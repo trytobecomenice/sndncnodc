@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.bak-*
+bot.pid
+bot.out.log
+.claude/settings.local.json

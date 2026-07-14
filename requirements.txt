@@ -1,0 +1,10 @@
+# No third-party Python packages required — bot.py and dashboard.py use only
+# the Python standard library (json, subprocess, http.server, etc.).
+#
+# The one external dependency is the Bullpen CLI, which must be installed and
+# authenticated separately (not a pip package):
+#   curl -fsSL https://cli.bullpen.fi/install.sh | bash
+#   bullpen login
+#
+# This file is kept for VS Code / tooling that expects a requirements.txt to
+# exist at the project root.

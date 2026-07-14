@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Polymarket Copybot Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-border: #262b36;
+    --text: #e6e8ec;
+    --muted: #8a90a0;
+    --green: #3ddc84;
+    --red: #ff5c5c;
+    --accent: #5b8cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    padding: 24px;
+  }
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  h1 {
+    font-size: 20px;
+    margin: 0;
+    font-weight: 600;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 13px;
+    margin-top: 4px;
+  }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    margin-left: 8px;
+  }
+  .badge-paper { background: #2a3b5c; color: #8fb2ff; }
+  .badge-live { background: #4a2323; color: #ff9a9a; }
+
+  .toggle-wrap { display: flex; align-items: center; gap: 12px; }
+  .status-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--muted);
+  }
+  .status-dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .status-dot.off { background: var(--red); }
+
+  button#toggleBtn {
+    padding: 10px 20px;
+    border-radius: 8px;
+    border: none;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  button#toggleBtn.start { background: var(--green); color: #06210f; }
+  button#toggleBtn.stop { background: var(--red); color: #2a0a0a; }
+  button#toggleBtn:hover { opacity: 0.85; }
+  button#toggleBtn:disabled { opacity: 0.5; cursor: default; }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .stat-label {
+    color: var(--muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 8px;
+  }
+  .stat-value {
+    font-size: 26px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat-value.positive { color: var(--green); }
+  .stat-value.negative { color: var(--red); }
+  .stat-sub {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 4px;
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .panel-title {
+    padding: 14px 16px;
+    font-weight: 600;
+    font-size: 14px;
+    border-bottom: 1px solid var(--panel-border);
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--panel-border);
+    white-space: nowrap;
+  }
+  th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  tr:last-child td { border-bottom: none; }
+  .side-buy { color: var(--green); font-weight: 600; }
+  .side-sell { color: var(--red); font-weight: 600; }
+  .pnl-pos { color: var(--green); }
+  .pnl-neg { color: var(--red); }
+  .muted { color: var(--muted); }
+  .event-tag {
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: #262b36;
+    color: var(--muted);
+  }
+  .empty {
+    padding: 32px;
+    text-align: center;
+    color: var(--muted);
+  }
+  .traders-line {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 12px;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>Polymarket Copybot <span id="modeBadge" class="badge badge-paper">PAPER</span></h1>
+    <div class="subtitle">Local dashboard — auto-refreshes every 5s</div>
+  </div>
+  <div class="toggle-wrap">
+    <div id="statusDot" class="status-dot off"></div>
+    <span id="statusText" class="muted">stopped</span>
+    <button id="toggleBtn" class="start" onclick="toggleBot()">Start Bot</button>
+  </div>
+</div>
+
+<div class="stats-grid">
+  <div class="stat-card">
+    <div class="stat-label">Realized PnL</div>
+    <div id="pnlValue" class="stat-value">$0.00</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Win Rate</div>
+    <div id="winRateValue" class="stat-value">—</div>
+    <div id="winRateSub" class="stat-sub"></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Trades Executed</div>
+    <div id="tradesExecutedValue" class="stat-value">0</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Wins / Losses</div>
+    <div id="winsLossesValue" class="stat-value">0 / 0</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Open Positions</div>
+    <div id="openPositionsValue" class="stat-value">0</div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-title">Trade Log</div>
+  <div id="tradesContainer"></div>
+</div>
+
+<div class="traders-line" id="tradersLine"></div>
+
+<script>
+async function fetchStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    render(data);
+  } catch (e) {
+    document.getElementById('statusText').textContent = 'dashboard error: ' + e;
+  }
+}
+
+function fmtUsd(n) {
+  const sign = n < 0 ? '-' : '';
+  return sign + '$' + Math.abs(n).toFixed(2);
+}
+
+function render(data) {
+  const running = data.bot_running;
+  document.getElementById('statusDot').className = 'status-dot ' + (running ? 'on' : 'off');
+  document.getElementById('statusText').textContent = running ? 'running' : 'stopped';
+
+  const btn = document.getElementById('toggleBtn');
+  btn.textContent = running ? 'Stop Bot' : 'Start Bot';
+  btn.className = running ? 'stop' : 'start';
+
+  const modeBadge = document.getElementById('modeBadge');
+  modeBadge.textContent = data.mode.toUpperCase();
+  modeBadge.className = 'badge ' + (data.mode === 'live' ? 'badge-live' : 'badge-paper');
+
+  const s = data.stats;
+  const pnlEl = document.getElementById('pnlValue');
+  pnlEl.textContent = fmtUsd(s.realized_pnl_usd);
+  pnlEl.className = 'stat-value ' + (s.realized_pnl_usd > 0 ? 'positive' : (s.realized_pnl_usd < 0 ? 'negative' : ''));
+
+  document.getElementById('winRateValue').textContent = s.win_rate === null ? '—' : s.win_rate + '%';
+  document.getElementById('winRateSub').textContent = (s.wins + s.losses) + ' closed trades';
+  document.getElementById('tradesExecutedValue').textContent = s.trades_executed;
+  document.getElementById('winsLossesValue').textContent = s.wins + ' / ' + s.losses;
+  document.getElementById('openPositionsValue').textContent = s.open_positions;
+
+  renderTrades(data.trades);
+
+  const traders = Object.entries(data.tracked_traders).map(([addr, nick]) => `${nick} (${addr.slice(0,6)}…${addr.slice(-4)})`).join(' · ');
+  document.getElementById('tradersLine').textContent =
+    `Tracking: ${traders} — $${data.fixed_trade_usd} per copied buy` +
+    (s.unresolved_count || s.error_count ? ` — ${s.unresolved_count} unresolved, ${s.error_count} errors (see log)` : '');
+}
+
+function renderTrades(trades) {
+  const container = document.getElementById('tradesContainer');
+  const rows = trades.filter(t => ['paper_buy','live_buy','paper_sell','live_sell','skip_sell_no_position','unresolved_trade','error'].includes(t.event_type));
+
+  if (rows.length === 0) {
+    container.innerHTML = '<div class="empty">No trades yet. Start the bot and wait for tracked traders to trade.</div>';
+    return;
+  }
+
+  let html = '<table><thead><tr>' +
+    '<th>Time</th><th>Trader</th><th>Event</th><th>Market</th><th>Outcome</th><th>Side</th><th>Amount</th><th>Price</th><th>PnL</th>' +
+    '</tr></thead><tbody>';
+
+  for (const t of rows) {
+    const time = new Date(t.timestamp).toLocaleString();
+    const side = t.side || '';
+    const sideClass = side === 'BUY' ? 'side-buy' : (side === 'SELL' ? 'side-sell' : '');
+    const amount = t.our_trade_usd !== undefined ? '$' + t.our_trade_usd.toFixed(2)
+                 : (t.our_shares_closed !== undefined ? t.our_shares_closed.toFixed(2) + ' sh' : '—');
+    const price = t.source_price !== undefined ? Number(t.source_price).toFixed(3) : '—';
+    let pnlCell = '—';
+    if (t.pnl_usd !== undefined) {
+      const cls = t.pnl_usd > 0 ? 'pnl-pos' : (t.pnl_usd < 0 ? 'pnl-neg' : '');
+      pnlCell = `<span class="${cls}">${fmtUsd(t.pnl_usd)}</span>`;
+    }
+    const eventLabel = t.event_type.replace('_', ' ');
+    html += `<tr>
+      <td class="muted">${time}</td>
+      <td>${t.trader_nickname || ''}</td>
+      <td><span class="event-tag">${eventLabel}</span></td>
+      <td>${t.market_slug || t.reason || '—'}</td>
+      <td>${t.outcome || ''}</td>
+      <td class="${sideClass}">${side}</td>
+      <td>${amount}</td>
+      <td>${price}</td>
+      <td>${pnlCell}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+async function toggleBot() {
+  const btn = document.getElementById('toggleBtn');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/toggle', { method: 'POST' });
+    const data = await res.json();
+    render(data);
+  } catch (e) {
+    alert('Failed to toggle bot: ' + e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+fetchStatus();
+setInterval(fetchStatus, 5000);
+</script>
+
+</body>
+</html>
