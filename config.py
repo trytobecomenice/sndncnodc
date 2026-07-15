@@ -116,6 +116,79 @@ SLIPPAGE_TOLERANCE = 0.05
 # SLIPPAGE_TOLERANCE band above rather than a tighter one.
 SPREAD_TOLERANCE = 0.05
 
+# Risk 3 (duplicate exposure) guard, added 2026-07-16. Positions are keyed
+# per-trader (trader|market_slug|outcome, see position_key in bot.py), so
+# without this guard two DIFFERENT tracked traders buying the same
+# market_slug+outcome would each open their own separate position -> we'd
+# accidentally hold 2x (or Nx) exposure to the same outcome.
+#
+# "Conviction scaling" policy:
+# - Cross-trader: if any OTHER tracked trader already holds an active
+#   (shares > 0) position in this exact market_slug+outcome, block the copy
+#   entirely -- exposure to a given outcome comes from only one trader at a
+#   time.
+# - Same-trader: the ORIGINAL trader who opened a position may still add to
+#   it (this is the existing average-up behavior), but only up to
+#   MAX_BUYS_PER_TRADER_OUTCOME total buys on that exact outcome. A further
+#   buy signal beyond the cap is blocked rather than silently averaged in
+#   forever.
+MAX_BUYS_PER_TRADER_OUTCOME = 2
+
+# Circuit breaker (kill switch), added 2026-07-16. Tracks realized pnl_usd on
+# OUR OWN closed copy-trades (paper_sell/live_sell events) per tracked
+# trader -- this is the only actual performance data the bot has, since we
+# don't see a trader's entry price history from before we started tracking
+# them. The moment either rule trips, that trader is muted: all further BUY
+# signals from them are blocked (existing positions can still be sold to
+# exit), regardless of any other setting. Mutes persist in state.json across
+# restarts and must be cleared manually (delete the trader's entry from
+# state.json's "muted_traders").
+#
+# - MUTE_CONSECUTIVE_LOSS_STREAK: mute after this many losing closes in a row.
+# - MUTE_WIN_RATE_THRESHOLD / MIN_TRADES_FOR_WIN_RATE_MUTE: mute if win rate
+#   over the last 10 closed trades falls below this threshold, but only once
+#   at least MIN_TRADES_FOR_WIN_RATE_MUTE closes exist -- with a smaller
+#   sample this rule would over-react to normal variance (e.g. 1 loss out of
+#   2 trades reading as a 0% win rate).
+MUTE_CONSECUTIVE_LOSS_STREAK = 3
+MUTE_WIN_RATE_THRESHOLD = 0.30
+MIN_TRADES_FOR_WIN_RATE_MUTE = 10
+
+# Trailing Take-Profit (TTP), added 2026-07-16. Runs once per poll cycle
+# against every active position (see check_trailing_take_profit in bot.py),
+# independent of what the source trader is doing -- this is what lets the
+# bot exit before a trader who's slower to sell gives back gains.
+#
+# - Tracks each position's highest profit percentage seen since entry
+#   (peak_profit_pct, persisted on the position in state.json so it survives
+#   restarts).
+# - The trail only "arms" once peak_profit_pct first reaches
+#   TRAILING_TP_ACTIVATION_PCT (+50%) -- positions below that are left alone
+#   entirely, no matter how far they pull back from a smaller peak.
+# - Once armed, a pullback of TRAILING_TP_DRAWDOWN_PCT from the peak, in
+#   PERCENTAGE POINTS (not relative -- e.g. peak +70% -> current +60% is a
+#   10-point drawdown, matching the spec example), triggers an immediate
+#   full-position market sell regardless of source trader activity.
+TRAILING_TP_ACTIVATION_PCT = 0.50
+TRAILING_TP_DRAWDOWN_PCT = 0.10
+
+# How often the TTP sweep actually runs. Added 2026-07-16 after measuring a
+# full sweep of 79 open positions at >120s (one `bullpen polymarket price`
+# subprocess per position): running it every 30s poll cycle would delay
+# trade copies by minutes and hammer the API. The sweep is time-gated inside
+# the poll loop; worst case a pullback is noticed this many seconds late.
+TRAILING_TP_CHECK_INTERVAL_SECONDS = 300
+
+# How often the resolved-market sweep runs (see run_closeout_sweep in
+# bot.py). Each sweep checks every open position's market for resolution
+# (`bullpen polymarket market`), books final 0/1 outcome prices into the
+# ledger for resolved ones, and — in LIVE mode only — runs
+# `bullpen polymarket closeout` to actually redeem winners on-chain.
+# Without this, positions in resolved markets sit in state forever (source
+# traders redeem rather than sell, and redemptions never appear as SELL
+# trades in the feed).
+CLOSEOUT_INTERVAL_SECONDS = 3600
+
 # Seconds between polls of the tracker feed.
 POLL_INTERVAL_SECONDS = 30
 
@@ -127,7 +200,9 @@ FEED_LIMIT = 150
 # LIVE_MODE = True places REAL orders with REAL funds via `bullpen polymarket
 # buy/sell --yes`. No per-trade confirmation. Set back to False to return to
 # paper/simulation mode.
-LIVE_MODE = True
+# Set to False 2026-07-16 for the paper-trading validation phase of the new
+# TTP + hardening features; flip back only after paper results check out.
+LIVE_MODE = False
 
 # Number of attempts for READ-ONLY bullpen calls (currently just `tracker
 # feed`) before giving up on a poll cycle. Deliberately NOT applied to

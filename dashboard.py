@@ -77,18 +77,28 @@ def build_status():
     state = load_json(config.STATE_PATH, {"positions": {}})
     positions = state.get("positions", {})
 
+    BUY_EVENTS = {"paper_buy", "live_buy"}
+    # Every event type that closes (part of) a position with a realized
+    # pnl_usd: source-copied sells, trailing take-profit exits, and
+    # resolved-market closes booked by the hourly closeout sweep.
+    CLOSE_EVENTS = {"paper_sell", "live_sell",
+                    "paper_sell_trailing_tp", "live_sell_trailing_tp",
+                    "position_resolved"}
+
     trades_executed = 0
     wins = 0
     losses = 0
     realized_pnl = 0.0
     unresolved_count = 0
     error_count = 0
+    skip_count = 0
+    unknown_fill_count = 0
 
     for e in log:
         et = e.get("event_type", "")
-        if et in ("paper_buy", "live_buy", "paper_sell", "live_sell"):
+        if et in BUY_EVENTS or et in CLOSE_EVENTS:
             trades_executed += 1
-        if et in ("paper_sell", "live_sell"):
+        if et in CLOSE_EVENTS:
             pnl = e.get("pnl_usd", 0.0) or 0.0
             realized_pnl += pnl
             if pnl > 0:
@@ -99,6 +109,10 @@ def build_status():
             unresolved_count += 1
         elif et == "error":
             error_count += 1
+        elif et.startswith("skip_"):
+            skip_count += 1
+        elif et == "unknown_fill_state":
+            unknown_fill_count += 1
 
     closed = wins + losses
     win_rate = (wins / closed * 100) if closed else None
@@ -117,6 +131,8 @@ def build_status():
             "open_positions": len(positions),
             "unresolved_count": unresolved_count,
             "error_count": error_count,
+            "skip_count": skip_count,
+            "unknown_fill_count": unknown_fill_count,
         },
         "trades": list(reversed(log))[:200],
     }
