@@ -32,7 +32,13 @@ FIXED_TRADE_USD = 5.0
 # sell will not fill below price*(1-SLIPPAGE_TOLERANCE). Protects against
 # copying into a price spike that happened between the source trade and our
 # execution a few seconds later.
-SLIPPAGE_TOLERANCE = 0.03
+#
+# Raised from 0.03 -> 0.05 on 2026-07-15 to cut "unresolved trade" misses on
+# fast-moving markets. Tradeoff: a 5% band also means we'll now fill copies
+# that have drifted meaningfully worse than the source trader's own price —
+# on a thin/low-liquidity market that can matter. If you start seeing live
+# fills you wouldn't have taken manually, bring this back down.
+SLIPPAGE_TOLERANCE = 0.05
 
 # Seconds between polls of the tracker feed.
 POLL_INTERVAL_SECONDS = 30
@@ -46,6 +52,26 @@ FEED_LIMIT = 150
 # buy/sell --yes`. No per-trade confirmation. Set back to False to return to
 # paper/simulation mode.
 LIVE_MODE = True
+
+# Number of attempts for READ-ONLY bullpen calls (currently just `tracker
+# feed`) before giving up on a poll cycle. Deliberately NOT applied to
+# buy/sell: retrying a trade command that may have already executed risks a
+# double fill, so trade execution stays single-shot and just logs a
+# failed_trade on error (see require_filled/failed_trade handling in bot.py).
+FEED_FETCH_RETRIES = 3
+FEED_FETCH_RETRY_DELAY_SECONDS = 0.5
+
+# Optional private Polygon RPC endpoint (e.g. an Alchemy/QuickNode app URL)
+# to cut latency and get `eth_getLogs` support the public fallback RPC
+# lacks. Leave as None to use bullpen's built-in public Polygon RPC.
+# Get this from https://dashboard.alchemy.com -> your app -> HTTPS URL.
+# Bullpen reads this via the BULLPEN_POLYGON_RPC_URL env var (verified via
+# `bullpen --help` and the CLI's own error-message text) — bot.py sets that
+# env var from this value before making any bullpen subprocess call, which
+# covers ALL bullpen commands (feed polling AND live buy/sell), not just a
+# subset. There is no in-repo web3/RPC client of our own to point at it;
+# bullpen owns 100% of the on-chain interaction for this bot.
+PRIVATE_POLYGON_RPC_URL = None  # e.g. "https://polygon-mainnet.g.alchemy.com/v2/<your-api-key>"
 
 # Files (all inside this project directory)
 import os

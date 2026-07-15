@@ -31,7 +31,32 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def run_bullpen_json(args):
+if config.PRIVATE_POLYGON_RPC_URL:
+    # Applies to every bullpen subprocess call below (feed polling AND live
+    # buy/sell) since it's a plain env var bullpen itself reads on startup —
+    # see config.PRIVATE_POLYGON_RPC_URL for how this was verified.
+    os.environ["BULLPEN_POLYGON_RPC_URL"] = config.PRIVATE_POLYGON_RPC_URL
+
+
+def run_bullpen_json(args, retries=1, retry_delay=0.5):
+    """retries=1 means "try once, no retry" — that's the default and MUST stay
+    the default for any call that can move funds (buy/sell). Only read-only
+    calls (tracker feed) should pass retries>1: a retried buy/sell risks
+    double-executing a trade that actually filled but errored on the
+    response leg.
+    """
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return _run_bullpen_json_once(args)
+        except RuntimeError as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(retry_delay)
+    raise last_error
+
+
+def _run_bullpen_json_once(args):
     result = subprocess.run(
         ["bullpen"] + args + ["--output", "json"],
         capture_output=True,
@@ -248,7 +273,11 @@ def main():
     bootstrap = not os.path.exists(config.STATE_PATH) or not state["seen_trade_ids"]
     if bootstrap:
         try:
-            feed = run_bullpen_json(["tracker", "feed", "--limit", str(config.FEED_LIMIT)])
+            feed = run_bullpen_json(
+                ["tracker", "feed", "--limit", str(config.FEED_LIMIT)],
+                retries=config.FEED_FETCH_RETRIES,
+                retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS,
+            )
             trades = feed.get("trades", [])
             for t in trades:
                 tid = t.get("trade_id")
@@ -266,7 +295,11 @@ def main():
 
     while True:
         try:
-            feed = run_bullpen_json(["tracker", "feed", "--limit", str(config.FEED_LIMIT)])
+            feed = run_bullpen_json(
+                ["tracker", "feed", "--limit", str(config.FEED_LIMIT)],
+                retries=config.FEED_FETCH_RETRIES,
+                retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS,
+            )
             trades = feed.get("trades", [])
             new_trades = [t for t in trades if t.get("trade_id") not in seen_set]
             new_trades.sort(key=lambda t: t.get("timestamp", ""))
