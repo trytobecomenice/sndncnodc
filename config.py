@@ -20,6 +20,35 @@ TRACKED_TRADERS = {
     "0x5966Db1fE50763C9e3C014d756369BAd07E1F804": "strict-8",
     "0x6211f97A76Ed5C4b1D658f637041AC5F293Db89E": "strict-9",
     "0x56acAb44cfCa2E88bb9B3406890Aea7bFA0CD77e": "strict-10",
+
+    # Added 2026-07-15: non-crypto diversification traders, sourced from
+    # `bullpen polymarket discover traders` (overall PnL leaderboard, since
+    # its --category filter does not actually filter — verified empirically)
+    # then screened with `wallet-stats --section categories` for a
+    # Politics/Geopolitics/World-dominant mix with near-zero crypto exposure,
+    # and cross-checked against the public Polymarket profit leaderboard via
+    # `bullpen polymarket profit --address <addr>`.
+    #
+    # IMPORTANT CAVEATS (read before risking real funds):
+    # - Bullpen's wallet-stats flagged all three as is_likely_bot=true. Your
+    #   existing 10 were explicitly filtered to exclude bots/farmers — these
+    #   were NOT filtered that way, because doing so eliminated every
+    #   candidate with a real non-crypto-dominant track record on today's
+    #   leaderboard. Verify you're comfortable with that trade-off.
+    # - No Weather- or Science-primary whale-tier trader could be verified.
+    #   Weather markets on Polymarket right now (temperature/wildfire) are
+    #   too new/thin to have an established profitable specialist, and no
+    #   Science category exists at meaningful volume. All 3 below are
+    #   Politics/Geopolitics/World traders instead — genuinely non-crypto,
+    #   but not the Weather/Science split originally asked for.
+    "0x71edffD0D70A1da823Ff07a3C6FC81457294D338": "geo-pako",      # "pako" — Politics 65%/Geopolitics 11%, $381,544 all-time
+                                                                      # leaderboard profit (confirmed), low_copyability, risk_tier low
+    "0xBAA2BCb5439E985CE4ccF815B4700027D1b92c73": "geo-denizz",    # "denizz" — Politics 32%/Geopolitics 56%/World 11%, $2,441,947
+                                                                      # all-time leaderboard profit (confirmed), low_copyability, risk_tier low
+    "0x7f9e2d1DF78614564a70BeCc7fA14AA9a6623A0e": "geo-anon-3",    # unnamed — Politics 43%/Geopolitics 41%/World 7%, ~$1.01M summed
+                                                                      # category PnL (leaderboard lookup itself errored — could not
+                                                                      # double-confirm via that specific endpoint), moderately_copyable,
+                                                                      # risk_tier low
 }
 
 # How much (USD) WE spend on each copied BUY, regardless of the source
