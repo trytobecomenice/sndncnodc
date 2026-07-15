@@ -105,6 +105,17 @@ FIXED_TRADE_USD = 5.0
 # fills you wouldn't have taken manually, bring this back down.
 SLIPPAGE_TOLERANCE = 0.05
 
+# Risk 1 (spread/liquidity) guard, added 2026-07-15. Before every LIVE
+# buy/sell, bot.py calls `bullpen polymarket preview` for a fresh read of
+# the current book and computes RELATIVE spread (preview's spread field is
+# an absolute price-tick value, e.g. 0.01 -- dividing by price is what makes
+# it comparable across outcomes trading near $0.05 vs near $0.95). If
+# relative spread exceeds this fraction, or preview itself reports a
+# liquidity warning, the copy is skipped and logged as skip_wide_spread
+# instead of firing into a thin book. Chosen to match the wider
+# SLIPPAGE_TOLERANCE band above rather than a tighter one.
+SPREAD_TOLERANCE = 0.05
+
 # Seconds between polls of the tracker feed.
 POLL_INTERVAL_SECONDS = 30
 

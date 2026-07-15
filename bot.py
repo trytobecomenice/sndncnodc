@@ -107,6 +107,50 @@ def require_filled(response, action_desc):
     return response
 
 
+def check_spread_tolerance(market_slug, outcome, amount, side):
+    """Risk 1 (spread/liquidity) pre-trade check. Calls `bullpen polymarket
+    preview` for a fresh read of the CURRENT book (independent of the
+    possibly-stale price the tracker feed reported for the source trade) and
+    rejects the copy if the relative spread (spread / price) exceeds
+    config.SPREAD_TOLERANCE, or if preview itself flags a liquidity warning.
+
+    NOTE: preview's `spread` field is an ABSOLUTE price-tick spread (e.g.
+    0.01), not a fraction of price -- dividing by price is required to get a
+    comparable relative number across outcomes trading near $0.05 vs near
+    $0.95. Verified empirically: a thin long-shot market and a liquid ~50/50
+    market can report the identical absolute spread while differing by 10x+
+    in relative terms.
+
+    Fails safe: if preview itself errors (network/timeout/parse), this
+    returns not-ok rather than skipping the check -- we'd rather miss a copy
+    than fire one blind into an unknown book.
+    """
+    try:
+        preview = run_bullpen_json([
+            "polymarket", "preview", market_slug, outcome, str(amount),
+            "--side", "buy" if side == "BUY" else "sell",
+        ], retries=config.FEED_FETCH_RETRIES, retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS)
+    except Exception as e:
+        return False, f"preview unavailable: {e}"
+
+    price = preview.get("price")
+    spread = preview.get("spread")
+    if not price or price <= 0 or spread is None:
+        return False, f"preview missing price/spread: {preview}"
+
+    relative_spread = spread / price
+    if relative_spread > config.SPREAD_TOLERANCE:
+        return False, (
+            f"relative spread {relative_spread:.1%} exceeds tolerance "
+            f"{config.SPREAD_TOLERANCE:.0%} (price={price}, abs_spread={spread})"
+        )
+
+    if preview.get("warning"):
+        return False, f"liquidity warning from preview: {preview['warning']}"
+
+    return True, None
+
+
 def load_state():
     if not os.path.exists(config.STATE_PATH):
         return {"seen_trade_ids": [], "positions": {}, "source_positions": {}}
@@ -184,6 +228,13 @@ def process_trade(trade, positions, source_positions):
         # failed_trade and bail out — we must NOT record a position we
         # never actually acquired.
         if config.LIVE_MODE:
+            spread_ok, spread_reason = check_spread_tolerance(
+                market_slug, outcome, config.FIXED_TRADE_USD, "BUY"
+            )
+            if not spread_ok:
+                append_log({**base_event, "event_type": "skip_wide_spread", "reason": spread_reason})
+                return
+
             max_price = round(price * (1 + config.SLIPPAGE_TOLERANCE), 4)
             try:
                 require_filled(run_bullpen_json([
@@ -229,6 +280,13 @@ def process_trade(trade, positions, source_positions):
         # reasoning as BUY: a failed, unmatched, or reverted sell must not
         # be recorded as closed.
         if config.LIVE_MODE:
+            spread_ok, spread_reason = check_spread_tolerance(
+                market_slug, outcome, shares_closed, "SELL"
+            )
+            if not spread_ok:
+                append_log({**base_event, "event_type": "skip_wide_spread", "reason": spread_reason})
+                return
+
             min_price = round(price * (1 - config.SLIPPAGE_TOLERANCE), 4)
             try:
                 require_filled(run_bullpen_json([
