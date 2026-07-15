@@ -49,6 +49,42 @@ TRACKED_TRADERS = {
                                                                       # category PnL (leaderboard lookup itself errored — could not
                                                                       # double-confirm via that specific endpoint), moderately_copyable,
                                                                       # risk_tier low
+
+    # Added 2026-07-15 (funnel expansion): 7 more, no bot/category filter
+    # per instruction ("just high profitability and high volume in month").
+    # Kept the ORIGINAL quality bar otherwise: risk_tier != degen,
+    # copyability_tier != not_recommended, profit_factor > 1 (all via
+    # `wallet-stats --section all`). Sourced from two pools: the top-50
+    # all-time PnL leaderboard (`discover traders`, exhausted at 50 rows —
+    # that's a hard cap, not a limit I chose), and top holders of the
+    # highest-volume single market I could get a fast response from
+    # (fed-rate-hike-in-2026 — event-top-holders timed out repeatedly on
+    # bigger events; `holders` on a single market worked and returns
+    # display names, which I resolved to addresses via `polymarket search
+    # --type user` on an exact name match).
+    #
+    # CAVEATS:
+    # - "geo-anon-4" (0xA7b7505A...) shows profit_factor=99.0 from
+    #   wallet-stats. That's almost certainly a capped/sentinel value in
+    #   Bullpen's calc, not a literal 99x ratio — I saw the same exact 99.0
+    #   on another wallet during screening. Real signal underneath (320
+    #   trades, $1.18M/mo volume, is_whale=true), but treat the ratio itself
+    #   as "very good, uncertain exact magnitude," not gospel.
+    # - "fed-warren-buffett" (0x4478d7bd...) is a Polymarket display name
+    #   coincidence, not the actual Warren Buffett or anyone impersonating
+    #   him in a way that implies real-world identity — just their chosen
+    #   pseudonym on the platform.
+    # - "fed-559b" (0x559B8506...) has profit_factor=1.04 — barely above
+    #   breakeven, the weakest of the 7 on that metric. Included because its
+    #   volume_30d ($322K) and win_rate still clear the bar, but it's the
+    #   first one I'd cut if you want to trim back.
+    "0x1465B79bfF7992Bc703e1AaFB3683b1089647072": "expand-1",  # profit_factor 1.83, win 69.6%, vol_30d $1.42M, Crypto-primary, whale
+    "0x060f34e5AA82Cc11C2a54c9EDF3E6A0632925A9d": "expand-2",  # profit_factor 1.37, win 67.5%, vol_30d $1.86M, Sports-primary, copyability_tier="bot"
+    "0x620d7e06CE27d16532C061EbA9b46C7e1833C67f": "expand-3",  # profit_factor 1.07, win 50.0%, vol_30d $1.52M, Sports-primary, whale
+    "0xA7b7505AbE2FDCC497C00074534f7fbd7e07962E": "geo-anon-4",  # profit_factor 99.0 (capped, see caveat above), win 50.0%, vol_30d $1.18M, Sports-primary, whale
+    "0x4478d7bd8a295691ac84f60a5ec2b47e122102a4": "fed-warren-buffett",  # profit_factor 1.35, win 60.2%, vol_30d $1.10M, Politics-primary, whale, 3753 trades
+    "0xcaab19659b995951a44cc992447cb2ad5be324dd": "fed-qmg-core",  # profit_factor 2.10, win 73.2%, vol_30d $903K, Mixed category, whale, 2323 trades
+    "0x559B850620CD9Ee1136D48484c1F374fC5d44959": "fed-559b",  # profit_factor 1.04 (marginal, see caveat above), win 35.6%, vol_30d $322K, Sports-primary
 }
 
 # How much (USD) WE spend on each copied BUY, regardless of the source
