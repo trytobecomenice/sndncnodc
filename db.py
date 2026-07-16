@@ -29,6 +29,15 @@ import config
 
 SEEN_TRADE_ID_CAP = 2000  # mirrors the old deque(maxlen=2000) in bot.py
 
+# wallet_profile.wallet_address is stored lowercase (normalized so it stays
+# consistent with the TS scoring layer, which writes lowercase — see
+# save_state() below). bot.py's own world uses checksummed mixed-case
+# throughout instead (config.TRACKED_TRADERS' keys, and the live tracker
+# feed's trader addresses — verified these two match each other exactly).
+# This lookup translates a lowercase DB address back to bot.py's expected
+# mixed-case form; see load_state()'s use of it below.
+_CANONICAL_CASE_BY_LOWER = {addr.lower(): addr for addr in config.TRACKED_TRADERS}
+
 
 def _connect():
     conn = sqlite3.connect(config.SQLITE_PATH)
@@ -103,7 +112,16 @@ def load_state():
             "circuit_breaker_muted, mute_reason, muted_at FROM wallet_profile"
         )
         for row in cur.fetchall():
-            addr = row["wallet_address"]
+            # wallet_profile.wallet_address is stored lowercase (shared with
+            # the TS scoring layer — see save_state()'s comment above). But
+            # `trader` values elsewhere in bot.py (from the live tracker
+            # feed, and from config.TRACKED_TRADERS' checksummed keys) are
+            # mixed-case, verified to match each other exactly. Translate
+            # back to that mixed-case form here so `trader in muted_traders`
+            # lookups elsewhere in bot.py keep working — otherwise every
+            # mute silently stops being enforced the moment it round-trips
+            # through the database.
+            addr = _CANONICAL_CASE_BY_LOWER.get(row["wallet_address"], row["wallet_address"])
             if row["recent_results_json"] is not None:
                 trader_performance[addr] = {
                     "recent_results": json.loads(row["recent_results_json"]),
@@ -213,6 +231,17 @@ def save_state(state):
             perf = trader_performance.get(trader)
             mute = muted_traders.get(trader)
             nickname = config.TRACKED_TRADERS.get(trader)
+            # Ethereum addresses are case-insensitive, but config.py's
+            # TRACKED_TRADERS uses checksummed (mixed-case) addresses while
+            # the TS scoring layer (packages/copy-trading) normalizes to
+            # lowercase before writing to this same shared table (see
+            # scoreWallets.ts's normalizeAddress) — verified this mismatch
+            # produces duplicate rows for the same real wallet if left
+            # unnormalized. `trader` itself (used above for the
+            # TRACKED_TRADERS nickname lookup) is intentionally left as-is;
+            # only the value actually written to the shared wallet_address
+            # column is normalized here.
+            wallet_address = trader.lower()
             conn.execute(
                 # `status` is deliberately never written here — it's owned by
                 # the TS scoring layer, not bot.py. Omitting it from both the
@@ -234,7 +263,7 @@ def save_state(state):
                     updated_at = excluded.updated_at
                 """,
                 (
-                    _new_id(), trader, nickname,
+                    _new_id(), wallet_address, nickname,
                     1 if mute else 0,
                     mute.get("reason") if mute else None,
                     _iso_to_ts(mute.get("muted_at")) if mute else None,

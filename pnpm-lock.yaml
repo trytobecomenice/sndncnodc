@@ -71,6 +71,9 @@ importers:
       '@copybot/db':
         specifier: workspace:*
         version: link:../db
+      '@copybot/shared':
+        specifier: workspace:*
+        version: link:../shared
       drizzle-orm:
         specifier: ^0.38.0
         version: 0.38.4(@libsql/client@0.14.0)(@types/react@19.2.17)(react@19.2.4)
@@ -94,12 +97,21 @@ importers:
         specifier: ^0.38.0
         version: 0.38.4(@libsql/client@0.14.0)(@types/react@19.2.17)(react@19.2.4)
     devDependencies:
+      '@types/node':
+        specifier: ^20.19.0
+        version: 20.19.43
       drizzle-kit:
         specifier: ^0.30.0
         version: 0.30.6
       tsx:
         specifier: ^4.19.0
         version: 4.23.1
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/shared:
+    devDependencies:
       typescript:
         specifier: ^5.7.0
         version: 5.9.3

@@ -37,18 +37,27 @@ interface ExecResult {
   timedOut: boolean;
 }
 
+// Node's execFile callback error is typed as ExecFileException | null, which
+// (unlike the narrower NodeJS.ErrnoException) does include `killed`/`signal`
+// — this local type just documents the two fields we actually read from it.
+interface ExecFileError {
+  killed?: boolean;
+  signal?: NodeJS.Signals | null;
+  code?: number | string | null;
+}
+
 function execBullpen(args: string[], timeoutMs: number): Promise<ExecResult> {
   return new Promise((resolve) => {
     execFile(
       "bullpen",
       [...args, "--output", "json"],
       { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
-      (error, stdout, stderr) => {
-        if (error && (error as NodeJS.ErrnoException).killed && error.signal) {
+      (error: ExecFileError | null, stdout, stderr) => {
+        if (error && error.killed && error.signal) {
           resolve({ stdout, stderr, exitCode: 1, timedOut: true });
           return;
         }
-        const exitCode = error && typeof (error as any).code === "number" ? (error as any).code : error ? 1 : 0;
+        const exitCode = error && typeof error.code === "number" ? error.code : error ? 1 : 0;
         resolve({ stdout, stderr, exitCode, timedOut: false });
       }
     );

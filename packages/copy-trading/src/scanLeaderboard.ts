@@ -34,6 +34,17 @@ const HOLDERS_PER_MARKET = 15;
 const READ_RETRIES = 3;
 const READ_RETRY_DELAY_MS = 500;
 
+// Ethereum addresses are case-INsensitive (0xABC... and 0xabc... are the
+// same wallet), but different bullpen commands return them in different
+// casing — `discover traders` returns EIP-55 checksummed mixed-case,
+// `search --type user` returns lowercase. Left unnormalized, this creates
+// duplicate rows for the same real wallet wherever the address is used as a
+// key (verified: 8 wallets ended up duplicated in wallet_profile from
+// exactly this). Always normalize to lowercase at the point of writing.
+function normalizeAddress(address: string): string {
+  return address.toLowerCase();
+}
+
 interface LeaderboardRow {
   source: string;
   rank: number | null;
@@ -64,7 +75,7 @@ async function scanDiscoverTradersOverall(): Promise<LeaderboardRow[]> {
     return {
       source: "discover_traders_overall",
       rank,
-      walletAddress: row.id,
+      walletAddress: normalizeAddress(row.id),
       displayName: null,
       pnlAllTime: pnl,
       volume30d: typeof row.volume === "number" ? row.volume : null,
@@ -90,8 +101,9 @@ async function makeNameResolver() {
     // entirely when we can read the address straight off the name.
     const embedded = FULL_ADDRESS_RE.exec(displayName);
     if (embedded) {
-      cache.set(displayName, embedded[0]);
-      return embedded[0];
+      const normalized = normalizeAddress(embedded[0]);
+      cache.set(displayName, normalized);
+      return normalized;
     }
     // The other shape some names take — "0x5533...51BA" — is a lossy
     // truncation with no recoverable address; a search call would just
@@ -107,7 +119,7 @@ async function makeNameResolver() {
         retryDelayMs: READ_RETRY_DELAY_MS,
       });
       const profile = (data?.profiles ?? []).find((p: any) => p.name === displayName) ?? data?.profiles?.[0];
-      const address = profile?.wallet ?? null;
+      const address = profile?.wallet ? normalizeAddress(profile.wallet) : null;
       cache.set(displayName, address);
       return address;
     } catch (err) {

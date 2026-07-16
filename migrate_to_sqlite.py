@@ -155,8 +155,17 @@ def migrate(state_path, log_path, db_path):
         perf = trader_performance.get(trader)
         mute = muted_traders.get(trader)
         is_tracked = trader in config.TRACKED_TRADERS
+        # Ethereum addresses are case-insensitive, but config.py's
+        # TRACKED_TRADERS uses checksummed (mixed-case) addresses while the
+        # TS scoring layer normalizes to lowercase before writing to this
+        # same shared table — verified this mismatch produces duplicate
+        # rows for the same real wallet if left unnormalized (see
+        # scoreWallets.ts's normalizeAddress). `trader` itself is left as-is
+        # for the TRACKED_TRADERS/trader_performance/muted_traders lookups
+        # above; only the value written to wallet_address is normalized.
+        wallet_address = trader.lower()
         existing = conn.execute(
-            "SELECT id FROM wallet_profile WHERE wallet_address=?", (trader,)
+            "SELECT id FROM wallet_profile WHERE wallet_address=?", (wallet_address,)
         ).fetchone()
         if existing:
             conn.execute(
@@ -168,7 +177,7 @@ def migrate(state_path, log_path, db_path):
                     _iso_to_ts(mute.get("muted_at")) if mute else None,
                     (perf or {}).get("consecutive_losses", 0),
                     json.dumps(perf.get("recent_results", [])) if perf is not None else None,
-                    _now_ts(), trader,
+                    _now_ts(), wallet_address,
                 ),
             )
             n_updated += 1
@@ -179,7 +188,7 @@ def migrate(state_path, log_path, db_path):
                 "recent_results_json, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    _new_id(), trader, nickname,
+                    _new_id(), wallet_address, nickname,
                     "track" if is_tracked else "watch",
                     "seeded from config.TRACKED_TRADERS by migrate_to_sqlite.py" if is_tracked else None,
                     _now_ts() if is_tracked else None,

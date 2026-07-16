@@ -16,6 +16,7 @@
   "dependencies": {
     "@copybot/bullpen-client": "workspace:*",
     "@copybot/db": "workspace:*",
+    "@copybot/shared": "workspace:*",
     "drizzle-orm": "^0.38.0"
   },
   "devDependencies": {
