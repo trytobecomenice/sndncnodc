@@ -230,3 +230,22 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADE_LOG_PATH = os.path.join(BASE_DIR, "trades_log.json")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
+
+# Shared SQLite DB (packages/db owns the schema/migrations; db.py only ever
+# does SELECT/INSERT/UPDATE/DELETE against it, never CREATE/ALTER TABLE).
+# Absolute path, same resolution rule as packages/db/src/env.ts, so both
+# sides always agree on one file regardless of each process's cwd.
+SQLITE_PATH = os.path.join(BASE_DIR, "data", "app.db")
+
+# "static": get_tracked_traders() returns TRACKED_TRADERS above, unchanged
+#   behavior — the default until the new TS leaderboard-scan/scoring layer's
+#   output (wallet_profile.status) has been running long enough to trust.
+# "db": get_tracked_traders() instead queries wallet_profile for
+#   status='track' AND circuit_breaker_muted=0, returned in the same
+#   {address: nickname} shape, so every call site is unaffected by the switch.
+TRACKED_TRADERS_SOURCE = "static"
+
+# Phase C hardening (see TRACKED_TRADERS_SOURCE="db"): if the DB query ever
+# returns fewer than this many traders, bot.py fails loudly at startup
+# rather than silently trading a near-empty tracker list.
+MIN_TRACKED_TRADERS = 3

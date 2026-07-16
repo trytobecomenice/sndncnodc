@@ -1,6 +1,27 @@
 __pycache__/
 *.pyc
 *.bak-*
+*.pre-sqlite-backup
 bot.pid
 bot.out.log
+dashboard.out.log
+*.pre-cutover-*
 .claude/settings.local.json
+
+# Node / TS monorepo
+node_modules/
+.pnpm-store/
+apps/dashboard/.next/
+apps/dashboard/out/
+*.tsbuildinfo
+packages/*/dist/
+
+# Shared SQLite DB (local dev data, not source)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.db-journal
+
+# env
+.env
+.env.local

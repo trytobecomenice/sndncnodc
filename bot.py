@@ -12,20 +12,25 @@ bootstrap) — pre-existing holdings the trader had before we started watching a
 visible to us, so a sell that exceeds what we've observed is clamped to selling 100%
 of our own position.
 
-Everything (fills, skips, errors) is appended to TRADE_LOG_PATH as a JSON array
-so a future dashboard can read it directly.
+Everything (fills, skips, errors) is appended to the shared SQLite DB's
+bot_event_log table (see db.py) so the Next.js dashboard (apps/dashboard)
+can read it directly, alongside bot.py's own local dashboard.py.
 """
 
 import json
-import os
 import signal
-import subprocess
 import sys
 import time
 from collections import deque
 from datetime import datetime, timezone
 
 import config
+from bullpen_client import (
+    BullpenTimeoutError,
+    extract_fill_price,
+    require_filled,
+    run_bullpen_json,
+)
 
 
 def now_iso():
@@ -43,113 +48,6 @@ def _handle_sigterm(signum, frame):
     global SHUTDOWN_REQUESTED
     SHUTDOWN_REQUESTED = True
     print("SIGTERM received — finishing current work, saving state, then exiting.")
-
-
-def atomic_write_json(path, obj):
-    """All persistence goes through here: write to a sibling .tmp, fsync,
-    then os.replace() so a crash/kill mid-write can never leave a truncated
-    JSON file at `path` — the old complete file survives until the new one
-    is fully on disk.
-    """
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(obj, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, path)
-
-
-class BullpenTimeoutError(RuntimeError):
-    """The bullpen subprocess hit its timeout. For money-moving calls this
-    is fundamentally different from a clean failure: the order MAY have
-    executed on-chain even though we never saw the response — callers must
-    log it as unknown_fill_state for manual reconciliation, never retry it.
-    """
-
-
-if config.PRIVATE_POLYGON_RPC_URL:
-    # Applies to every bullpen subprocess call below (feed polling AND live
-    # buy/sell) since it's a plain env var bullpen itself reads on startup —
-    # see config.PRIVATE_POLYGON_RPC_URL for how this was verified.
-    os.environ["BULLPEN_POLYGON_RPC_URL"] = config.PRIVATE_POLYGON_RPC_URL
-
-
-def run_bullpen_json(args, retries=1, retry_delay=0.5):
-    """retries=1 means "try once, no retry" — that's the default and MUST stay
-    the default for any call that can move funds (buy/sell). Only read-only
-    calls (tracker feed) should pass retries>1: a retried buy/sell risks
-    double-executing a trade that actually filled but errored on the
-    response leg.
-    """
-    last_error = None
-    for attempt in range(1, retries + 1):
-        try:
-            return _run_bullpen_json_once(args)
-        except RuntimeError as e:
-            last_error = e
-            if attempt < retries:
-                time.sleep(retry_delay)
-    raise last_error
-
-
-def _run_bullpen_json_once(args):
-    try:
-        result = subprocess.run(
-            ["bullpen"] + args + ["--output", "json"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except subprocess.TimeoutExpired:
-        # Raised as a RuntimeError subclass so the retry loop above still
-        # retries read-only calls, while trade call sites can distinguish
-        # "timed out, fill state unknown" from a clean rejection.
-        raise BullpenTimeoutError(
-            f"bullpen {' '.join(args)} timed out after 60s; "
-            f"if this was a trade, the order MAY still have executed"
-        )
-    data = None
-    if result.stdout.strip():
-        try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            data = None
-
-    # A trade command can exit non-zero (e.g. exit 4 "trade execution
-    # failed") while still printing a JSON error body to stdout — check the
-    # exit code independent of whether stdout parsed, or a rejected/reverted
-    # order silently sails through as if it succeeded.
-    if result.returncode != 0:
-        detail = result.stderr.strip()
-        if isinstance(data, dict):
-            detail = data.get("error") or data.get("error_code") or data.get("message") or detail
-        raise RuntimeError(
-            f"bullpen {' '.join(args)} exited {result.returncode}: {detail or 'no error detail'}"
-        )
-    if data is None:
-        raise RuntimeError(f"bullpen {' '.join(args)} produced no parseable JSON output: {result.stdout!r}")
-    if isinstance(data, dict) and data.get("ok") is False:
-        raise RuntimeError(f"bullpen {' '.join(args)} error: {data.get('error')}")
-    return data
-
-
-# Statuses `bullpen polymarket buy/sell --output json` can report. Only
-# MATCHED means the CLI actually settled shares/cash on-chain — UNMATCHED
-# (no counterparty, e.g. swept by a much larger concurrent order), DELAYED,
-# or a resting LIVE limit order are not fills. A 0 exit code plus parseable
-# JSON only proves the CLI accepted the request, not that it filled.
-FILLED_TRADE_STATUSES = {"MATCHED"}
-
-
-def require_filled(response, action_desc):
-    status = str(response.get("status") or "").upper()
-    tx_hashes = response.get("transaction_hashes") or []
-    if status not in FILLED_TRADE_STATUSES or not tx_hashes:
-        raise RuntimeError(
-            f"{action_desc} did not confirm an on-chain fill "
-            f"(status={status or 'missing'}, transaction_hashes={tx_hashes})"
-        )
-    return response
 
 
 def check_spread_tolerance(market_slug, outcome, amount, side):
@@ -229,21 +127,6 @@ def get_market_prices(market_slug, outcome):
     if not indicative or indicative <= 0:
         return None, None, f"no usable price in response: {match}"
     return best_bid, indicative, None
-
-
-def extract_fill_price(response):
-    """Best-effort read of the ACTUAL average fill price from a buy/sell
-    response. No live fill has ever been captured by this bot yet (all
-    history is paper), so the exact field name is unverified — we try the
-    plausible candidates and return None if none is present, in which case
-    the caller falls back to the source trade's price and logs the raw
-    response so the first real fill documents the true shape.
-    """
-    for key in ("avg_price", "average_price", "fill_price", "executed_price", "price"):
-        value = response.get(key)
-        if isinstance(value, (int, float)) and 0 < value <= 1:
-            return float(value)
-    return None
 
 
 def close_position_trailing_tp(key, trader, nickname, market_slug, outcome, positions,
@@ -480,69 +363,12 @@ def run_closeout_sweep(positions, trader_performance, muted_traders):
                         "error": f"closeout redeem failed: {e}"})
 
 
-def load_state():
-    """Fail-CLOSED on a corrupt state file: state.json is the only record of
-    what positions we hold, so starting fresh over a corrupt file would mean
-    trading with amnesia while money may still be deployed in markets (and
-    bootstrap would re-baseline, orphaning every open position). Restore
-    from a state.json.bak-* backup instead.
-    """
-    if not os.path.exists(config.STATE_PATH):
-        return {"seen_trade_ids": [], "positions": {}, "source_positions": {},
-                "trader_performance": {}, "muted_traders": {}}
-    try:
-        with open(config.STATE_PATH) as f:
-            state = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        sys.exit(
-            f"FATAL: {config.STATE_PATH} is unreadable ({e}).\n"
-            f"Refusing to start with no position memory while positions may still be open.\n"
-            f"Restore it from the most recent state.json.bak-* file (or {config.STATE_PATH}.tmp "
-            f"if one exists from an interrupted write), then restart."
-        )
-    state.setdefault("source_positions", {})
-    state.setdefault("trader_performance", {})
-    state.setdefault("muted_traders", {})
-    return state
-
-
-def save_state(state):
-    atomic_write_json(config.STATE_PATH, state)
-
-
-# In-memory copy of the trade log, loaded once at startup — append_log used
-# to re-read the whole (ever-growing) file from disk on every single event.
-_log_cache = None
-
-
-def _load_log_cache():
-    global _log_cache
-    if _log_cache is not None:
-        return _log_cache
-    _log_cache = []
-    if os.path.exists(config.TRADE_LOG_PATH):
-        try:
-            with open(config.TRADE_LOG_PATH) as f:
-                _log_cache = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            # Fail-OPEN here, unlike load_state: the log is an audit trail,
-            # not trading state, and append_log gets called from exception
-            # handlers — a corrupt log must not be able to crash-loop the
-            # bot. Move the damaged file aside and start a fresh log that
-            # records the fact.
-            corrupt_path = (f"{config.TRADE_LOG_PATH}.corrupt-"
-                            f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}")
-            os.replace(config.TRADE_LOG_PATH, corrupt_path)
-            _log_cache = [{"timestamp": now_iso(), "event_type": "log_recovered",
-                           "note": f"existing trade log was unreadable; moved aside to {corrupt_path}"}]
-    return _log_cache
-
-
-def append_log(event):
-    log = _load_log_cache()
-    log.append(event)
-    atomic_write_json(config.TRADE_LOG_PATH, log)
-    print(f"[{event['timestamp']}] {event['event_type']}: {event.get('market_slug', '')} {event.get('outcome', '')}")
+# load_state/save_state/append_log now live in db.py, backed by the shared
+# SQLite DB (see db.py's module docstring) instead of state.json/
+# trades_log.json. Imported under these exact names so every call site below
+# (process_trade, check_trailing_take_profit, check_circuit_breaker,
+# run_closeout_sweep, main) is unchanged — only the storage backend moved.
+from db import load_state, save_state, append_log  # noqa: E402
 
 
 def position_key(trader, market_slug, outcome):
@@ -828,7 +654,12 @@ def main():
                     "source_positions": source_positions, "trader_performance": trader_performance,
                     "muted_traders": muted_traders})
 
-    bootstrap = not os.path.exists(config.STATE_PATH) or not state["seen_trade_ids"]
+    # load_state() (db.py) is now the sole source of truth regardless of
+    # whether state.json exists on disk — bootstrap purely off whether it
+    # returned any seen_trade_ids, not file presence (checking
+    # os.path.exists(config.STATE_PATH) here would incorrectly re-bootstrap
+    # on every restart once state.json is retired).
+    bootstrap = not state["seen_trade_ids"]
     if bootstrap:
         try:
             feed = run_bullpen_json(

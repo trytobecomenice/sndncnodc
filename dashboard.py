@@ -5,11 +5,18 @@ Local dashboard for the Polymarket copytrading bot.
 Serves a single-page dashboard at http://localhost:8787 showing PnL, win
 rate, trade counts, and the full trade log, with a button to start/stop
 bot.py. Pure standard library — no extra installs required.
+
+Reads from the shared SQLite DB (data/app.db, see db.py) rather than
+state.json/trades_log.json directly — bot_event_log rows store the exact
+same event dicts bot.py always built (each row's payload_json is literally
+json.dumps(event)), so build_status()'s stats computation below is otherwise
+unchanged from the JSON-file version.
 """
 
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import webbrowser
@@ -65,77 +72,102 @@ def stop_bot():
         os.remove(PID_PATH)
 
 
-def load_json(path, default):
-    if not os.path.exists(path):
-        return default
-    with open(path) as f:
-        return json.load(f)
+def _connect():
+    conn = sqlite3.connect(config.SQLITE_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _load_recent_events(conn, limit=200):
+    """Returns the same list-of-dicts shape trades_log.json used to be —
+    each bot_event_log row's payload_json IS that original event dict
+    (append_log in db.py stores json.dumps(event) verbatim), newest first.
+    """
+    cur = conn.execute(
+        "SELECT payload_json FROM bot_event_log ORDER BY timestamp DESC LIMIT ?", (limit,)
+    )
+    return [json.loads(row["payload_json"]) for row in cur.fetchall()]
+
+
+def _open_position_count(conn):
+    cur = conn.execute(
+        "SELECT COUNT(*) c FROM paper_trade "
+        "WHERE status = 'open' AND strategy = 'bot_filtered' AND is_demo_data = 0"
+    )
+    return cur.fetchone()["c"]
 
 
 def build_status():
-    log = load_json(config.TRADE_LOG_PATH, [])
-    state = load_json(config.STATE_PATH, {"positions": {}})
-    positions = state.get("positions", {})
+    conn = _connect()
+    try:
+        recent_events = _load_recent_events(conn, limit=200)
+        open_positions = _open_position_count(conn)
 
-    BUY_EVENTS = {"paper_buy", "live_buy"}
-    # Every event type that closes (part of) a position with a realized
-    # pnl_usd: source-copied sells, trailing take-profit exits, and
-    # resolved-market closes booked by the hourly closeout sweep.
-    CLOSE_EVENTS = {"paper_sell", "live_sell",
-                    "paper_sell_trailing_tp", "live_sell_trailing_tp",
-                    "position_resolved"}
+        # trades_executed/wins/losses/realized_pnl need the FULL event
+        # history for correct totals, not just the 200-row display window —
+        # query bot_event_log directly for those, same event_type buckets
+        # build_status always used.
+        BUY_EVENTS = {"paper_buy", "live_buy"}
+        CLOSE_EVENTS = {"paper_sell", "live_sell",
+                        "paper_sell_trailing_tp", "live_sell_trailing_tp",
+                        "position_resolved"}
 
-    trades_executed = 0
-    wins = 0
-    losses = 0
-    realized_pnl = 0.0
-    unresolved_count = 0
-    error_count = 0
-    skip_count = 0
-    unknown_fill_count = 0
+        trades_executed = 0
+        wins = 0
+        losses = 0
+        realized_pnl = 0.0
+        unresolved_count = 0
+        error_count = 0
+        skip_count = 0
+        unknown_fill_count = 0
 
-    for e in log:
-        et = e.get("event_type", "")
-        if et in BUY_EVENTS or et in CLOSE_EVENTS:
-            trades_executed += 1
-        if et in CLOSE_EVENTS:
-            pnl = e.get("pnl_usd", 0.0) or 0.0
-            realized_pnl += pnl
-            if pnl > 0:
-                wins += 1
-            else:
-                losses += 1
-        elif et == "unresolved_trade":
-            unresolved_count += 1
-        elif et == "error":
-            error_count += 1
-        elif et.startswith("skip_"):
-            skip_count += 1
-        elif et == "unknown_fill_state":
-            unknown_fill_count += 1
+        cur = conn.execute("SELECT event_type, payload_json FROM bot_event_log")
+        for row in cur.fetchall():
+            et = row["event_type"] or ""
+            if et in BUY_EVENTS or et in CLOSE_EVENTS:
+                trades_executed += 1
+            if et in CLOSE_EVENTS:
+                payload = json.loads(row["payload_json"])
+                pnl = payload.get("pnl_usd", 0.0) or 0.0
+                realized_pnl += pnl
+                if pnl > 0:
+                    wins += 1
+                else:
+                    losses += 1
+            elif et == "unresolved_trade":
+                unresolved_count += 1
+            elif et == "error":
+                error_count += 1
+            elif et.startswith("skip_"):
+                skip_count += 1
+            elif et == "unknown_fill_state":
+                unknown_fill_count += 1
 
-    closed = wins + losses
-    win_rate = (wins / closed * 100) if closed else None
+        closed = wins + losses
+        win_rate = (wins / closed * 100) if closed else None
 
-    return {
-        "bot_running": bot_pid() is not None,
-        "mode": "live" if config.LIVE_MODE else "paper",
-        "tracked_traders": config.TRACKED_TRADERS,
-        "fixed_trade_usd": config.FIXED_TRADE_USD,
-        "stats": {
-            "realized_pnl_usd": round(realized_pnl, 4),
-            "win_rate": round(win_rate, 1) if win_rate is not None else None,
-            "trades_executed": trades_executed,
-            "wins": wins,
-            "losses": losses,
-            "open_positions": len(positions),
-            "unresolved_count": unresolved_count,
-            "error_count": error_count,
-            "skip_count": skip_count,
-            "unknown_fill_count": unknown_fill_count,
-        },
-        "trades": list(reversed(log))[:200],
-    }
+        return {
+            "bot_running": bot_pid() is not None,
+            "mode": "live" if config.LIVE_MODE else "paper",
+            "tracked_traders": config.TRACKED_TRADERS,
+            "fixed_trade_usd": config.FIXED_TRADE_USD,
+            "stats": {
+                "realized_pnl_usd": round(realized_pnl, 4),
+                "win_rate": round(win_rate, 1) if win_rate is not None else None,
+                "trades_executed": trades_executed,
+                "wins": wins,
+                "losses": losses,
+                "open_positions": open_positions,
+                "unresolved_count": unresolved_count,
+                "error_count": error_count,
+                "skip_count": skip_count,
+                "unknown_fill_count": unknown_fill_count,
+            },
+            "trades": recent_events,
+        }
+    finally:
+        conn.close()
 
 
 class Handler(BaseHTTPRequestHandler):

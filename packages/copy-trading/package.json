@@ -1,0 +1,26 @@
+{
+  "name": "@copybot/copy-trading",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "scan:leaderboard": "tsx src/scanLeaderboard.ts",
+    "scan:wallets": "tsx src/scoreWallets.ts",
+    "monitor:trades": "tsx src/monitorTrades.ts",
+    "score:trades": "tsx src/scoreTrades.ts",
+    "paper:update-pnl": "tsx src/paperUpdatePnl.ts",
+    "review:outcomes": "tsx src/reviewOutcomes.ts",
+    "update:rules": "tsx src/updateRules.ts",
+    "report:daily": "tsx src/dailyReport.ts"
+  },
+  "dependencies": {
+    "@copybot/bullpen-client": "workspace:*",
+    "@copybot/db": "workspace:*",
+    "drizzle-orm": "^0.38.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

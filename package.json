@@ -1,0 +1,24 @@
+{
+  "name": "polymarket-copybot",
+  "private": true,
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "pnpm --filter dashboard dev",
+    "db:generate": "pnpm --filter @copybot/db generate",
+    "db:migrate": "pnpm --filter @copybot/db migrate",
+    "db:studio": "pnpm --filter @copybot/db studio",
+    "seed": "pnpm --filter @copybot/db seed",
+    "scan:leaderboard": "pnpm --filter @copybot/copy-trading scan:leaderboard",
+    "scan:wallets": "pnpm --filter @copybot/copy-trading scan:wallets",
+    "monitor:trades": "pnpm --filter @copybot/copy-trading monitor:trades",
+    "score:trades": "pnpm --filter @copybot/copy-trading score:trades",
+    "paper:update-pnl": "pnpm --filter @copybot/copy-trading paper:update-pnl",
+    "review:outcomes": "pnpm --filter @copybot/copy-trading review:outcomes",
+    "update:rules": "pnpm --filter @copybot/copy-trading update:rules",
+    "report:daily": "pnpm --filter @copybot/copy-trading report:daily",
+    "test": "pnpm -r test"
+  }
+}
