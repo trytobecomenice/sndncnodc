@@ -284,6 +284,28 @@ export const botSourcePosition = sqliteTable("bot_source_position", {
   shares: real("shares").notNull(),
 });
 
+// Portfolio-level risk state, owned exclusively by bot.py's risk layer
+// (risk_manager.py, via db.py) — same ownership rule as the other bot_*
+// plumbing tables: TS owns the DDL, only bot.py reads/writes rows. Known
+// keys: "equity_hwm" (float — portfolio equity high-water mark) and
+// "kill_switch" (object {triggered_at, reasons, equity, hwm} — present and
+// non-null means new BUYs are halted until manually cleared via
+// reset_kill_switch.py).
+export const botRiskState = sqliteTable("bot_risk_state", {
+  key: text("key").primaryKey(),
+  valueJson: text("value_json").notNull(),
+  updatedAt: timestampCol("updated_at"),
+});
+
+// market_slug -> parent event slug memo, resolved once per market via
+// `bullpen polymarket market <slug>` (events[0].slug) and cached forever —
+// feeds the per-event exposure cap. Owned by bot.py like bot_risk_state.
+export const botMarketEvent = sqliteTable("bot_market_event", {
+  marketSlug: text("market_slug").primaryKey(),
+  eventSlug: text("event_slug").notNull(),
+  resolvedAt: timestampCol("resolved_at"),
+});
+
 // ---------------------------------------------------------------------------
 // Weather domain
 // ---------------------------------------------------------------------------

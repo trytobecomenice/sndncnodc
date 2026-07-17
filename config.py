@@ -224,6 +224,47 @@ FEED_FETCH_RETRY_DELAY_SECONDS = 0.5
 # bullpen owns 100% of the on-chain interaction for this bot.
 PRIVATE_POLYGON_RPC_URL = None  # e.g. "https://polygon-mainnet.g.alchemy.com/v2/<your-api-key>"
 
+# --- Portfolio-level risk controls (risk_manager.py) -------------------------
+# These gate NEW BUYs only — sells, trailing-TP exits, and closeouts are
+# never blocked (a risk layer that traps you in positions adds risk instead
+# of removing it). Applied in BOTH paper and live mode so paper runs stay
+# representative. Chosen 2026-07-18 ("Moderate" bundle + owner's bankroll
+# numbers, see below); any limit can be disabled by setting it to None.
+
+# Hard ceiling on total USD deployed (sum of open positions' cost basis).
+# A BUY that would push total exposure ABOVE this is skipped.
+MAX_TOTAL_EXPOSURE_USD = 250.0
+
+# Cap on USD deployed within a single Polymarket EVENT (markets are grouped
+# into events; e.g. every "What price will Bitcoin hit in July?" strike is
+# one event). Resolved via `bullpen polymarket market <slug>` ->
+# events[0].slug, cached in bot_market_event. NOTE this only catches
+# same-event concentration — economically-correlated bets split across
+# different events (e.g. "BTC reach 72.5k" vs "BTC dip to 50k") are NOT
+# caught; cross-event correlation stays unmodeled for now.
+MAX_EVENT_EXPOSURE_USD = 30.0
+
+# Kill switch: portfolio equity is defined as PAPER_BANKROLL_USD + realized
+# PnL + unrealized PnL (unrealized comes from the trailing-TP sweep's price
+# fetches, so equity refreshes every TRAILING_TP_CHECK_INTERVAL_SECONDS ~5
+# min, not per-trade). TWO independent triggers latch the same halt:
+#
+#   1. EQUITY_FLOOR_USD — the catastrophic stop: halt if equity ever drops
+#      below this absolute level. Owner's framing: "trading with $125, stop
+#      if I'm down to $100."
+#   2. MAX_DRAWDOWN_FROM_PEAK_USD — the working stop: halt if equity falls
+#      this far below its own high-water mark. This is the trigger that
+#      protects profit already banked — with +$107 realized at the time
+#      this was configured, the floor alone would allow giving back all of
+#      it plus $25 before firing.
+#
+# Once triggered the halt LATCHES (persisted in bot_risk_state, survives
+# restarts) until manually cleared with `python3 reset_kill_switch.py` —
+# a breached limit means a human reviews before risk resumes.
+PAPER_BANKROLL_USD = 125.0
+EQUITY_FLOOR_USD = 100.0
+MAX_DRAWDOWN_FROM_PEAK_USD = 50.0
+
 # Files (all inside this project directory)
 import os
 

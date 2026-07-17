@@ -31,12 +31,22 @@ SEEN_TRADE_ID_CAP = 2000  # mirrors the old deque(maxlen=2000) in bot.py
 
 # wallet_profile.wallet_address is stored lowercase (normalized so it stays
 # consistent with the TS scoring layer, which writes lowercase — see
-# save_state() below). bot.py's own world uses checksummed mixed-case
-# throughout instead (config.TRACKED_TRADERS' keys, and the live tracker
-# feed's trader addresses — verified these two match each other exactly).
-# This lookup translates a lowercase DB address back to bot.py's expected
-# mixed-case form; see load_state()'s use of it below.
-_CANONICAL_CASE_BY_LOWER = {addr.lower(): addr for addr in config.TRACKED_TRADERS}
+# save_state() below). positions/source_positions (paper_trade) intentionally
+# keep whatever casing the live tracker feed reports (checksummed mixed-case)
+# since they're never cross-referenced against wallet_profile by key.
+#
+# trader_performance/muted_traders, however, round-trip through
+# wallet_profile every save/load — so bot.py keys those two dicts by
+# LOWERCASE address (see check_circuit_breaker/process_trade in bot.py).
+# This used to be handled by translating wallet_profile's lowercase address
+# back to config.TRACKED_TRADERS' checksummed casing on load, but that only
+# ever worked for the static 20-wallet list: a wallet muted under
+# TRACKED_TRADERS_SOURCE="db" (sourced from wallet_profile, not config.py)
+# had no checksummed form to translate back to, so `trader in muted_traders`
+# would silently stop matching after a restart and un-mute it. Keying both
+# sides lowercase sidesteps that entirely instead of trying to recover a
+# checksum we don't have (no web3/eth_utils dependency in this project —
+# see requirements.txt).
 
 
 def _connect():
@@ -112,16 +122,10 @@ def load_state():
             "circuit_breaker_muted, mute_reason, muted_at FROM wallet_profile"
         )
         for row in cur.fetchall():
-            # wallet_profile.wallet_address is stored lowercase (shared with
-            # the TS scoring layer — see save_state()'s comment above). But
-            # `trader` values elsewhere in bot.py (from the live tracker
-            # feed, and from config.TRACKED_TRADERS' checksummed keys) are
-            # mixed-case, verified to match each other exactly. Translate
-            # back to that mixed-case form here so `trader in muted_traders`
-            # lookups elsewhere in bot.py keep working — otherwise every
-            # mute silently stops being enforced the moment it round-trips
-            # through the database.
-            addr = _CANONICAL_CASE_BY_LOWER.get(row["wallet_address"], row["wallet_address"])
+            # Lowercase, matching how bot.py now keys trader_performance/
+            # muted_traders (see the module-level comment above) — no case
+            # translation needed since both sides agree on lowercase.
+            addr = row["wallet_address"]
             if row["recent_results_json"] is not None:
                 trader_performance[addr] = {
                     "recent_results": json.loads(row["recent_results_json"]),
@@ -226,22 +230,20 @@ def save_state(state):
 
         trader_performance = state.get("trader_performance", {})
         muted_traders = state.get("muted_traders", {})
-        all_traders = set(trader_performance) | set(muted_traders) | set(config.TRACKED_TRADERS)
-        for trader in all_traders:
-            perf = trader_performance.get(trader)
-            mute = muted_traders.get(trader)
-            nickname = config.TRACKED_TRADERS.get(trader)
-            # Ethereum addresses are case-insensitive, but config.py's
-            # TRACKED_TRADERS uses checksummed (mixed-case) addresses while
-            # the TS scoring layer (packages/copy-trading) normalizes to
-            # lowercase before writing to this same shared table (see
-            # scoreWallets.ts's normalizeAddress) — verified this mismatch
-            # produces duplicate rows for the same real wallet if left
-            # unnormalized. `trader` itself (used above for the
-            # TRACKED_TRADERS nickname lookup) is intentionally left as-is;
-            # only the value actually written to the shared wallet_address
-            # column is normalized here.
-            wallet_address = trader.lower()
+        # trader_performance/muted_traders are already lowercase-keyed (see
+        # module comment above). config.TRACKED_TRADERS is checksummed
+        # mixed-case, so it's normalized into the same lowercase key space
+        # here — unioning the raw dicts directly would put the same real
+        # wallet in the set twice under two different strings (e.g. a
+        # TRACKED_TRADERS_SOURCE="db" wallet that's also in the static list),
+        # splitting its perf/mute data and its nickname across two separate
+        # writes that then race to overwrite the same row.
+        nickname_by_lower = {addr.lower(): nick for addr, nick in config.TRACKED_TRADERS.items()}
+        all_traders = set(trader_performance) | set(muted_traders) | set(nickname_by_lower)
+        for wallet_address in all_traders:
+            perf = trader_performance.get(wallet_address)
+            mute = muted_traders.get(wallet_address)
+            nickname = nickname_by_lower.get(wallet_address)
             conn.execute(
                 # `status` is deliberately never written here — it's owned by
                 # the TS scoring layer, not bot.py. Omitting it from both the
@@ -288,6 +290,10 @@ def _decision_type_for_event(event_type, side):
     if event_type in ("skip_muted_trader", "skip_duplicate_position"):
         return "skip"
     if event_type == "skip_wide_spread" and side == "BUY":
+        return "skip"
+    # Portfolio-risk gates (risk_manager.py) — all BUY-only by construction.
+    if event_type in ("skip_risk_kill_switch", "skip_risk_exposure_ceiling",
+                      "skip_risk_event_cap", "skip_risk_event_unresolved"):
         return "skip"
     return None
 
@@ -373,6 +379,14 @@ def get_tracked_traders():
     config.TRACKED_TRADERS_SOURCE gates the switch from the hardcoded list to
     the TS scoring layer's output (see config.py) — call sites in bot.py
     never need to know which source is active.
+
+    Called once at bot.py startup (main()), not per-poll: this is a
+    deliberate restart-to-pick-up-changes design, matching the
+    fail-loudly-at-startup framing of the MIN_TRACKED_TRADERS check below.
+    bot.py uses the returned dict as BOTH the nickname lookup (as before)
+    AND, new as of this function actually being wired in, the authoritative
+    membership filter for which trades get copied at all — see
+    bot.py main()'s `tracked_by_lower`.
     """
     if config.TRACKED_TRADERS_SOURCE != "db":
         return dict(config.TRACKED_TRADERS)
@@ -395,3 +409,89 @@ def get_tracked_traders():
             f"or set TRACKED_TRADERS_SOURCE back to 'static' in config.py."
         )
     return {row["wallet_address"]: (row["nickname"] or row["wallet_address"]) for row in rows}
+
+
+# --- Portfolio-risk state (bot_risk_state / bot_market_event) ----------------
+# Owned exclusively by bot.py's risk layer (risk_manager.py) — see the
+# ownership notes on these tables in packages/db/src/schema.ts. Known
+# bot_risk_state keys: "equity_hwm" (float), "kill_switch" (dict, present =
+# new BUYs halted; cleared via reset_kill_switch.py).
+
+
+def get_risk_value(key):
+    """Returns the JSON-decoded value for `key`, or None if unset."""
+    conn = _connect()
+    try:
+        cur = conn.execute("SELECT value_json FROM bot_risk_state WHERE key = ?", (key,))
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    return json.loads(row["value_json"]) if row else None
+
+
+def set_risk_value(key, value):
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO bot_risk_state (key, value_json, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, "
+            "updated_at = excluded.updated_at",
+            (key, json.dumps(value), _now_ts()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_risk_value(key):
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM bot_risk_state WHERE key = ?", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_market_events():
+    """Returns the full {market_slug: event_slug} memo (see bot_market_event)."""
+    conn = _connect()
+    try:
+        cur = conn.execute("SELECT market_slug, event_slug FROM bot_market_event")
+        return {row["market_slug"]: row["event_slug"] for row in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def save_market_event(market_slug, event_slug):
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO bot_market_event (market_slug, event_slug, resolved_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(market_slug) DO UPDATE SET "
+            "event_slug = excluded.event_slug, resolved_at = excluded.resolved_at",
+            (market_slug, event_slug, _now_ts()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def realized_pnl_total():
+    """Total realized PnL across every position close the bot has ever
+    logged — one term of the portfolio-equity calculation (see
+    risk_manager.compute_equity). Recomputed from bot_event_log on each call
+    rather than maintained incrementally: it's a single SUM over an indexed
+    scan, called once per TTP sweep (~5 min), and can never drift from the
+    log the way a running counter could.
+    """
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT COALESCE(SUM(json_extract(payload_json, '$.pnl_usd')), 0) AS total "
+            "FROM bot_event_log WHERE event_type IN "
+            "('paper_sell', 'live_sell', 'paper_sell_trailing_tp', "
+            "'live_sell_trailing_tp', 'position_resolved')"
+        )
+        return float(cur.fetchone()["total"])
+    finally:
+        conn.close()

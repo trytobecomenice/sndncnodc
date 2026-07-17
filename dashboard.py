@@ -23,6 +23,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
+from db import get_tracked_traders
 
 PORT = 8787
 PID_PATH = os.path.join(config.BASE_DIR, "bot.pid")
@@ -38,11 +39,38 @@ def bot_pid():
             pid = int(f.read().strip())
     except (ValueError, OSError):
         return None
+
+    # Reap the bot if it's an exited child of THIS process. start_bot()
+    # discards its Popen object, so nothing ever wait()s on the child —
+    # when bot.py exits, it lingers as a zombie, and zombies pass the
+    # os.kill(pid, 0) existence check below, making a dead bot report as
+    # "running" forever (observed 2026-07-18: a cleanly-SIGTERM'd bot.py
+    # showed ZN/<defunct> in ps while this function kept returning its pid).
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass  # not our child (bot started manually or by a prior dashboard run)
+
     try:
         os.kill(pid, 0)
     except OSError:
         os.remove(PID_PATH)
         return None
+
+    # os.kill(pid, 0) also succeeds on zombies parented to OTHER processes
+    # (which we cannot reap) — check the real process state and treat
+    # Z/defunct as dead. `ps -o stat=` is Darwin/Linux-portable.
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.stdout.strip().startswith("Z"):
+            os.remove(PID_PATH)
+            return None
+    except Exception:
+        pass  # ps unavailable/slow — fall back on the existence check above
+
     return pid
 
 
@@ -68,8 +96,14 @@ def stop_bot():
         os.kill(pid, signal.SIGTERM)
     except OSError:
         pass
-    if os.path.exists(PID_PATH):
-        os.remove(PID_PATH)
+    # Deliberately do NOT delete the pid file here. bot.py finishes its
+    # in-flight work before exiting (see its SIGTERM handler), so the
+    # process is genuinely still running for a few seconds — deleting the
+    # pid file immediately (a) lied about that in the UI, and (b) orphaned
+    # the pid from tracking, so bot_pid() never got the chance to reap the
+    # exited child and it stayed a zombie for the dashboard's lifetime.
+    # bot_pid() now owns the pid file's cleanup: it removes it on the first
+    # status poll after the process actually dies.
 
 
 def _connect():
@@ -147,10 +181,21 @@ def build_status():
         closed = wins + losses
         win_rate = (wins / closed * 100) if closed else None
 
+        # Reflects whichever source config.TRACKED_TRADERS_SOURCE is
+        # currently set to (static config.py dict or wallet_profile), same
+        # as bot.py itself uses — see db.get_tracked_traders. Falls back to
+        # the static dict on error (e.g. MIN_TRACKED_TRADERS underrun in
+        # "db" mode) rather than 500ing this read-only status endpoint;
+        # bot.py's own startup check is the actual enforcement point.
+        try:
+            tracked_traders = get_tracked_traders()
+        except Exception:
+            tracked_traders = config.TRACKED_TRADERS
+
         return {
             "bot_running": bot_pid() is not None,
             "mode": "live" if config.LIVE_MODE else "paper",
-            "tracked_traders": config.TRACKED_TRADERS,
+            "tracked_traders": tracked_traders,
             "fixed_trade_usd": config.FIXED_TRADE_USD,
             "stats": {
                 "realized_pnl_usd": round(realized_pnl, 4),

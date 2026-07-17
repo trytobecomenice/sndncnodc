@@ -55,12 +55,48 @@ position tracking — every query `db.py` runs against `paper_trade` for `bot.py
 must filter `is_demo_data = 0`, or the bot will try to manage a fake position that doesn't
 exist on Polymarket.
 
+## Portfolio-level risk controls (risk_manager.py, added 2026-07-18)
+
+Three controls gate every new BUY (paper AND live — paper stays representative);
+sells, trailing-TP exits, and closeouts are NEVER blocked — a risk layer that
+traps you in positions adds risk instead of removing it:
+
+1. **Total exposure ceiling** (`config.MAX_TOTAL_EXPOSURE_USD`): sum of open
+   cost basis + the new trade may not exceed the ceiling.
+2. **Per-event exposure cap** (`config.MAX_EVENT_EXPOSURE_USD`): same check
+   scoped to one Polymarket event (market→event resolved via
+   `bullpen polymarket market`, memoized in `bot_market_event`; resolution
+   failure fails CLOSED — the buy is skipped, exposure never bypasses the cap
+   by being unattributable). Only same-event concentration is caught;
+   economically-correlated bets across different events are not.
+3. **Drawdown kill switch**: equity = `PAPER_BANKROLL_USD` + realized +
+   unrealized PnL, refreshed by the TTP sweep (~5 min reaction time, not
+   per-trade). Two independent triggers latch one halt: an absolute equity
+   floor (`EQUITY_FLOOR_USD`) and a max drawdown from the equity high-water
+   mark (`MAX_DRAWDOWN_FROM_PEAK_USD`). The latch persists in
+   `bot_risk_state` across restarts and is cleared only by
+   `python3 reset_kill_switch.py` (then restart bot.py) — a breached limit
+   means a human reviews before risk resumes. The reset is deliberately a
+   standalone script, not a dashboard button: dashboard.py's documented
+   boundary is that it never writes to `data/app.db`.
+
+`bot_risk_state` and `bot_market_event` are bot.py-owned rows (TS/Drizzle
+still owns the DDL, same rule as every other `bot_*` table); the TS side must
+treat them as read-only. Decision logic lives in `risk_manager.py` as pure
+functions with stdlib-unittest coverage (`python3 -m unittest
+test_risk_manager`).
+
 ## Risks of copy trading itself
 
 - **Stale/thin liquidity**: a copy can fill at a much worse price than the source trader's own
   fill if the book has moved or is too thin — `check_spread_tolerance` in `bot.py` rejects live
   copies above `config.SPREAD_TOLERANCE` relative spread, but paper-mode fills always use the
-  source trade's reported price, which won't reflect this in paper PnL.
+  source trade's reported price, which won't reflect this in paper PnL. Since 2026-07-18 this
+  gap is at least *measured*: every paper copy also calls `bullpen polymarket preview` and logs
+  the executable price + signed `shortfall_pct`/`shortfall_usd` into its bot_event_log payload
+  (`measure_paper_shortfall` in bot.py — measurement only, deliberately never fed back into
+  paper fills, so paper PnL stays optimistic but the implementation-shortfall cost of being
+  last to every trade is now quantified before any live-mode decision).
 - **Leaderboard wallets can be misleading**: high all-time PnL can come from one lucky trade,
   survivorship bias, or a wallet that's simply too illiquid to actually follow — this is why
   the wallet scorer (`packages/copy-trading`, in progress) penalizes one-hit-wonders and scores
