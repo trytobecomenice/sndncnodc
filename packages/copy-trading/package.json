@@ -11,7 +11,8 @@
     "paper:update-pnl": "tsx src/paperUpdatePnl.ts",
     "review:outcomes": "tsx src/reviewOutcomes.ts",
     "update:rules": "tsx src/updateRules.ts",
-    "report:daily": "tsx src/dailyReport.ts"
+    "report:daily": "tsx src/dailyReport.ts",
+    "test": "vitest run"
   },
   "dependencies": {
     "@copybot/bullpen-client": "workspace:*",
@@ -22,6 +23,7 @@
   "devDependencies": {
     "@types/node": "^20.19.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.10"
   }
 }
