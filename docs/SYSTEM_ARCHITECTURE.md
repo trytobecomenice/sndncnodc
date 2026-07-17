@@ -47,6 +47,12 @@ foundation to grow from**:
    pulls real wallet data from Polymarket via the `bullpen` CLI and saves it to the database.
    Already run successfully against live data.
 8. **Wrote `docs/SAFETY.md`**, documenting the safety rules and boundaries between the pieces.
+9. **Built `scoreWallets.ts`**, the second research-brain script: it reads the candidates
+   `scanLeaderboard.ts` found, scores each one (ROI + consistency + a one-hit-wonder penalty +
+   copyability), and writes a `track`/`watch`/`ignore` verdict onto `wallet_profile.status`.
+   Fixed an address-casing bug along the way (some `bullpen` commands return checksummed
+   mixed-case addresses, others lowercase — every DB writer now normalizes to lowercase before
+   insert, so the same real wallet can't silently end up as two different rows).
 
 Nothing about how the bot actually trades changed. What changed is *where it remembers things*,
 and a foundation was added for it to eventually get smarter about *who* it copies.
@@ -190,10 +196,13 @@ A simple web page (no build step, plain HTML/JS) that reads the same database ev
 load or refresh it, and shows PnL, win rate, open positions, and the recent event log. It also
 has the Start/Stop button for `bot.py`.
 
-### C. The research scan — `scanLeaderboard.ts` (currently a manual, one-off command)
+### C. The research scan — `scanLeaderboard.ts` + `scoreWallets.ts` (both manual, one-off commands)
 
-Run today with `pnpm scan:leaderboard`. This does **not** run automatically or continuously yet
-— you type the command and it does one pass:
+Neither runs automatically or continuously yet — you type a command and it does one pass. They're
+meant to be run in order: `scanLeaderboard.ts` finds *candidates*, `scoreWallets.ts` decides which
+of those candidates are worth copying.
+
+**`scanLeaderboard.ts`** (`pnpm scan:leaderboard`):
 
 1. Asks `bullpen` for the global top-50 wallets by profit (`discover traders`).
 2. Asks `bullpen` for the highest-volume events right now, looks at each one's biggest market,
@@ -203,12 +212,26 @@ Run today with `pnpm scan:leaderboard`. This does **not** run automatically or c
    came from (so you can tell "global top-50" data apart from "holders of the World Cup Winner
    market" data).
 
+**`scoreWallets.ts`** (`pnpm scan:wallets`), added after the above:
+
+1. Reads every candidate address out of `leaderboard_scan`.
+2. **Pass 1 (cheap, ~9.5s/wallet):** pulls each wallet's summary stats (lifetime PnL, 30-day ROI,
+   trade count) from `bullpen` and immediately marks the obviously-too-thin/too-weak ones
+   `ignore` — they never get a pass-2 call.
+3. **Pass 2 (expensive, ~15s/wallet, survivors only):** pulls each remaining wallet's full
+   `pnl-series` history to measure consistency and penalize "one lucky spike" wallets.
+4. Both passes run several wallets at once via a small concurrency pool
+   (`packages/shared/src/concurrency.ts`) instead of one at a time.
+5. Writes a final `track` / `watch` / `ignore` verdict (plus the score and reasoning) onto
+   `wallet_profile.status` — but only that column and its scoring-related siblings; it never
+   touches the five circuit-breaker columns `bot.py` owns on that same table (see §3 above).
+
 **Important — this doesn't feed back into trading yet.** Right now, `bot.py` still only trades
-the 20 wallets hardcoded in `config.py` (`TRACKED_TRADERS_SOURCE = "static"`). The leaderboard
-scan is just *collecting* data at this point. The next piece to build, `scoreWallets.ts`, is what
-will actually score these wallets and decide which ones are worth tracking — and only once
-that's trusted would `config.py` get flipped to `TRACKED_TRADERS_SOURCE = "db"` so `bot.py`
-starts trading off the scored list instead of the hardcoded one.
+the 20 wallets hardcoded in `config.py` (`TRACKED_TRADERS_SOURCE = "static"`). Both scripts are
+just *collecting and scoring* data at this point — running `scoreWallets.ts` today updates the
+database but changes nothing about what `bot.py` actually copies. Only once the scoring is
+trusted would `config.py` get flipped to `TRACKED_TRADERS_SOURCE = "db"` so `bot.py` starts
+trading off the scored list instead of the hardcoded one.
 
 ### D. The Next.js dashboard — `apps/dashboard` (not running by default; start with `pnpm dev`)
 
@@ -220,10 +243,11 @@ built yet.
 ### Putting it together
 
 ```
- bot.py (every 30s)                    scanLeaderboard.ts (manual, one-off)
-   │  polls bullpen for new trades       │  polls bullpen for wallet/holder data
-   ▼                                     ▼
- db.py  ───────────►  data/app.db  ◄───────────  Drizzle (TypeScript)
+ bot.py (every 30s)         scanLeaderboard.ts ──► scoreWallets.ts
+   │  polls bullpen           (manual, one-off)     (manual, one-off,
+   │  for new trades           polls bullpen for      run after scan)
+   ▼                           wallet/holder data      │ writes wallet_profile.status
+ db.py  ───────────►  data/app.db  ◄────────────────────┘  (Drizzle, TypeScript)
                     (ONE shared file)
                         ▲        ▲
                         │        │
@@ -248,15 +272,21 @@ built yet.
 | `data/app.db` | The actual shared database file. Not tracked in git. |
 | `packages/db/src/schema.ts` | The database's blueprint — every table and column, in one place. |
 | `packages/bullpen-client/` | TypeScript version of `bullpen_client.py`, for the new scripts to use. |
-| `packages/copy-trading/src/scanLeaderboard.ts` | Pulls wallet/leaderboard data from Polymarket into the database. |
+| `packages/copy-trading/src/scanLeaderboard.ts` | Pulls wallet/leaderboard candidate data from Polymarket into `leaderboard_scan`. |
+| `packages/copy-trading/src/scoreWallets.ts` | Scores those candidates and writes `track`/`watch`/`ignore` onto `wallet_profile.status`. |
+| `packages/shared/src/concurrency.ts` | Small "run N at once" concurrency pool used by `scoreWallets.ts`'s two passes. |
 | `apps/dashboard/` | The new Next.js web dashboard (Overview page built so far). |
 | `docs/SAFETY.md` | Safety rules, ownership boundaries, and known risks. |
 
 ## 6. What's not built yet
 
-So you know exactly where things stand: `scoreWallets.ts` (turns raw leaderboard data into a
-"should we copy this wallet?" score), `monitorTrades.ts` / `scoreTrades.ts` (the broader trade
+So you know exactly where things stand: `monitorTrades.ts` / `scoreTrades.ts` (the broader trade
 observer and decision engine described in the spec), `paperUpdatePnl.ts`, `reviewOutcomes.ts`,
 `updateRules.ts` (the self-improving rules engine), `dailyReport.ts` (Telegram summaries), the
-remaining 8 dashboard pages, and the entire weather arbitrage bot. All of it is designed for
-(the database already has tables waiting for it) but not yet written.
+remaining 8 dashboard pages, and the entire weather arbitrage bot — `packages/weather/src/` is a
+literal empty folder right now, not even a `package.json` yet, so it isn't wired into the pnpm
+workspace at all. Every one of these already has `package.json` script entries and/or database
+tables waiting for it (the weather tables alone: `weather_station`,
+`weather_historical_observation`, `weather_forecast_snapshot`, `weather_market_mapping`,
+`weather_probability_estimate`, `weather_position`, `weather_pnl_snapshot` — all defined in
+`packages/db/src/schema.ts`, none read or written by any code yet).
