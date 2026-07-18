@@ -1,8 +1,10 @@
 # System Architecture — Master Reference Guide
 
-This document explains, in plain language, what exists in this repo right now: what was built,
-how the pieces fit together, and exactly what happens when the bot runs. It's meant to be the
-one place you can come back to and re-orient yourself.
+**Audience note:** zero prior context assumed. This document explains, in plain language, what
+exists in this repo right now: what was built, how the pieces fit together, and exactly what
+happens when the bot runs. It's meant to be the one place you can come back to and re-orient
+yourself. For the risk controls themselves (what's enforced, exact numbers, why), see
+`docs/RISK_MANAGEMENT.md` — this document explains the *system*, that one explains the *rules*.
 
 ---
 
@@ -129,18 +131,21 @@ supposed to look like. When the database's shape needs to change, you run `pnpm 
 
 ### Who's allowed to change *which fields*
 
-Because both `bot.py` and the future scoring scripts write to the same `wallet_profile` table,
+Because both `bot.py` and the scoring scripts write to the same `wallet_profile` table,
 there's a second, more subtle rule about *which columns* each side is allowed to touch, so they
 never silently overwrite each other's work:
 
 | Field | Owned by | What it means |
 |---|---|---|
-| `wallet_profile.status` (`track` / `watch` / `ignore`) | The TypeScript scoring layer (future `scoreWallets.ts`) | Decides which wallets are worth copying |
-| `wallet_profile.circuit_breaker_muted`, `mute_reason`, `consecutive_losses` | `bot.py` (via `db.py`) | The existing circuit-breaker logic that mutes a losing-streak wallet |
+| `wallet_profile.status`/`statusReason`/`statusChangedAt` + scoring sub-columns (`track` / `watch` / `ignore`) | The TypeScript scoring layer (`scoreWallets.ts`) | Decides which wallets are worth copying |
+| `wallet_profile.circuit_breaker_muted`, `mute_reason`, `muted_at`, `consecutive_losses`, `recent_results_json` | `bot.py` (via `db.py`) | The circuit-breaker logic that mutes a losing-streak wallet |
+| `bot_risk_state`, `bot_market_event` (whole tables) | `bot.py` (via `risk_manager.py`/`db.py`) | The portfolio-level kill-switch latch and market→event cache — TS/Drizzle owns the table *shape*, but treats the row *contents* as read-only |
 
-`bot.py` checks *both* fields before copying a trade (muted OR not-tracked blocks a copy), but
-it only ever *writes* the mute-related ones. This is why `db.py`'s code has comments like
-*"status is deliberately never written here."*
+`bot.py` checks *both* `wallet_profile` fields before copying a trade (muted OR not-tracked
+blocks a copy), but it only ever *writes* the mute-related ones. This is why `db.py`'s code has
+comments like *"status is deliberately never written here."* Full detail on why this split
+exists and how it's structurally enforced (not just convention): `docs/RISK_MANAGEMENT.md`
+Rule 9.
 
 ### Making it safe for multiple writers at once
 
@@ -175,20 +180,27 @@ This is the same logic that existed before today, just reading/writing SQLite in
    wallets?"* (`bullpen tracker feed`).
 2. For every new trade found:
    - If it's a **BUY**: check the wallet isn't muted, check no other tracked wallet already
-     holds this exact market+outcome (avoids doubling up), then simulate buying $5 worth
-     (paper mode — no real money moves).
+     holds this exact market+outcome and that this trader hasn't hit their same-outcome buy cap
+     (avoids doubling up — `docs/RISK_MANAGEMENT.md` Rule 3), then check the portfolio-level
+     exposure ceiling / per-event cap / drawdown kill switch (`risk_manager.py`, Rule 6). In LIVE
+     mode only, also check the spread/liquidity guard and the pre-trade slippage ceiling
+     (Rules 4 and 11) before an order is ever submitted. Only after every check passes does it
+     simulate (or place) buying $5 worth.
    - If it's a **SELL**: figure out what fraction of their position they sold, and sell that
-     same fraction of our simulated position.
+     same fraction of our simulated position — sells are never blocked by any risk gate.
    - Every decision (copy, or skip-and-why) gets written to the database: one row in
      `bot_event_log` (the raw record) and, for buy/skip decisions specifically, one row in
-     `decision_journal` too.
+     `decision_journal` too. Paper copies also log a signed execution-shortfall measurement
+     (Rule 10) — visibility only, it never changes the paper fill or PnL.
 3. **Every 5 minutes**, a separate sweep checks every open position's current price: if a
    position peaked at +50% profit or more and has since pulled back 10 percentage points from
-   that peak, it's automatically sold (the "trailing take-profit").
+   that peak, it's automatically sold (the "trailing take-profit"). This same sweep also
+   refreshes portfolio equity for the drawdown kill switch.
 4. **Every hour**, another sweep checks whether any held market has resolved (settled); if so,
    the position is closed out at the final price.
 5. Positions live in the `paper_trade` table; the running list of "who's been muted for losing
-   too much" lives in `wallet_profile`.
+   too much" lives in `wallet_profile`; the kill-switch latch and market→event cache live in
+   `bot_risk_state`/`bot_market_event`.
 
 ### B. The local built-in dashboard — `dashboard.py` (runs continuously, port 8787)
 
@@ -267,6 +279,8 @@ built yet.
 | `config.py` | All tuning constants — tracked wallets, risk thresholds, live/paper switch. |
 | `bullpen_client.py` | Talks to the `bullpen` CLI (the only thing that ever touches Polymarket/keys). |
 | `db.py` | Python's bridge to the shared SQLite database. |
+| `risk_manager.py` | Pure-function portfolio risk controls (exposure ceiling, event cap, drawdown kill switch) — see `docs/RISK_MANAGEMENT.md` Rule 6. |
+| `reset_kill_switch.py` | Standalone script to clear a latched kill-switch halt after human review. Deliberately not a dashboard button. |
 | `dashboard.py` | The original small built-in web dashboard (port 8787). |
 | `migrate_to_sqlite.py` | One-time script that moved old JSON data into SQLite. Already run. |
 | `data/app.db` | The actual shared database file. Not tracked in git. |
@@ -276,7 +290,9 @@ built yet.
 | `packages/copy-trading/src/scoreWallets.ts` | Scores those candidates and writes `track`/`watch`/`ignore` onto `wallet_profile.status`. |
 | `packages/shared/src/concurrency.ts` | Small "run N at once" concurrency pool used by `scoreWallets.ts`'s two passes. |
 | `apps/dashboard/` | The new Next.js web dashboard (Overview page built so far). |
-| `docs/SAFETY.md` | Safety rules, ownership boundaries, and known risks. |
+| `docs/RISK_MANAGEMENT.md` | Every risk rule currently enforced — what, how, cost, why. The rules ledger. |
+| `docs/SAFETY.md` | Database ownership boundaries, migration runbooks, and known residual risks. |
+| `test_risk_manager.py`, `test_bot_risk_checks.py` | Unit tests for the portfolio risk controls and the slippage ceiling (pure-function, no DB/network). |
 
 ## 6. What's not built yet
 
