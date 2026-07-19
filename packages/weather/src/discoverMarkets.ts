@@ -12,6 +12,10 @@
 // detects that per-event (by checking for "wunderground.com" in the description) and skips
 // non-Wunderground events entirely rather than mislabeling their settlement_source. Handling
 // non-Wunderground settlement sources is a real, separate future capability, not attempted here.
+// The Polymarket "Weather" category also includes non-city-temperature markets (air quality
+// index, earthquake counts, a hantavirus-pandemic market, "hottest year on record") that share
+// the same binary-outcome shape but obviously aren't Wunderground-settled either — these fall
+// through the same non-Wunderground skip path with no special-casing needed.
 //
 // DYNAMIC STATION AUTO-ONBOARDING (2026-07-19): Polymarket adds new city markets continuously —
 // a station allowlist that only worked for cities seen so far would break the moment an
@@ -38,7 +42,13 @@ import { findStationByExternalId, upsertMarketMapping, upsertWeatherStation } fr
 import { checkOddsFilter } from "./oddsFilter";
 import { resolveStationMetadata } from "./stationReconciliation";
 
-const DISCOVER_LIMIT = process.argv[2] ? Number(process.argv[2]) : 10;
+// Default 100: verified live (2026-07-19) that `bullpen polymarket discover --category weather`
+// caps at 100 events server-side regardless of a higher --limit requested (tried 200, got 100
+// back) — so 100 is the actual full universe available per call, not an arbitrary choice. The
+// original default of 10 was accidentally only seeing ~8 of the real ~48 distinct cities
+// Polymarket currently lists (Joey: "polymarket isnt only this few country... should hv much
+// more") — 100 captures the whole set in one call.
+const DISCOVER_LIMIT = process.argv[2] ? Number(process.argv[2]) : 100;
 
 interface DiscoverOutcome {
   name: string;

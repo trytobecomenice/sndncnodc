@@ -345,15 +345,27 @@ are only briefly in-band and a scan that misses that window would never learn th
 every Wunderground-sourced event's station gets resolved/onboarded on every scan regardless of
 current odds — Rule 10 still gates which *markets* get written to `weather_market_mapping` (a real
 capital/attention decision), but never gates which *stations* this system simply knows about,
-since station metadata alone commits no capital and carries no risk. **Live-verified**: a single
-scan onboarded 6 real stations across 3 continents (KLGA/NYC, ZSPD/Shanghai, RCSS/Taipei,
-WMKK/Kuala Lumpur, ZGGG/Guangzhou, ZHHH/Wuhan, ZGSZ/Shenzhen) with correct real names, coordinates,
-and timezones — including `Asia/Singapore` for Kuala Lumpur, the geographically-correct IANA zone
-name for Malaysia (there is no separate `Asia/Kuala_Lumpur` zone), which a manual per-city map
-would have had to know rather than derive. Re-running is confirmed idempotent (0 newly onboarded
-on a second scan, same 8 stations, same 5 mappings). Still never fabricated: if the parsed code
-isn't a real METAR-reporting station,
-resolution returns `null` and the market is skipped and logged, exactly as before.
+since station metadata alone commits no capital and carries no risk.
+
+**Full-scale live verification (2026-07-19), after Joey pointed out the discovery scan itself was
+also artificially narrow.** The default `--limit` passed to `bullpen polymarket discover` was 10 —
+confirmed live that the API actually caps at **100 events per call regardless of a higher limit
+requested** (tried 200, got 100 back), and those 100 events span **48 distinct cities**, not the
+~8 a `--limit 10` scan could ever see. Default bumped to 100 (the real ceiling, not an arbitrary
+round number). Re-run at full scale: **1,062 real strike markets** scanned across all 100 events,
+**35 additional stations auto-onboarded in one pass** (43 total), **181 draft market mappings**
+written pending Rule 8 review — all in ~32 seconds. Every single station resolved to correct real
+names/coordinates/timezones spanning every inhabited continent (e.g. `Asia/Kolkata` for Lucknow,
+`America/Argentina/Buenos_Aires` for Buenos Aires, `Africa/Johannesburg` for Cape Town,
+`Asia/Singapore` for Kuala Lumpur — Malaysia has no separate `Asia/Kuala_Lumpur` zone), none of
+which any manual per-city map would have gotten right by accident. Re-running confirmed idempotent
+(0 newly onboarded, same 181 mappings). The Polymarket "Weather" category also surfaced 6
+non-city-temperature markets (air quality index, earthquake counts, a hantavirus-pandemic market,
+"hottest year on record") that share the same binary-outcome JSON shape but obviously aren't
+Wunderground-settled — these fall through the existing non-Wunderground skip path with zero
+special-casing needed, confirming that path is robust to market shapes beyond just temperature
+buckets. Still never fabricated: if a parsed code isn't a real METAR-reporting station, resolution
+returns `null` and the market is skipped and logged, exactly as before.
 
 **System costs & trade-offs:** reviewing once per city/event (rather than once per individual
 degree-bucket market) trades a small amount of theoretical rigor for a large reduction in manual
