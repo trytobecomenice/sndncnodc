@@ -6,9 +6,11 @@
   "scripts": {
     "ingest:metar": "tsx src/ingestMetar.ts",
     "prune:historical": "tsx src/pruneHistorical.ts",
+    "discover:markets": "tsx src/discoverMarkets.ts",
     "test": "vitest run"
   },
   "dependencies": {
+    "@copybot/bullpen-client": "workspace:*",
     "@copybot/db": "workspace:*",
     "drizzle-orm": "^0.38.0"
   },

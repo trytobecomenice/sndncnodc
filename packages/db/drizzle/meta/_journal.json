@@ -15,6 +15,13 @@
       "when": 1784306436363,
       "tag": "0001_equal_thor_girl",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1784456276427,
+      "tag": "0002_chief_johnny_blaze",
+      "breakpoints": true
     }
   ]
 }

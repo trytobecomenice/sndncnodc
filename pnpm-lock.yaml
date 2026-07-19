@@ -121,6 +121,9 @@ importers:
 
   packages/weather:
     dependencies:
+      '@copybot/bullpen-client':
+        specifier: workspace:*
+        version: link:../bullpen-client
       '@copybot/db':
         specifier: workspace:*
         version: link:../db

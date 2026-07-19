@@ -12,14 +12,12 @@
 // whole-degree-Celsius bucket, so this script's output must never be used to validate a market
 // resolution, only to feed climatology_prob/forecast_prob.
 //
-// SINGLE-FILE FOR NOW, DELIBERATELY: the blueprint's proposed db/writers.ts (a shared
-// assertStationExists-style guard, mirroring scoreWallets.ts's upsertWalletProfile pattern) is
-// worth building once a SECOND script also writes weather_station/weather_historical_observation
-// rows (ingestNoaa.ts, ingestOpenMeteo.ts). Introducing that abstraction for one caller today
-// would be structure with no reuse yet — deferred until it has a second caller.
+// db/writers.ts now holds the shared upsertWeatherStation helper (added 2026-07-19, once
+// discoverMarkets.ts became a second writer of weather_station — the exact trigger this file
+// originally said would justify the abstraction).
 
-import { and, eq } from "drizzle-orm";
-import { db, weatherHistoricalObservation, weatherStation } from "@copybot/db";
+import { db, weatherHistoricalObservation } from "@copybot/db";
+import { upsertWeatherStation } from "./db/writers";
 
 const AVIATION_WEATHER_BASE = "https://aviationweather.gov/api/data/metar";
 
@@ -102,8 +100,6 @@ function computeCompleteDayMinMax(
 
 const cToF = (c: number) => (c * 9) / 5 + 32;
 
-/** Idempotent — matches on weather_station.external_id's unique constraint, so re-running this
- * script never creates duplicate station rows. */
 async function upsertMetarStation(icaoId: string, sample: MetarReport): Promise<string> {
   const timezone = KNOWN_STATION_TIMEZONES[icaoId];
   if (!timezone) {
@@ -114,27 +110,15 @@ async function upsertMetarStation(icaoId: string, sample: MetarReport): Promise<
     );
   }
 
-  const existing = await db
-    .select({ id: weatherStation.id })
-    .from(weatherStation)
-    .where(and(eq(weatherStation.externalId, icaoId), eq(weatherStation.source, "metar")))
-    .limit(1);
-
-  if (existing.length > 0) return existing[0].id;
-
-  const [inserted] = await db
-    .insert(weatherStation)
-    .values({
-      externalId: icaoId,
-      name: sample.name,
-      source: "metar",
-      lat: sample.lat,
-      lon: sample.lon,
-      timezone,
-      notes: "Onboarded by ingestMetar.ts — nowcast/forecast input only, never a settlement source.",
-    })
-    .returning({ id: weatherStation.id });
-  return inserted.id;
+  return upsertWeatherStation({
+    externalId: icaoId,
+    name: sample.name,
+    source: "metar",
+    lat: sample.lat,
+    lon: sample.lon,
+    timezone,
+    notes: "Onboarded by ingestMetar.ts — nowcast/forecast input only, never a settlement source.",
+  });
 }
 
 /** Idempotent — matches on weather_historical_observation's (station_id, obs_date, source)

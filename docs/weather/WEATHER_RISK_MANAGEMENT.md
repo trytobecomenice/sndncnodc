@@ -7,10 +7,11 @@ exists — precise enough to extend, tune, or challenge without re-deriving the 
 **Status: early implementation.** This rules ledger was written *before* any code, per an explicit
 documentation-first requirement, and is kept in sync as pieces get built — see each rule's "How it
 works mechanically" for what's implemented and unit-tested today (`ingestMetar.ts`,
-`pruneHistorical.ts`, `emergencyCloseoutGuard.ts`, `checkSettlementAgainstMetar.ts`) versus what's
-still planned (`detectAnomaly.ts`'s general bounds-check, `verifySettlement.ts`'s live
-Wunderground fetch, and all entry-rule/position-sizing logic). **This is the single source of
-truth for what rules will apply to the Weather Bot** — check it
+`pruneHistorical.ts`, `emergencyCloseoutGuard.ts`, `checkSettlementAgainstMetar.ts`,
+`discoverMarkets.ts`, `oddsFilter.ts`, `db/writers.ts`) versus what's still planned
+(`detectAnomaly.ts`'s general bounds-check, `verifySettlement.ts`'s live Wunderground fetch, and
+all entry-rule/position-sizing logic). **This is the single source of truth for what rules will
+apply to the Weather Bot** — check it
 before proposing a new restriction so a decision already made here doesn't get silently
 re-thought. `docs/weather/WEATHER_ARCHITECTURE.md` is the companion: data flow, schema, and scheduling
 detail that explains *how* these rules get implemented mechanically.
@@ -309,13 +310,27 @@ category of mistake this whole rules ledger exists to avoid — just one step re
 **What it does:** every new Polymarket weather event gets its settlement station reviewed and
 approved by a human once, before any of its markets can be traded — never fully automatic.
 
-**How it works mechanically:** `discoverMarkets.ts` runs `bullpen polymarket discover --category
-weather` periodically and surfaces one draft candidate per **city/event** (not per individual
-degree-bucket market — Polymarket groups many binary strike markets under one event, e.g. Seoul's
-"highest temperature" event contains a separate market for every whole-degree outcome). A human
-approves the settlement-station pairing once per event; every strike market under that event
-inherits the approved mapping automatically. `is_active` on `weather_market_mapping` defaults to
-requiring this approval — no market trades off an unreviewed mapping.
+**How it works mechanically: implemented and live-run against real Polymarket data (2026-07-19).**
+`packages/weather/src/discoverMarkets.ts` (`pnpm --filter @copybot/weather discover:markets`) runs
+`bullpen polymarket discover --category weather` and, for each event, writes one
+`weather_market_mapping` row per surviving strike market (Rule 10's odds filter applies first —
+see below) — all sharing one settlement-station pairing per event, so the human review happens
+once per **city/event**, not per individual degree-bucket market, even though each strike market
+gets its own row (Polymarket groups many binary strike markets under one event, e.g. Seoul's
+"highest temperature" event contains 11 separate whole-degree markets). Every write goes through
+`upsertMarketMapping`, which always defaults `is_active` to `false` — no market trades off an
+unreviewed mapping. **Real finding from the first live run**: not every weather event settles via
+Wunderground — Hong Kong's event cites the Hong Kong Observatory directly. `discoverMarkets.ts`
+detects this per-event (checking for `wunderground.com` in the description) and skips
+non-Wunderground events entirely rather than mislabeling their `settlement_source`; handling other
+settlement authorities is a real, separate future capability. **Station coordinates are never
+fabricated**: Wunderground's event descriptions name a station and parse to an ICAO-style code
+(from the cited URL — verified the URL's path DEPTH varies by country, e.g. Asian cities use
+`.../kr/incheon/RKSI` but NYC uses `.../us/ny/new-york-city/KLGA`, so the parser matches the
+trailing segment, not a fixed path depth) but never give lat/lon directly — a market's mapping is
+only written if an existing `weather_station` row for that same external ID (typically METAR, from
+`ingestMetar.ts`) already has real, verified coordinates to borrow; otherwise it's skipped and
+logged, never guessed.
 
 **System costs & trade-offs:** reviewing once per city/event (rather than once per individual
 degree-bucket market) trades a small amount of theoretical rigor for a large reduction in manual
@@ -335,23 +350,75 @@ system has enough of a track record to justify loosening the gate.
 every other table in this schema — referential correctness (e.g. "does this `station_id` actually
 exist?") is enforced in application code, not by SQLite.
 
-**How it works mechanically:** a single validation helper, `assertStationExists(stationId)` in
-`packages/weather/src/db/writers.ts`, is called at the top of every writer function that
-references a `station_id` or `market_slug` — the same single-writer-funnel pattern the Copy Bot's
-`upsertWalletProfile` already uses (one function per table is the only place that writes it,
-making the safety boundary easy to verify by inspection).
+**How it works mechanically: implemented (2026-07-19), corrected from this rule's original
+description.** `packages/weather/src/db/writers.ts` (built once a second script,
+`discoverMarkets.ts`, also needed to write `weather_station` rows — the exact trigger
+`ingestMetar.ts`'s original comment said would justify it) holds `findStationByExternalId`,
+`upsertWeatherStation`, and `upsertMarketMapping` — the single-writer-funnel pattern the Copy
+Bot's `upsertWalletProfile` already uses. The actual existence guard is structural rather than a
+separate named `assertStationExists` function (this rule originally described one that wasn't
+actually built that way): `upsertMarketMapping` requires a real `stationId`, and callers (e.g.
+`discoverMarkets.ts`) obtain that ID only from `upsertWeatherStation`/`findStationByExternalId` —
+there is no code path that can write a mapping row with a fabricated or unverified station
+reference. **A real bug this design already caught**: `weather_station.external_id` originally had
+a single-column `UNIQUE` constraint (not composite with `source`), silently contradicting this
+codebase's own documented "one row per source per real-world location" design
+(`docs/weather/WEATHER_ARCHITECTURE.md` §1). It surfaced the moment two different sources actually
+referenced the same station (`discoverMarkets.ts` trying to create a `wunderground` row for a
+station `ingestMetar.ts` had already onboarded as `metar`) — a live `UNIQUE constraint failed`
+error, not a silent corruption. Fixed via a real migration (`packages/db/drizzle/0002_chief_johnny_blaze.sql`):
+dropped the single-column unique index, added a composite one on `(external_id, source)`. Existing
+data survived the migration untouched (verified).
 
 **System costs & trade-offs:** SQLite only enforces FK constraints with `PRAGMA foreign_keys = ON`
 per-connection — turning that on would make any out-of-order write (e.g. a backfill script racing
 ahead of its station row landing) a hard failure instead of an inert loose reference, real
 rigidity for a system with several independent ingestion scripts that can plausibly run out of
-strict order. The `assertStationExists` approach catches the same class of bug (a typo'd or
-deleted-in-error station ID) without that rigidity cost.
+strict order. The structural-guard approach catches the same class of bug (a typo'd or
+deleted-in-error station ID) without that rigidity cost — though, as the composite-index bug
+above shows, "no FKs" also means schema-level mistakes (like a too-strict unique constraint) don't
+get caught until real, live multi-writer usage exercises them. Worth remembering as a general
+caution about this rule, not just a one-time fix.
 
 **Why it exists:** consistency with the rest of this codebase (zero `.references()` calls exist
 anywhere in `packages/db/src/schema.ts` today, Copy Bot tables included) — introducing FKs only
 for weather tables would make this domain structurally inconsistent with everything else in the
 same schema file for no proportionate benefit, since nothing in this system hard-deletes rows.
+
+---
+
+## 10. Extreme Odds Filter
+
+**What it does:** the bot only ingests/tracks strike markets whose current implied probability
+("Yes" outcome price) is between **10% and 90%** — anything outside that band is skipped
+entirely, never written to `weather_market_mapping`.
+
+**How it works mechanically: implemented and unit-tested (2026-07-19).**
+`checkOddsFilter()` in `packages/weather/src/oddsFilter.ts` (`MIN_IMPLIED_PROB = 0.1`,
+`MAX_IMPLIED_PROB = 0.9`, both Joey's stated defaults) is applied by `discoverMarkets.ts` to every
+individual strike market's "Yes" probability before any DB write is even considered — a market
+failing this filter never reaches the station-lookup or mapping-write logic at all. 8 unit tests
+pass, including exact-boundary cases and both live-observed real values (0.0005 and 0.99 from an
+actual `bullpen polymarket discover` run). **Confirmed doing real work on live data**: of 110
+real strike markets scanned in the first live run, 94 were filtered out by this rule alone — most
+Asian city markets that day had already collapsed to near-certainty on one bucket (the day was
+nearly over, the actual high effectively already known), exactly the "capital-inefficient
+steamroller" pattern this rule exists to screen out. Three genuinely contested NYC markets (Yes =
+0.165, 0.525, 0.26) and two Shanghai low-temperature markets (0.166, 0.808) passed the filter —
+the real, live proof the band finds real trading-band opportunities, not just filters everything.
+
+**System costs & trade-offs:** a market can cross into or out of the 10-90% band as new
+information arrives (e.g. a forecast update) — this rule is evaluated at discovery/scan time, not
+continuously, so a market that enters the band between scans isn't picked up until the next
+`discoverMarkets.ts` run, and one that exits the band isn't automatically dropped from
+`weather_market_mapping` (no code yet un-tracks a previously-written mapping — a re-scan just
+never re-writes it, it doesn't delete it). Whether stale, now-out-of-band mappings should be
+actively pruned is an open question, not yet addressed.
+
+**Why it exists:** direct instruction (Joey, 2026-07-19) — deep out-of-the-money markets (<10%)
+are lottery tickets (thin edge-per-dollar-of-risk); deep in-the-money markets (>90%) are
+capital-inefficient (a bet there ties up capital for a payout ratio too small to matter). The bot
+should spend its attention and capital strictly inside the actively-contested trading band.
 
 ---
 

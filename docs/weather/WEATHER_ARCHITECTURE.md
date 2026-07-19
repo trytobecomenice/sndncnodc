@@ -99,12 +99,25 @@ gridpoint/station ID, Open-Meteo's rounded lat/lon (it has no station concept), 
 code, Wunderground's station page ID. There's no database-level link between these rows for the
 same real place (matches the rest of this schema — zero foreign keys anywhere, see Schema
 Strategy below); the pairing is made once, by a human, during the per-city mapping review.
+**Corrected 2026-07-19**: this table's `external_id` column originally had a single-column
+`UNIQUE` constraint, which contradicted "one row per source" and silently made it impossible for
+two sources to ever share the same external ID — caught the moment `discoverMarkets.ts` (a second
+writer) actually tried it, fixed via migration to a composite `(external_id, source)` unique
+index. See `docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 9 for the full story — a concrete
+example of this schema's "no FKs" trade-off cutting both ways: no rigidity from out-of-order
+writes, but also no automatic catch for an overly-strict constraint until real multi-writer usage
+exercises it.
 
-**Market mapping is semi-automated discovery, human-approved.** `discoverMarkets.ts` runs
-`bullpen polymarket discover --category weather --output json` to find new events, parses each
-description for its settlement station, and surfaces one draft candidate per city/event (Polymarket
-groups many binary strike markets — one per degree bucket — under one event). A human approves the
-station pairing once; every strike market under that event inherits it automatically. The
+**Market mapping is semi-automated discovery, human-approved — implemented and live-run (2026-07-19).**
+`discoverMarkets.ts` runs `bullpen polymarket discover --category weather --output json` to find
+new events, parses each description for its settlement station, and writes one
+`weather_market_mapping` row per surviving strike market (Rule 10's odds filter applies first),
+all sharing one station pairing per event so human review only happens once per city/event even
+though Polymarket groups many binary strike markets — one per degree bucket — under that one
+event. `is_active` always starts `false`. **Real finding from the first live run**: not every
+weather event actually settles via Wunderground — Hong Kong's cites the Hong Kong Observatory
+directly; `discoverMarkets.ts` detects and skips non-Wunderground events rather than mislabeling
+them. The
 alternative (reviewing every individual degree-bucket market) was considered and rejected as
 excess manual effort for no added safety — the risky judgment call is which station to trust, not
 which bucket.
@@ -190,11 +203,12 @@ Copy Bot's `scoreWallets.ts` already uses within a single run (its pass-1/pass-2
 ## 4. Proposed `packages/weather/` structure
 
 `packages/weather/` is now a real, wired-in pnpm workspace member — `package.json`/`tsconfig.json`
-exist, and four scripts are built, tested, and live-verified against `data/app.db` (2026-07-19).
-Structure mirrors `packages/copy-trading`'s conventions: plain `tsx`-executed scripts, an
-`isMainModule` guard so files stay test-importable, vitest for pure-function tests. **Deliberately
-no `db/writers.ts` yet** — that shared-guard abstraction (`assertStationExists`) is worth building
-once a second script also writes `weather_station` rows; `ingestMetar.ts` is still the only one.
+exist, and seven scripts/modules are built, tested, and live-verified against `data/app.db` and
+real Polymarket data (2026-07-19). Structure mirrors `packages/copy-trading`'s conventions: plain
+`tsx`-executed scripts, an `isMainModule` guard so files stay test-importable, vitest for
+pure-function tests. **`db/writers.ts` is now built** — introduced exactly when
+`discoverMarkets.ts` became a second writer of `weather_station` rows, the trigger this section
+originally said would justify it.
 
 ```
 packages/weather/
@@ -207,10 +221,13 @@ packages/weather/
     emergencyCloseoutGuard.test.ts      # BUILT ✅ — 8 tests
     checkSettlementAgainstMetar.ts      # BUILT ✅ — Rule 6's Dual Oracle Cross-Check (4°F threshold)
     checkSettlementAgainstMetar.test.ts # BUILT ✅ — 8 tests
+    oddsFilter.ts                       # BUILT ✅ — Rule 10's Extreme Odds Filter (10%-90% band)
+    oddsFilter.test.ts                  # BUILT ✅ — 8 tests
+    discoverMarkets.ts                  # BUILT ✅ — bullpen discover --category weather → draft mapping candidates, odds-filtered
+    db/writers.ts                       # BUILT ✅ — shared upsertWeatherStation/upsertMarketMapping/findStationByExternalId
     ingestNoaa.ts                       # not yet built — forecast + climatology input
     ingestOpenMeteo.ts                  # not yet built — forecast input
     verifySettlement.ts                 # not yet built — Playwright, Wunderground, ON-DEMAND ONLY (deliberately deferred, see docs/weather/WEATHER_RISK_MANAGEMENT.md Rule 5)
-    discoverMarkets.ts                  # not yet built — bullpen discover --category weather → draft mapping candidates
     detectAnomaly.ts                    # not yet built — Rule 4's general physically-impossible-jump bounds-check
     computeProbability.ts               # not yet built — climatology + forecast + nowcast blend
     checkMarkets.ts                     # not yet built — refresh market-implied prices, recompute edge

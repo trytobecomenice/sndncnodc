@@ -310,16 +310,27 @@ export const botMarketEvent = sqliteTable("bot_market_event", {
 // Weather domain
 // ---------------------------------------------------------------------------
 
-export const weatherStation = sqliteTable("weather_station", {
-  id: id(),
-  externalId: text("external_id").notNull().unique(),
-  name: text("name").notNull(),
-  source: text("source").notNull(), // noaa | openmeteo | wunderground
-  lat: real("lat").notNull(),
-  lon: real("lon").notNull(),
-  timezone: text("timezone").notNull(),
-  notes: text("notes"),
-});
+export const weatherStation = sqliteTable(
+  "weather_station",
+  {
+    id: id(),
+    // NOT globally unique on its own — see the composite unique index below. One real-world
+    // location gets one row PER SOURCE (external_id is that source's own identifier for it,
+    // e.g. an ICAO code from both METAR and Wunderground for the same airport) — a single-column
+    // unique constraint here was a bug, caught 2026-07-19 when discoverMarkets.ts tried to
+    // create a "wunderground" row for a station ingestMetar.ts had already onboarded as "metar"
+    // and hit a UNIQUE constraint violation. See docs/weather/WEATHER_ARCHITECTURE.md §1,
+    // "Source-to-station mapping."
+    externalId: text("external_id").notNull(),
+    name: text("name").notNull(),
+    source: text("source").notNull(), // noaa | openmeteo | metar | wunderground
+    lat: real("lat").notNull(),
+    lon: real("lon").notNull(),
+    timezone: text("timezone").notNull(),
+    notes: text("notes"),
+  },
+  (t) => [uniqueIndex("weather_station_external_id_source_unique_idx").on(t.externalId, t.source)]
+);
 
 export const weatherHistoricalObservation = sqliteTable(
   "weather_historical_observation",
