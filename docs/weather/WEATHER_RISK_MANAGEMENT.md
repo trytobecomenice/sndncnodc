@@ -43,11 +43,25 @@ decision, never a side effect of another change.
 
 ---
 
-## 2. Strict physical isolation
+## 2. Strict physical isolation — "100% Dependency Isolation," formal definition
 
 **What it does:** the Weather Bot's code, database tables, and documentation live entirely
-separately from the Copy Bot's — zero shared logic beyond two already-shared TypeScript utility
-packages.
+separately from the Copy Bot's. This rule has three concrete, checkable parts (defined explicitly
+by Joey, 2026-07-19 — not left as a vague principle):
+
+1. **Zero runtime imports.** `packages/weather` must never import any code or module from
+   `packages/copy-trading`, and vice versa. They execute as completely separate, decoupled OS
+   processes — no shared process, no shared in-memory state, ever.
+2. **Isolated third-party dependencies.** Heavy or risky dependencies required only by weather
+   work (e.g. Playwright, needed for the future Wunderground settlement fetch — Rule 5) are
+   declared exclusively in `packages/weather/package.json`. `packages/copy-trading/package.json`
+   must remain entirely untouched by weather-driven dependency additions, and vice versa.
+3. **Table-level logic boundary.** Both packages intentionally share `@copybot/db` (the same
+   physical SQLite file and one Drizzle schema file, `packages/db/src/schema.ts`) — that sharing
+   is deliberate, approved infrastructure, not a violation. But weather business logic must never
+   read or write a Copy Bot table (`wallet_profile`, `paper_trade`, `leaderboard_scan`,
+   `decision_journal`, `rule_set`, `bot_event_log`, or any other non-`weather_*` table) — it is
+   strictly limited to the 7 `weather_*` tables.
 
 **How it works mechanically:** all Weather Bot code lives in `packages/weather/` only — never
 `packages/copy-trading/`, never any Python Copy Bot file (`bot.py`/`db.py`/`config.py`/
@@ -55,15 +69,21 @@ packages.
 `packages/db/src/schema.ts` lines 309-411) are structurally separate from every Copy Bot table —
 no shared rows, no shared `rule_set`/`rule_change` reuse (those are shaped around copy-trading
 concepts like mute streaks and TTP activation; reusing them would blur the boundary this rule
-exists to keep sharp). The only shared infrastructure is the physical `data/app.db` SQLite file
-itself and two utility packages already designed to be shared: `packages/bullpen-client` (talks to
-the `bullpen` CLI) and `packages/db` (the Drizzle connection + full schema, both domains' tables
-included in one file for operational simplicity, not because the domains are one system).
+exists to keep sharp). **Verified compliant as of `ingestMetar.ts` (2026-07-19)**: a repo-wide
+grep found zero references from `packages/weather/` to `packages/copy-trading/` or to any
+Copy-Bot-specific table name, and zero references the other direction — `packages/weather/package.json`
+currently depends on only `@copybot/db` + `drizzle-orm`, nothing from `packages/copy-trading`.
+This check should be re-run (a plain grep is sufficient — see the parenthetical above) any time a
+new weather script is added, not assumed to stay true automatically.
 
 **System costs & trade-offs:** this means some genuine duplication — the Weather Bot can't reuse
 the Copy Bot's `rule_set` versioning table, circuit-breaker patterns, or portfolio risk manager
 even where the underlying need (versioned thresholds, a kill-switch pattern) is conceptually
-similar; each gets its own weather-specific implementation. That's accepted cost, not an oversight.
+similar; each gets its own weather-specific implementation. Isolated dependencies (part 2) also
+means the two packages' `node_modules` will diverge over time (e.g. only weather ever pulls in
+Playwright, a heavy dependency) — accepted cost, not an oversight, and arguably a benefit: a
+Copy Bot install never pays for weather-only dependencies, and a security issue in one package's
+dependency tree can't implicate the other's.
 
 **Why it exists:** `.claudeprompt`'s standing instruction: "Keep these domains separated at all
 times. Never mix Copy Bot logic with Weather Bot logic, and never let their database tables or
