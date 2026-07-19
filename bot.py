@@ -70,6 +70,12 @@ def check_spread_tolerance(market_slug, outcome, amount, side):
     Fails safe: if preview itself errors (network/timeout/parse), this
     returns not-ok rather than skipping the check -- we'd rather miss a copy
     than fire one blind into an unknown book.
+
+    OUTPUT: (ok, reason, executable_price) — executable_price is the fresh
+    preview price this call already fetched, returned so callers (e.g.
+    check_slippage_ceiling, added 2026-07-19) can reuse it instead of
+    making a second preview call for the same market/outcome/amount. None
+    when ok is False (no reliable price was read).
     """
     try:
         preview = run_bullpen_json([
@@ -77,23 +83,63 @@ def check_spread_tolerance(market_slug, outcome, amount, side):
             "--side", "buy" if side == "BUY" else "sell",
         ], retries=config.FEED_FETCH_RETRIES, retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS)
     except Exception as e:
-        return False, f"preview unavailable: {e}"
+        return False, f"preview unavailable: {e}", None
 
     price = preview.get("price")
     spread = preview.get("spread")
     if not price or price <= 0 or spread is None:
-        return False, f"preview missing price/spread: {preview}"
+        return False, f"preview missing price/spread: {preview}", None
 
     relative_spread = spread / price
     if relative_spread > config.SPREAD_TOLERANCE:
         return False, (
             f"relative spread {relative_spread:.1%} exceeds tolerance "
             f"{config.SPREAD_TOLERANCE:.0%} (price={price}, abs_spread={spread})"
-        )
+        ), None
 
     if preview.get("warning"):
         return False, f"liquidity warning from preview: {preview['warning']}"
 
+    return True, None, price
+
+
+def check_slippage_ceiling(source_price, executable_price, side):
+    """"Disciplined Taker" price ceiling, added 2026-07-19. Proactively
+    ABORTS a live copy if the market has already moved past
+    config.SLIPPAGE_TOLERANCE since the source trade — a genuine PRE-TRADE
+    decision, distinct from the --max-price/--min-price already passed to
+    the order itself in process_trade/close_position_trailing_tp (same
+    SLIPPAGE_TOLERANCE constant, reused rather than duplicated — see its
+    doc comment in config.py). Without this check, a moved market still
+    gets an order SUBMITTED: --max-price/--min-price stops it from filling
+    at a bad price, but the order can still rest unfilled on the book at
+    the limit price rather than cleanly not happening, and could come back
+    to fill hours later against a signal that's no longer live. This check
+    means we never submit that order in the first place.
+
+    Only called on BUYs in practice (see call site in process_trade) — a
+    slippage ceiling on a SELL would block an exit, and per
+    risk_manager.py's same principle, a risk layer that traps you in
+    positions adds risk instead of removing it. Kept side-aware anyway so
+    the direction is correct if a SELL use is ever deliberately added.
+
+    INPUT:  source_price — the tracked trader's own fill price
+            executable_price — the CURRENT price from a fresh preview
+            side — "BUY" or "SELL"
+    OUTPUT: (ok, reason) — reason is None when ok
+    """
+    if side == "BUY":
+        adverse_pct = (executable_price - source_price) / source_price
+    else:
+        adverse_pct = (source_price - executable_price) / source_price
+
+    if adverse_pct > config.SLIPPAGE_TOLERANCE:
+        return False, (
+            f"price moved {adverse_pct:.1%} against the source trade "
+            f"(source={source_price}, executable={executable_price}), exceeds "
+            f"{config.SLIPPAGE_TOLERANCE:.0%} slippage ceiling — aborting rather "
+            f"than submit an order into an already-moved market"
+        )
     return True, None
 
 
@@ -233,7 +279,10 @@ def close_position_trailing_tp(key, trader, nickname, market_slug, outcome, posi
 
     effective_price = current_price
     if config.LIVE_MODE:
-        spread_ok, spread_reason = check_spread_tolerance(market_slug, outcome, shares_closed, "SELL")
+        # No slippage-ceiling check here (contrast the BUY path in
+        # process_trade) — this is an exit, and exits are never blocked
+        # by a risk gate (see check_slippage_ceiling's docstring / risk_manager.py).
+        spread_ok, spread_reason, _preview_price = check_spread_tolerance(market_slug, outcome, shares_closed, "SELL")
         if not spread_ok:
             append_log({**base_event, "event_type": "skip_wide_spread_trailing_tp", "reason": spread_reason})
             return
@@ -687,11 +736,20 @@ def process_trade(trade, positions, source_positions, trader_performance, muted_
         # failed_trade and bail out — we must NOT record a position we
         # never actually acquired.
         if config.LIVE_MODE:
-            spread_ok, spread_reason = check_spread_tolerance(
+            spread_ok, spread_reason, executable_price = check_spread_tolerance(
                 market_slug, outcome, config.FIXED_TRADE_USD, "BUY"
             )
             if not spread_ok:
                 append_log({**base_event, "event_type": "skip_wide_spread", "reason": spread_reason})
+                return
+
+            # "Disciplined Taker" price ceiling — reuses the preview price
+            # check_spread_tolerance just fetched, no extra network call.
+            # BUY-only: exits are never blocked by a risk gate (see
+            # check_slippage_ceiling's docstring).
+            slippage_ok, slippage_reason = check_slippage_ceiling(price, executable_price, "BUY")
+            if not slippage_ok:
+                append_log({**base_event, "event_type": "skip_slippage_ceiling", "reason": slippage_reason})
                 return
 
             max_price = round(price * (1 + config.SLIPPAGE_TOLERANCE), 4)
@@ -764,7 +822,10 @@ def process_trade(trade, positions, source_positions, trader_performance, muted_
         # reasoning as BUY: a failed, unmatched, or reverted sell must not
         # be recorded as closed.
         if config.LIVE_MODE:
-            spread_ok, spread_reason = check_spread_tolerance(
+            # No slippage-ceiling check here — this is an exit (see
+            # check_slippage_ceiling's docstring / risk_manager.py's same
+            # principle: never block a SELL, only BUYs).
+            spread_ok, spread_reason, _preview_price = check_spread_tolerance(
                 market_slug, outcome, shares_closed, "SELL"
             )
             if not spread_ok:

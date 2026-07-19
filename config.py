@@ -93,10 +93,19 @@ TRACKED_TRADERS = {
 FIXED_TRADE_USD = 5.0
 
 # Max acceptable slippage on LIVE orders, as a fraction of the source trade's
-# price. A live buy will not fill above price*(1+SLIPPAGE_TOLERANCE); a live
-# sell will not fill below price*(1-SLIPPAGE_TOLERANCE). Protects against
-# copying into a price spike that happened between the source trade and our
-# execution a few seconds later.
+# price. Governs TWO complementary mechanisms that share this one number:
+#   1. Order-level fill limit: a live buy will not fill above
+#      price*(1+SLIPPAGE_TOLERANCE); a live sell will not fill below
+#      price*(1-SLIPPAGE_TOLERANCE) (--max-price/--min-price passed to the
+#      order itself).
+#   2. Pre-trade "Disciplined Taker" price ceiling, added 2026-07-19
+#      (check_slippage_ceiling in bot.py, BUY-only): if a fresh preview
+#      shows the market has ALREADY moved past this band since the source
+#      trade, the copy is aborted before an order is ever submitted, rather
+#      than relying solely on (1) to reject/rest an order into an
+#      already-moved market.
+# Both exist to protect against copying into a price spike that happened
+# between the source trade and our execution a few seconds later.
 #
 # Raised from 0.03 -> 0.05 on 2026-07-15 to cut "unresolved trade" misses on
 # fast-moving markets. Tradeoff: a 5% band also means we'll now fill copies
