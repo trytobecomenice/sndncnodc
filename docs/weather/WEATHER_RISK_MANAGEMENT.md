@@ -18,10 +18,11 @@ before proposing a new restriction so a decision already made here doesn't get s
 re-thought. `docs/weather/WEATHER_ARCHITECTURE.md` is the companion: data flow, schema, and scheduling
 detail that explains *how* these rules get implemented mechanically.
 
-**Rules 1-15 are implemented and live-verified except where noted (the anomaly-detector's general
-bounds-check and `verifySettlement.ts` still planned, see Roadmap). Rule 14 (the EV Bridge) and
-Rule 15 (the Order Builder — Rules 7/11/12 now actually enforced, not just documented) are both
-implemented and live-verified end-to-end as of 2026-07-20.**
+**Rules 1-16 are implemented and live-verified except where noted (the anomaly-detector's general
+bounds-check and `verifySettlement.ts` still planned, see Roadmap). Rule 14 (the EV Bridge), Rule
+15 (the Order Builder — Rules 7/11/12 now actually enforced), and Rule 16 (the Early-Exit Engine —
+profit-target/stop-loss, closing the position lifecycle) are all implemented and live-verified
+end-to-end as of 2026-07-20.**
 
 This document is intentionally separate from `docs/copy-trading/RISK_MANAGEMENT.md` (the Copy Bot's rules
 ledger) — per `.claudeprompt`, the two systems' rules, like their code and schema, must never be
@@ -868,6 +869,84 @@ written down" and "a rule is enforced by running code."
 
 ---
 
+## 16. The Early-Exit Engine — profit-target and stop-loss position monitoring
+
+**What it does:** the "brain for swing trading." `earlyExit.ts` scans every open paper position
+and decides HOLD to settlement or EXIT early, closing the position (paper-only) the moment it
+does. This is the direct implementation of the strategic framing Joey introduced when the EV
+Bridge was built (Rule 14): "we are not just holding to settlement... we want two paths for a
+trade: holding to resolution, OR trading the spread dynamically."
+
+**How it works mechanically: implemented and live-verified end-to-end (2026-07-20).**
+
+- **`exitSignals.ts`** — pure, unit-tested functions (11 tests), same DB-free split as
+  `orderSizing.ts`. `evaluateExit(heldOutcome, freshEdge, edgeFloor, tempBufferCheck)` re-signs the
+  latest `weather_probability_estimate.edge` (always computed from the "Yes" outcome's
+  perspective) to the position's own held side, then checks three conditions in priority order:
+  1. **`stop_loss_temp_buffer`** — the fresh ensemble's point-estimate forecast has drifted back
+     into Rule 12's buffer zone, checked FIRST regardless of what the edge says, since a point-
+     forecast drift is a more immediate danger signal than the blended probability (which can lag
+     behind a forecast that's already moving against the position).
+  2. **`stop_loss_model_inversion`** — the re-signed edge has gone negative AND its magnitude is
+     itself ≥ the same 5pp floor (Rule 7) — a REAL opposing edge has emerged, not noise.
+  3. **`profit_target`** — the re-signed edge is still positive but has decayed below that same
+     5pp floor. **Deliberately reuses Rule 7's existing edge floor rather than inventing a new
+     profit-capture-percentage constant** — the reasoning: a position whose current edge no longer
+     clears the same bar a brand-new trade would need to clear has no real remaining reason to
+     hold, i.e. "alpha decay." Keeps the entry and exit bars consistent with each other by
+     construction, not by manual tuning.
+- **Freshness gate**: a position is only evaluated against a `weather_probability_estimate` row
+  strictly newer than the position's own `openedAt`. If `checkMarkets.ts` hasn't produced a fresher
+  read since entry — including, deliberately, when a market has gone stale (Rule 14's Staleness
+  Guard) and `checkMarkets.ts` has stopped logging fresh estimates for it — this correctly falls
+  through to HOLD. A near-resolution market should ride to real settlement, not be force-exited on
+  a signal that no longer exists to check.
+- **`earlyExit.ts`** — the orchestrator. For each open position: looks up its
+  `weather_market_mapping` (threshold range only — no station timezone lookup needed here, unlike
+  `checkMarkets.ts`/`orderBuilder.ts`, precisely because staleness is handled indirectly via the
+  freshness gate above, not re-checked directly); fetches the freshest estimate; runs
+  `checkTempBuffer` + `evaluateExit`; on an exit signal, prices the exit from the latest
+  `weather_market_odds_snapshot` row (side-adjusted: a "No" position's exit price is
+  `1 - impliedYesProbability`) and computes `realizedPnlUsd` via `computeRealizedPnl(entryPrice,
+  exitPrice, ourShares)`; writes the close via a new `closePaperTradeOrder()` writer
+  (`status='closed'`, `closedAt`, `realizedPnlUsd`, `closeReason`).
+- **Auto-close, an explicit choice (Joey, 2026-07-20, asked and confirmed rather than assumed)**:
+  paper-only (Rule 1) means auto-closing carries zero real-capital risk, and it's the only way to
+  actually complete the position lifecycle — a position left "open" forever (even after its edge
+  has genuinely evaporated) would permanently block `orderBuilder.ts`'s duplicate-exposure guard
+  from ever re-entering that market on a later, independent signal. This also closes the "position
+  closeout/PnL" gap the Roadmap had flagged since Rule 15.
+
+**Live-verified against synthetic-but-isolated test cases (2026-07-20), real production code path,
+cleaned up after — the same smoke-test-then-clean-up pattern used for `checkMarkets.ts`'s first
+verification.** Two cases run against the real `data/app.db` via the real `earlyExit.ts`/
+`closePaperTradeOrder` code path, then deleted (never touching the 3 real open Seoul positions,
+confirmed intact after both tests): (1) a position with a decayed 2pp edge correctly triggered
+`profit_target` and closed with `realizedPnl=$20.00` (exit 0.60 vs. entry 0.50, matching the exact
+math `computeRealizedPnl` predicts); (2) a position with a strong +30pp edge but a forecast sitting
+only 0.9°F from a strike boundary (below the 1.5°F buffer) correctly triggered
+`stop_loss_temp_buffer` — proving the priority order works as designed: a real danger signal
+overrides even a currently-strong edge. The 3 real open Seoul positions were also evaluated in both
+runs and correctly held (all three still clear the 5pp floor with an intact buffer as of this
+session).
+
+**System costs & trade-offs:** the freshness gate means `earlyExit.ts` is only as good as how often
+`checkMarkets.ts` is re-run — with no scheduler wired up yet (per the Execution Cycle table,
+`docs/weather/WEATHER_ARCHITECTURE.md` §3), a position sitting between manual runs won't be
+evaluated for exit at all, which is a real gap for genuine "swing trading" (which implies
+timeliness) until scheduling exists. Reusing Rule 7's floor for both entry and exit means the exact
+same calibration uncertainty flagged there applies here too — an uncalibrated 5pp floor is doing
+double duty as both gates, so miscalibration in one direction affects both when to enter AND when
+to exit identically, not independently.
+
+**Why it exists:** direct instruction (Joey, 2026-07-20) — "the brain for swing trading," the
+second half of the buy-low/sell-high strategy Rule 14's odds-history table was built to enable.
+Closes the position lifecycle Rule 15 left open: a Weather Bot that can only open positions and
+never close them early isn't actually capable of the dynamic-spread-trading strategy Joey described
+when the odds-history table was first built.
+
+---
+
 ## Roadmap / explicitly not yet built
 
 - `detectAnomaly.ts`'s general bounds-check (physically-impossible-jump detection on raw
@@ -881,17 +960,19 @@ written down" and "a rule is enforced by running code."
   (0.25), `TEMP_BUFFER_F` (1.5), `STALE_CUTOFF_HOUR` (18:00) — all are explicitly-flagged starting
   values, not empirically derived. Needs real paper-trade settlement outcomes to validate against;
   the 3 real positions opened 2026-07-20 are the first data toward that.
-- **The "Buy Low, Sell High" early-exit strategy** — trading the spread dynamically as odds shift,
-  rather than only holding every position to settlement (Joey, 2026-07-20). The odds-history table
-  (`weather_market_odds_snapshot`, Rule 14) exists specifically to make this possible later; the
-  actual shift-detection/exit-decision logic is not built yet.
-- **Position closeout / settlement-driven PnL** — `orderBuilder.ts` only opens positions; nothing
-  yet closes a `weather_position` row, computes `realizedPnlUsd`, or rolls up `weather_pnl_snapshot`.
-  This is the natural next gap once real positions exist to close.
+- **`weather_pnl_snapshot` rollup** — `earlyExit.ts` (Rule 16) now computes and writes
+  `realizedPnlUsd` per closed position, but nothing yet aggregates that into a portfolio-level
+  `weather_pnl_snapshot` row (realized + unrealized totals, open position count, win rate) the way
+  the Copy Bot's `paper:update-pnl` does. The per-position data now exists; the rollup script over
+  it does not.
+- **Scheduling for `earlyExit.ts`** — real gap named in Rule 16: exit evaluation is only as timely
+  as how often `checkMarkets.ts` is manually re-run. No `launchd` job exists yet for either script
+  (see Execution Cycle, `docs/weather/WEATHER_ARCHITECTURE.md` §3), so genuine "swing trading"
+  timeliness isn't there yet.
 - `WEATHER_PAPER_BANKROLL_USD` is currently a static mock constant (10,000), not a real,
   accounted-for capital base — Rule 11's sizing math is correct, but nothing yet tracks capital
   consumed by open positions against it (a second open position sized off the same static 10,000
-  rather than remaining capital), which the 3-open-position portfolio right now doesn't yet expose
+  rather than remaining capital), which the small open-position count right now doesn't yet expose
   but a larger one would.
 - The `weather_rule_set` table, if/when entry-threshold logic needs its own versioned audit trail.
 - `launchd` plist files (mechanism decided in `docs/weather/WEATHER_ARCHITECTURE.md`; concrete job

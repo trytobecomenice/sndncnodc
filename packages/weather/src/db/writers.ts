@@ -179,6 +179,48 @@ export async function hasOpenPosition(marketSlug: string): Promise<boolean> {
   return rows.length > 0;
 }
 
+export interface OpenPositionRow {
+  id: string;
+  marketSlug: string;
+  outcome: "Yes" | "No";
+  openedAt: Date;
+  entryPrice: number;
+  ourShares: number;
+}
+
+/** All currently-open paper positions — earlyExit.ts's entry point (mirrors orderBuilder.ts's
+ * fetchActiveMappings as the analogous "what do I need to evaluate this pass" query). */
+export async function fetchOpenPositions(): Promise<OpenPositionRow[]> {
+  const rows = await db
+    .select({
+      id: weatherPosition.id,
+      marketSlug: weatherPosition.marketSlug,
+      outcome: weatherPosition.outcome,
+      openedAt: weatherPosition.openedAt,
+      entryPrice: weatherPosition.entryPrice,
+      ourShares: weatherPosition.ourShares,
+    })
+    .from(weatherPosition)
+    .where(eq(weatherPosition.status, "open"));
+  return rows as OpenPositionRow[];
+}
+
+/** Closes a paper position (Early-Exit Engine, Joey 2026-07-20) — writes closedAt/realizedPnlUsd/
+ * closeReason and flips status to 'closed'. Paper-only (Rule 1): closing here never touches a real
+ * order. Once closed, the position no longer blocks orderBuilder.ts's duplicate-exposure guard
+ * from re-entering the same market on a later, independent signal. */
+export async function closePaperTradeOrder(
+  positionId: string,
+  exitPrice: number,
+  realizedPnlUsd: number,
+  closeReason: string
+): Promise<void> {
+  await db
+    .update(weatherPosition)
+    .set({ status: "closed", closedAt: new Date(), realizedPnlUsd, closeReason })
+    .where(eq(weatherPosition.id, positionId));
+}
+
 export interface InsertPaperTradeOrderParams {
   marketSlug: string;
   outcome: "Yes" | "No";

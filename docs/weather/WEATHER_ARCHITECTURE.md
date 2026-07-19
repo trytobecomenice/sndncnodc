@@ -87,8 +87,12 @@ weather_probability_estimate  (climatology + forecast → blended_prob; market_i
 weather_position  (the Order Builder — orderBuilder.ts, Rule 15: Kelly-sized paper trades,
                     enforcing Rules 7/11/12, live-verified 2026-07-20)
         │
+        ├── earlyExit.ts (Rule 16, the "brain for swing trading"): scans open positions against
+        │   fresher checkMarkets.ts estimates, closes on profit-target (alpha decay below the same
+        │   Rule 7 floor) or stop-loss (model inversion / temp-buffer failure) — paper-only,
+        │   auto-closing, live-verified 2026-07-20
         ▼
-weather_pnl_snapshot
+weather_pnl_snapshot  (rollup not yet built — see Roadmap)
 ```
 
 **Why two source roles, not one.** Every source that feeds `forecast_prob`/`climatology_prob`
@@ -285,7 +289,7 @@ Copy Bot's `scoreWallets.ts` already uses within a single run (its pass-1/pass-2
 ## 4. Proposed `packages/weather/` structure
 
 `packages/weather/` is now a real, wired-in pnpm workspace member — `package.json`/`tsconfig.json`
-exist, and twenty-one scripts/modules are built, tested, and live-verified against `data/app.db` and
+exist, and twenty-four scripts/modules are built, tested, and live-verified against `data/app.db` and
 real Polymarket/Open-Meteo data (2026-07-19 through 2026-07-20). Structure mirrors
 `packages/copy-trading`'s conventions: plain
 `tsx`-executed scripts, an `isMainModule` guard so files stay test-importable, vitest for
@@ -327,16 +331,19 @@ packages/weather/
     orderSizing.ts                      # BUILT ✅ — Rule 15, pure Kelly/edge-floor/temp-buffer/sizing math
     orderSizing.test.ts                 # BUILT ✅ — 14 tests
     orderBuilder.ts                     # BUILT ✅ — Rule 15, the Order Builder: reads weather_probability_estimate, writes sized paper trades to weather_position
-    managePositions.ts                  # not yet built — position CLOSEOUT/settlement, not entry (entry is now orderBuilder.ts's job)
+    exitSignals.ts                      # BUILT ✅ — Rule 16, pure profit-target/stop-loss decision math
+    exitSignals.test.ts                 # BUILT ✅ — 11 tests
+    earlyExit.ts                        # BUILT ✅ — Rule 16, the Early-Exit Engine: scans open positions, auto-closes on profit-target/stop-loss
     updatePnl.ts                        # not yet built — weather_pnl_snapshot rollup
 ```
 
 `packages/weather/package.json` scripts, built: `ingest:metar`, `prune:historical`,
 `discover:markets`, `backfill:historical`, `ingest:openmeteo`, `prune:forecasts`,
-`calculate:probability`, `check:markets`, `build:orders`. Not yet built: `manage-positions`,
+`calculate:probability`, `check:markets`, `build:orders`, `check:exits`. Not yet built:
 `update-pnl`. Each is its own future `launchd` job (mechanism decided, jobs not yet scheduled — see
 §3). `verifySettlement.ts` deliberately has **no** script/job of its own — it's a function called
-from `discoverMarkets.ts` and `managePositions.ts`, never an independent poll.
+from `discoverMarkets.ts`, never an independent poll (position closeout is now `earlyExit.ts`'s
+job, not a `managePositions.ts` that never got built).
 
 ---
 
@@ -344,12 +351,9 @@ from `discoverMarkets.ts` and `managePositions.ts`, never an independent poll.
 
 - NOAA ingestion and the live Wunderground fetch (`verifySettlement.ts`) — see §4's file table for
   the current built/not-built split.
-- **Position closeout / settlement-driven PnL** (`managePositions.ts`'s remaining job, `updatePnl.ts`) —
-  `orderBuilder.ts` (Rule 15) only opens positions; nothing yet closes one, computes realized PnL,
-  or rolls up `weather_pnl_snapshot`.
-- **The "Buy Low, Sell High" early-exit strategy** — the odds-history table
-  (`weather_market_odds_snapshot`) exists to make this possible later; the shift-detection/exit
-  logic itself is not built.
+- **`weather_pnl_snapshot` rollup** (`updatePnl.ts`) — `earlyExit.ts` (Rule 16) now computes and
+  writes `realizedPnlUsd` per closed position, but nothing yet aggregates that into a
+  portfolio-level snapshot (realized + unrealized totals, win rate).
 - The `weather_rule_set` table.
 - `launchd` plist files themselves (mechanism decided; concrete job definitions come with the
   scripts they invoke).

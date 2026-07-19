@@ -4,7 +4,7 @@
 "Last reviewed" date below before trusting a number in here over the live system (`bot.out.log`,
 `data/app.db`, `bullpen status`).
 
-**Last reviewed: 2026-07-20** (updated same-day: Weather Bot Order Builder — Staleness Guard + `orderBuilder.ts` — built and live-verified, 3 real paper positions opened)
+**Last reviewed: 2026-07-20** (updated same-day: Weather Bot Early-Exit Engine — `earlyExit.ts` — built and live-verified; profit-target/stop-loss auto-close now closes the position lifecycle)
 
 ## Snapshot, right now
 
@@ -152,11 +152,32 @@
   model (resolved: quarter-Kelly), Rule 7's edge floor wasn't in the original scope but was judged
   a natural companion to Rule 12 (resolved: built now), and "too close to end of day" needed a
   concrete number (resolved: 18:00 station-local). **Kept as real paper-trading positions**, Joey's
-  explicit choice — not cleared as test artifacts. 70 unit tests passing across the weather package.
-  Still not built: `verifySettlement.ts` (the live Wunderground/Playwright fetch — deliberately
-  deferred as its own step), `detectAnomaly.ts`'s general bounds-check, position closeout/PnL
-  rollup, the early-exit strategy. Full design in `docs/weather/WEATHER_ARCHITECTURE.md` /
-  `docs/weather/WEATHER_RISK_MANAGEMENT.md`.
+  explicit choice — not cleared as test artifacts.
+- **The Early-Exit Engine — built and live-verified** (2026-07-20; `exitSignals.ts`,
+  `earlyExit.ts`, 22nd-23rd scripts; new `closePaperTradeOrder`/`fetchOpenPositions` writers). The
+  "brain for swing trading" — closes the position lifecycle Rule 15 left open. Scans every open
+  `weather_position` and, using whatever fresher-than-entry `weather_probability_estimate` exists,
+  decides HOLD or EXIT: `profit_target` when the edge has decayed below the same 5pp floor a new
+  trade needs to clear (Rule 7, reused rather than a new invented constant — "alpha decay"),
+  `stop_loss_model_inversion` when a real opposing edge emerges, or `stop_loss_temp_buffer` when a
+  fresh forecast drifts back into Rule 12's buffer zone — checked FIRST, ahead of the edge, since a
+  point-forecast drift is a more immediate danger signal. Auto-closes (writes `realizedPnlUsd`) on
+  any exit signal — an explicit choice Joey confirmed rather than a signal-only design, since paper
+  trading means auto-closing is zero-risk and is the only way a closed market becomes re-tradeable
+  again (orderBuilder.ts's duplicate-exposure guard otherwise blocks it forever). **Live-verified**
+  via two isolated synthetic test cases (inserted, run through the real code path, deleted — the 3
+  real Seoul positions untouched throughout and confirmed still open after both tests): a decayed
+  2pp-edge position correctly triggered `profit_target` with exactly-correct PnL math ($20.00 on a
+  0.50→0.60 move); a strong +30pp-edge position with a forecast 0.9°F from a strike boundary
+  correctly triggered `stop_loss_temp_buffer` instead — proving the priority order (danger signal
+  beats a currently-strong edge) works as designed. All 3 real Seoul positions independently
+  evaluated correctly as HOLD in both runs. 81 unit tests passing across the weather package.
+  **Real gap named, not hidden**: exit timeliness is bounded by how often `checkMarkets.ts` is
+  manually re-run — no scheduler exists yet for either script, so this isn't yet genuine real-time
+  swing trading. Still not built: `verifySettlement.ts` (the live Wunderground/Playwright fetch —
+  deliberately deferred as its own step), `detectAnomaly.ts`'s general bounds-check,
+  `weather_pnl_snapshot`'s portfolio-level rollup. Full design in
+  `docs/weather/WEATHER_ARCHITECTURE.md` / `docs/weather/WEATHER_RISK_MANAGEMENT.md`.
 - **Database schema ownership:** TypeScript/Drizzle owns schema and migrations; Python
   (`db.py`) uses CRUD only — see `docs/copy-trading/SAFETY.md` §2.
 
