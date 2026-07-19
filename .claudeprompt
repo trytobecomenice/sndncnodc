@@ -1,0 +1,27 @@
+# Agent Instructions for polymarket-copybot
+
+These rules are mandatory for this workspace.
+
+## 1) System Overview & Two-Part Architecture
+- This repository contains two distinct domains:
+  - Copy Bot: Polymarket wallet tracking, paper trading, trade history, and circuit-breaker behavior.
+  - Weather Bot: future arbitrage work, planned separately and intentionally isolated.
+- Keep these domains separated at all times. Never mix Copy Bot logic with Weather Bot logic, and never let their database tables or schema evolve as if they were one system.
+
+## 2) Core Logic & Data Flow
+- The Copy Bot is driven by Python entrypoints such as bot.py, db.py, bullpen_client.py, and config.py. It polls Polymarket data through the bullpen CLI and uses the shared SQLite database for state and trade history.
+- The Weather Bot is not yet implemented; any weather-related work must remain isolated in packages/weather and its own schema/tables.
+- State and history come from two sources:
+  - Polymarket data: bullpen CLI.
+  - Persistent state/trade logs: data/app.db.
+
+
+
+## 4) Safety & Boundaries
+- This project is paper trading only. Do not introduce live-trade execution or private-key handling in app code.
+- Keep the shared SQLite database ownership rules intact: TypeScript owns schema/migrations; Python only executes CRUD.
+- Do not bypass the existing safety boundaries for copy-trading, wallet scoring, or database access.
+
+## 5) Strict Continuous Update Rule
+- Every time you successfully complete a coding task, implement a feature, or change the database schema, you MUST automatically update either CHANGELOG.md or docs/CURRENT_STATE.md to reflect the new reality.
+- If you change behavior, files, schema, or workflow, the update must be made before the task is considered complete.
