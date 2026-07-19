@@ -1,0 +1,18 @@
+{
+  "name": "@copybot/weather",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "ingest:metar": "tsx src/ingestMetar.ts"
+  },
+  "dependencies": {
+    "@copybot/db": "workspace:*",
+    "drizzle-orm": "^0.38.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
