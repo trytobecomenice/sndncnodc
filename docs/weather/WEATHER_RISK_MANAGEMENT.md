@@ -570,23 +570,32 @@ basis-risk margin in Rule 7.
 deterministic forecast — used specifically to surface fat-tail/low-probability scenarios a single
 point forecast would hide.
 
-**How it works mechanically (planned — formalized 2026-07-19, not yet implemented):** applies to
-`ingestOpenMeteo.ts` (not yet built). Open-Meteo — already the planned primary forecast source
-(`docs/weather/WEATHER_ARCHITECTURE.md`) — offers an ensemble/multi-model forecast product
-alongside its standard deterministic API; the exact integration shape (which models, how spread is
-summarized into `forecast_prob`) is a real design decision for whoever builds `ingestOpenMeteo.ts`,
-not pinned down further here since it hasn't been verified against the live API surface yet.
-Conceptually: instead of one point temperature estimate, an ensemble yields a DISTRIBUTION across
-model runs — `climatology_prob`/`forecast_prob`/`blended_prob` should be derived from that
-distribution's shape (e.g. what fraction of ensemble members land in a given bucket), not from a
-single number treated as certain.
+**How it works mechanically: architecture decided and verified live, not yet implemented
+(2026-07-20).** `ingestOpenMeteo.ts` (not yet built) will call Open-Meteo's dedicated Ensemble API
+(`https://ensemble-api.open-meteo.com/v1/ensemble`, free non-commercial tier, no API key) —
+verified directly against the live endpoint rather than trusting secondhand documentation, which
+caught a real error: the commonly-cited ECMWF model identifier `ecmwf_ifs04` silently returns only
+a single non-ensemble series with no error — the actual working identifier is **`ecmwf_ifs025`**
+(51 members: 1 control + 50 perturbed, confirmed live). Per Joey's decision (2026-07-20), both
+`ecmwf_ifs025` (51 members) and `gfs_seamless` (31 members) are fetched — 82 combined members per
+station/day, a genuine multi-model ensemble rather than one model family's internal spread, a more
+robust fat-tail defense than either alone. Response member keys follow `temperature_2m` (control)
+/ `temperature_2m_member01`...`memberNN` (perturbed) — verified against real live data, not
+assumed. Individual members are retained only 3 days server-side, so this system's own database is
+the only durable record of what the ensemble said — critical for later validating forecast
+accuracy against actual outcomes. Storage: a new table, `weather_ensemble_forecast` (see
+`docs/weather/WEATHER_ARCHITECTURE.md` §2 for the exact column design) — chosen over cramming the
+distribution into `weather_forecast_snapshot.rawJson` specifically so `computeProbability.ts` can
+later answer "what fraction of members hit the target bucket" with a direct SQL `COUNT`, not JSON
+parsing at read time.
 
-**System costs & trade-offs:** an ensemble API means more data per forecast fetch (multiple model
-runs instead of one number) and more computation to summarize it into a probability — a real cost
-against the "fast, cheap, frequent" framing the rest of this system's forecast-side sources use
-(Rule 5's execution-cycle table). Worth it specifically because a single deterministic forecast
-cannot represent tail risk at all — it has no way to say "usually X, but a real chance of Y" — and
-tail risk is exactly what a whole-degree cliff-edge market is most exposed to.
+**System costs & trade-offs:** real, quantified, not hand-waved — ~82 members × 43 stations × ~10
+forecast days ≈ 35,000 rows per refresh cycle, at the same 3-6h cadence as the existing forecast
+snapshot job. This needs its own retention policy once built (an ensemble row has no value once
+`forecastFor` resolves) — planned, not yet implemented alongside `pruneHistorical.ts`. Fetching
+two models instead of one roughly doubles both the row volume and the API calls per refresh cycle
+(2 calls per station instead of 1) — accepted specifically because tail-risk representation was
+judged worth the cost, the same trade-off already justified below.
 
 **Why it exists:** direct instruction (Joey, 2026-07-19) — a single deterministic model gives a
 false sense of precision on exactly the kind of question (will tomorrow's high cross this precise
@@ -609,8 +618,9 @@ begins.
   Rules 11 and 12 must both be enforced there once it's built).
 - `computeProbability.ts`'s actual climatology/forecast blend math (Rule 13's ensemble
   requirement applies here once built).
-- `ingestOpenMeteo.ts` (Rule 13 depends on this — must use an ensemble/multi-model product, not a
-  single deterministic forecast).
+- `ingestOpenMeteo.ts` — architecture decided and verified live (2026-07-20): `ecmwf_ifs025` (51
+  members) + `gfs_seamless` (31 members), new `weather_ensemble_forecast` table. Not yet built —
+  awaiting go-ahead to implement.
 - A defined capital-base constant for the Weather Bot (Rule 11 is blocked on this — no
   `PAPER_BANKROLL_USD`-equivalent exists yet for this system).
 - The `weather_rule_set` table, if/when entry-threshold logic needs its own versioned audit trail.

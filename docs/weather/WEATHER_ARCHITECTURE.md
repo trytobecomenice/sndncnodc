@@ -166,6 +166,34 @@ sharp. Each `weather_probability_estimate` row already carries its own `model_ve
 enough versioning for now; a dedicated `weather_rule_set` table is a reasonable future addition
 once entry-threshold/position-sizing logic exists, not needed yet.
 
+**PLANNED (2026-07-20, not yet built): an 8th table, `weather_ensemble_forecast`**, for
+`ingestOpenMeteo.ts`'s ensemble members — decided, not yet migrated. Rule 13 requires ensemble
+forecasting, not a single deterministic model; the existing `weather_forecast_snapshot` table
+stores one point forecast per (station, day), which has no shape for ~82 individual ensemble
+members. Rather than cram a large JSON blob into `weather_forecast_snapshot.rawJson` (would work
+with zero schema change, but forces every future probability calculation to parse JSON in
+application code instead of running SQL), the decision (Joey, 2026-07-20) was a dedicated table:
+
+```
+weather_ensemble_forecast
+  id
+  stationId
+  forecastFor      -- the target date this member is forecasting, station-local calendar day
+  issuedAt         -- when this ensemble run was fetched (re-issued forecasts accumulate, same
+                       pattern as weather_forecast_snapshot)
+  model            -- "ecmwf_ifs025" | "gfs_seamless"
+  memberIndex      -- 0 = control member, 1..50 (ecmwf) or 1..30 (gfs) = perturbed members
+  tMaxF, tMinF      -- that member's own forecasted daily max/min, station-local day
+  UNIQUE (stationId, forecastFor, issuedAt, model, memberIndex)
+```
+
+This makes "probability of hitting a target bucket" a direct SQL query —
+`COUNT(*) WHERE tMaxF >= threshold` divided by total member count — rather than JSON parsing at
+read time. Needs its own retention policy once built (an ensemble row has ~zero value once
+`forecastFor` has resolved, same reasoning as `weather_forecast_snapshot`'s existing 60-day
+window, likely shorter given the row volume — see Execution Cycle below for the volume estimate
+that makes this non-optional, not just tidy).
+
 ---
 
 ## 3. Execution cycle
@@ -188,6 +216,7 @@ process would compound that same accepted risk rather than just adding a new one
 | Daily historical obs | Daily | Official daily obs finalize once |
 | Historical data pruning | Daily, paired with the above | Enforces Rule 2's rolling retention window |
 | Forecast snapshot refresh | Every 3-6h | Open-Meteo/NWS update a few times a day |
+| **Ensemble forecast refresh** (`ingestOpenMeteo.ts`, planned) | **Every 3-6h**, same cadence as forecast snapshot | ~82 members × 43 stations × ~10 forecast days ≈ 35,000 rows per cycle — needs its own short retention (Rule 13, planned), not a "run more often than needed" cost |
 | METAR nowcast pull | Hourly, same-day markets only | Cheap, high-value intraday signal — forecast input, never settlement |
 | Market discovery | Daily | New city/day events appear roughly daily |
 | Price refresh + edge recompute | Every 1-2h | Cheap `bullpen` calls; price moves faster than forecast |
@@ -229,7 +258,7 @@ packages/weather/
     stationReconciliation.ts            # BUILT ✅ — auto-onboarding: real coords (aviationweather.gov) + timezone (geo-tz, offline)
     stationReconciliation.test.ts       # BUILT ✅ — 4 tests, incl. cities never hardcoded anywhere (London, Tokyo)
     ingestNoaa.ts                       # not yet built — forecast + climatology input
-    ingestOpenMeteo.ts                  # not yet built — forecast input
+    ingestOpenMeteo.ts                  # not yet built — PLANNED: ecmwf_ifs025 (51 members) + gfs_seamless (31 members) ensemble, verified endpoints, see Schema Strategy §2
     verifySettlement.ts                 # not yet built — Playwright, Wunderground, ON-DEMAND ONLY (deliberately deferred, see docs/weather/WEATHER_RISK_MANAGEMENT.md Rule 5)
     detectAnomaly.ts                    # not yet built — Rule 4's general physically-impossible-jump bounds-check
     computeProbability.ts               # not yet built — climatology + forecast + nowcast blend
