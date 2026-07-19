@@ -589,12 +589,24 @@ distribution into `weather_forecast_snapshot.rawJson` specifically so `computePr
 later answer "what fraction of members hit the target bucket" with a direct SQL `COUNT`, not JSON
 parsing at read time.
 
-**System costs & trade-offs:** real, quantified, not hand-waved — ~82 members × 43 stations × ~10
-forecast days ≈ 35,000 rows per refresh cycle, at the same 3-6h cadence as the existing forecast
-snapshot job. This needs its own retention policy once built (an ensemble row has no value once
-`forecastFor` resolves) — planned, not yet implemented alongside `pruneHistorical.ts`. Fetching
-two models instead of one roughly doubles both the row volume and the API calls per refresh cycle
-(2 calls per station instead of 1) — accepted specifically because tail-risk representation was
+**Built and live-verified across all 43 stations (2026-07-20)**: 35,260 rows in one run (exactly
+82 members × 10 days × 43 stations), zero failures, chunked bulk `onConflictDoUpdate` upserts
+(300 rows/statement) confirmed via `EXPLAIN QUERY PLAN` to actually use the lookup index, not scan
+the table. A real cross-model disagreement surfaced immediately: RKSI's next-day forecast has
+`ecmwf_ifs025` putting 11/51 members (~22%) at or above 80°F versus `gfs_seamless` putting only
+1/31 (~3%) — precisely the kind of signal a single deterministic model would have hidden, which is
+the entire justification for this rule.
+
+**System costs & trade-offs:** real, quantified, not hand-waved — confirmed ~35,000 rows per
+refresh cycle (not an estimate: the live run hit 35,260 exactly), at the same 3-6h cadence as the
+existing forecast snapshot job. **Retention is a real, currently-unclosed gap, not a future nice-
+to-have**: each run is a NEW forecast generation by design (`issuedAt` set fresh per run, same
+"reissued forecasts accumulate" pattern `weather_forecast_snapshot` already uses) — two
+consecutive test runs produced 70,520 rows with zero pruning. This table must not run unattended
+in production until a retention policy is added to `pruneHistorical.ts` (or a sibling script) —
+noted in Roadmap as a blocker, not a polish item. Fetching two models instead of one roughly
+doubles both the row volume and the API calls per refresh cycle (2 calls per station instead of 1)
+— accepted specifically because tail-risk representation was
 judged worth the cost, the same trade-off already justified below.
 
 **Why it exists:** direct instruction (Joey, 2026-07-19) — a single deterministic model gives a
@@ -618,9 +630,11 @@ begins.
   Rules 11 and 12 must both be enforced there once it's built).
 - `computeProbability.ts`'s actual climatology/forecast blend math (Rule 13's ensemble
   requirement applies here once built).
-- `ingestOpenMeteo.ts` — architecture decided and verified live (2026-07-20): `ecmwf_ifs025` (51
-  members) + `gfs_seamless` (31 members), new `weather_ensemble_forecast` table. Not yet built —
-  awaiting go-ahead to implement.
+- **Retention policy for `weather_ensemble_forecast` — a real blocker, not a polish item.**
+  `ingestOpenMeteo.ts` is built and live-verified (Rule 13), but every run is a new, un-pruned
+  forecast generation (35,260 rows/run, confirmed). Must not be scheduled to run unattended until
+  a short retention window (shorter than `weather_forecast_snapshot`'s 60 days — an ensemble row
+  has no value once `forecastFor` resolves) is added to `pruneHistorical.ts` or a sibling script.
 - A defined capital-base constant for the Weather Bot (Rule 11 is blocked on this — no
   `PAPER_BANKROLL_USD`-equivalent exists yet for this system).
 - The `weather_rule_set` table, if/when entry-threshold logic needs its own versioned audit trail.

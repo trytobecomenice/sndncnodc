@@ -84,8 +84,22 @@
   calls, since they were already fully backfilled). Rate-limit-aware by necessity, not caution for
   its own sake — the archive's rate limiter triggered after just 2 manual test requests during
   development; the real 43-station run needed zero backoffs at the 5s pacing used.
+- **Ensemble forecast ingestion — built and live-verified across all 43 stations** (2026-07-20,
+  `ingestOpenMeteo.ts`, 11th script; `weather_ensemble_forecast`, 8th table, migration
+  `0003_cooing_beast.sql`). Fetches `ecmwf_ifs025` (51 members) + `gfs_seamless` (31 members) per
+  station — verified both model identifiers live rather than trusting docs, catching that the
+  commonly-cited `ecmwf_ifs04` silently returns a single non-ensemble series with no error; the
+  real one is `ecmwf_ifs025`. 35,260 rows in one run (exactly 82 members × 10 days × 43 stations),
+  zero failures. Chunked bulk upserts (`onConflictDoUpdate`, 300 rows/statement) confirmed via
+  `EXPLAIN QUERY PLAN` to actually use the new lookup index. Real signal surfaced immediately:
+  RKSI's next-day forecast has `ecmwf_ifs025` putting 11/51 members (~22%) at/above 80°F vs.
+  `gfs_seamless`'s 1/31 (~3%) — a genuine cross-model disagreement. **Open risk, not yet closed**:
+  each run is a new forecast generation by design (two test runs produced 70,520 rows, zero
+  pruning) — this table must not be scheduled unattended until a retention policy exists (see
+  `docs/weather/WEATHER_RISK_MANAGEMENT.md` Roadmap). Also fixed while here: `dashboard.py`
+  (port 8787) had been stopped since before this session and was restarted.
   Still not built: `verifySettlement.ts` (the live Wunderground/Playwright fetch — deliberately
-  deferred as its own step), NOAA/Open-Meteo ingestion, probability computation, position
+  deferred as its own step), the ensemble retention policy above, probability computation, position
   management. Full design in `docs/weather/WEATHER_ARCHITECTURE.md` /
   `docs/weather/WEATHER_RISK_MANAGEMENT.md`.
 - **Database schema ownership:** TypeScript/Drizzle owns schema and migrations; Python

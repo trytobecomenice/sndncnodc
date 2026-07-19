@@ -365,6 +365,40 @@ export const weatherForecastSnapshot = sqliteTable(
   (t) => [index("weather_forecast_lookup_idx").on(t.stationId, t.forecastFor)]
 );
 
+// One row per (station, forecast day, ensemble run, model, member) — see
+// docs/weather/WEATHER_ARCHITECTURE.md §2 and docs/weather/WEATHER_RISK_MANAGEMENT.md Rule 13.
+// Deliberately separate from weatherForecastSnapshot (a single point forecast per day) rather
+// than reusing its rawJson blob: this shape lets a probability calculation run a direct SQL
+// COUNT/AVG over tMaxF rather than parsing JSON per read.
+export const weatherEnsembleForecast = sqliteTable(
+  "weather_ensemble_forecast",
+  {
+    id: id(),
+    stationId: text("station_id").notNull(),
+    forecastFor: text("forecast_for").notNull(), // YYYY-MM-DD, station-local calendar day
+    issuedAt: timestampCol("issued_at"),
+    model: text("model").notNull(), // "ecmwf_ifs025" | "gfs_seamless"
+    memberIndex: integer("member_index").notNull(), // 0 = control member, 1..N = perturbed
+    tMaxF: real("t_max_f").notNull(),
+    tMinF: real("t_min_f").notNull(),
+  },
+  (t) => [
+    // Full natural key — makes re-running the ingester idempotent (same run, same member,
+    // same day upserts in place rather than duplicating).
+    uniqueIndex("weather_ensemble_forecast_unique_idx").on(
+      t.stationId,
+      t.forecastFor,
+      t.issuedAt,
+      t.model,
+      t.memberIndex
+    ),
+    // Read-path index matching the actual probability-query shape ("all members for this
+    // station+day+model, or this station+day across models") — SQLite can also use this
+    // index's leading columns for narrower (stationId) / (stationId, forecastFor) filters.
+    index("weather_ensemble_forecast_lookup_idx").on(t.stationId, t.forecastFor, t.model),
+  ]
+);
+
 export const weatherMarketMapping = sqliteTable("weather_market_mapping", {
   id: id(),
   marketSlug: text("market_slug").notNull().unique(),

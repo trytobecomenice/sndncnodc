@@ -8,6 +8,7 @@
     "prune:historical": "tsx src/pruneHistorical.ts",
     "discover:markets": "tsx src/discoverMarkets.ts",
     "backfill:historical": "tsx src/backfillHistorical.ts",
+    "ingest:openmeteo": "tsx src/ingestOpenMeteo.ts",
     "test": "vitest run"
   },
   "dependencies": {

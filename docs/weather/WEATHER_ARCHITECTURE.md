@@ -166,10 +166,10 @@ sharp. Each `weather_probability_estimate` row already carries its own `model_ve
 enough versioning for now; a dedicated `weather_rule_set` table is a reasonable future addition
 once entry-threshold/position-sizing logic exists, not needed yet.
 
-**PLANNED (2026-07-20, not yet built): an 8th table, `weather_ensemble_forecast`**, for
-`ingestOpenMeteo.ts`'s ensemble members — decided, not yet migrated. Rule 13 requires ensemble
-forecasting, not a single deterministic model; the existing `weather_forecast_snapshot` table
-stores one point forecast per (station, day), which has no shape for ~82 individual ensemble
+**BUILT AND LIVE-VERIFIED (2026-07-20): an 8th table, `weather_ensemble_forecast`**
+(migration `0003_cooing_beast.sql`), for `ingestOpenMeteo.ts`'s ensemble members. Rule 13 requires
+ensemble forecasting, not a single deterministic model; the existing `weather_forecast_snapshot`
+table stores one point forecast per (station, day), which has no shape for ~82 individual ensemble
 members. Rather than cram a large JSON blob into `weather_forecast_snapshot.rawJson` (would work
 with zero schema change, but forces every future probability calculation to parse JSON in
 application code instead of running SQL), the decision (Joey, 2026-07-20) was a dedicated table:
@@ -189,10 +189,19 @@ weather_ensemble_forecast
 
 This makes "probability of hitting a target bucket" a direct SQL query —
 `COUNT(*) WHERE tMaxF >= threshold` divided by total member count — rather than JSON parsing at
-read time. Needs its own retention policy once built (an ensemble row has ~zero value once
-`forecastFor` has resolved, same reasoning as `weather_forecast_snapshot`'s existing 60-day
-window, likely shorter given the row volume — see Execution Cycle below for the volume estimate
-that makes this non-optional, not just tidy).
+read time. **Verified live**: `EXPLAIN QUERY PLAN` on exactly that query confirms
+`weather_ensemble_forecast_lookup_idx` is actually used (`SEARCH ... USING INDEX`, not a table
+scan). Real result pulled this way, RKSI's next day: `ecmwf_ifs025` put 11/51 members (~22%) at or
+above 80°F, `gfs_seamless` put only 1/31 (~3%) — a genuine cross-model disagreement, exactly the
+signal a single deterministic forecast would have hidden.
+
+**Retention gap, real and not yet closed**: each `ingestOpenMeteo.ts` run is a NEW forecast
+generation (`issuedAt` is set fresh per run) — by design, matching `weather_forecast_snapshot`'s
+existing "reissued forecasts accumulate" pattern, not a bug. But that means this table has **no
+prune policy yet** and grows every refresh cycle. Live-confirmed: two consecutive runs produced
+70,520 rows (2 × 35,260, 2 distinct `issuedAt` values) — real, correct data, but a real,
+un-addressed growth-rate problem at a 3-6h production cadence. Needs a short retention window
+added to `pruneHistorical.ts` (or a sibling script) before this runs unattended — see Roadmap.
 
 ---
 
@@ -232,7 +241,7 @@ Copy Bot's `scoreWallets.ts` already uses within a single run (its pass-1/pass-2
 ## 4. Proposed `packages/weather/` structure
 
 `packages/weather/` is now a real, wired-in pnpm workspace member — `package.json`/`tsconfig.json`
-exist, and ten scripts/modules are built, tested, and live-verified against `data/app.db` and
+exist, and eleven scripts/modules are built, tested, and live-verified against `data/app.db` and
 real Polymarket data (2026-07-19). Structure mirrors `packages/copy-trading`'s conventions: plain
 `tsx`-executed scripts, an `isMainModule` guard so files stay test-importable, vitest for
 pure-function tests. **`db/writers.ts` is now built** — introduced exactly when
@@ -258,7 +267,7 @@ packages/weather/
     stationReconciliation.ts            # BUILT ✅ — auto-onboarding: real coords (aviationweather.gov) + timezone (geo-tz, offline)
     stationReconciliation.test.ts       # BUILT ✅ — 4 tests, incl. cities never hardcoded anywhere (London, Tokyo)
     ingestNoaa.ts                       # not yet built — forecast + climatology input
-    ingestOpenMeteo.ts                  # not yet built — PLANNED: ecmwf_ifs025 (51 members) + gfs_seamless (31 members) ensemble, verified endpoints, see Schema Strategy §2
+    ingestOpenMeteo.ts                  # BUILT ✅ — ecmwf_ifs025 (51 members) + gfs_seamless (31 members), 35,260 rows/run live-verified across all 43 stations
     verifySettlement.ts                 # not yet built — Playwright, Wunderground, ON-DEMAND ONLY (deliberately deferred, see docs/weather/WEATHER_RISK_MANAGEMENT.md Rule 5)
     detectAnomaly.ts                    # not yet built — Rule 4's general physically-impossible-jump bounds-check
     computeProbability.ts               # not yet built — climatology + forecast + nowcast blend

@@ -4,6 +4,7 @@ __pycache__/
 *.pre-sqlite-backup
 bot.pid
 bot.out.log
+dashboard.pid
 dashboard.out.log
 *.pre-cutover-*
 .claude/settings.local.json
