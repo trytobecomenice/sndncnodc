@@ -84,7 +84,8 @@ weather_probability_estimate  (climatology + forecast → blended_prob; market_i
         │
         ├── sparse, on-demand only ──→ verifySettlement.ts (Wunderground — Rule 4/5, pre-closeout ONLY)
         ▼
-weather_position  (future entry-rule logic — the "Order Builder," not yet designed)
+weather_position  (the Order Builder — orderBuilder.ts, Rule 15: Kelly-sized paper trades,
+                    enforcing Rules 7/11/12, live-verified 2026-07-20)
         │
         ▼
 weather_pnl_snapshot
@@ -183,6 +184,15 @@ probability *shift*, which an upserted "latest value" table can't answer. See
 `docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 14 for the full parsing-engine and
 rounding-boundary-math detail.
 
+**BUILT AND LIVE-VERIFIED (2026-07-20): `weather_position` extended** (migration
+`0006_goofy_grey_gargoyle.sql`) — the Order Builder (Rule 15) reuses this pre-existing, previously
+-empty 7th table rather than creating a new one, since it was already shaped exactly for a paper
+trade (`marketSlug`/`outcome`/`entryPrice`/`ourSizeUsd`/`status`). Gained 8 nullable columns for
+execution telemetry: `ensemble_prob`, `polymarket_prob`, `probability_difference`, `is_same_day`,
+`station_local_time`, `temp_buffer_f`, `full_kelly_fraction`, `applied_fraction` — the exact
+metrics that justified each trade, per Joey's explicit spec, recorded at build time rather than
+needing to be re-derived later.
+
 **No connection to Copy Bot tables**, and no reuse of the Copy Bot's `rule_set`/`rule_change`
 tables — those are shaped around copy-trading-specific concepts (mute streaks, TTP activation,
 spread tolerance) and reusing them would blur exactly the boundary `.claudeprompt` requires stay
@@ -275,7 +285,7 @@ Copy Bot's `scoreWallets.ts` already uses within a single run (its pass-1/pass-2
 ## 4. Proposed `packages/weather/` structure
 
 `packages/weather/` is now a real, wired-in pnpm workspace member — `package.json`/`tsconfig.json`
-exist, and eighteen scripts/modules are built, tested, and live-verified against `data/app.db` and
+exist, and twenty-one scripts/modules are built, tested, and live-verified against `data/app.db` and
 real Polymarket/Open-Meteo data (2026-07-19 through 2026-07-20). Structure mirrors
 `packages/copy-trading`'s conventions: plain
 `tsx`-executed scripts, an `isMainModule` guard so files stay test-importable, vitest for
@@ -312,16 +322,21 @@ packages/weather/
     checkMarkets.ts                     # BUILT ✅ — Rule 14, the EV Bridge: odds snapshot + blended prob + edge, live-verified end-to-end
     verifySettlement.ts                 # not yet built — Playwright, Wunderground, ON-DEMAND ONLY (deliberately deferred, see docs/weather/WEATHER_RISK_MANAGEMENT.md Rule 5)
     detectAnomaly.ts                    # not yet built — Rule 4's general physically-impossible-jump bounds-check
-    managePositions.ts                  # not yet built — future entry-rule design; the "Order Builder" (Rule 11/12 enforcement), explicitly deferred
+    staleness.ts                        # BUILT ✅ — Rule 14 addendum, station-local staleness/cutoff guard
+    staleness.test.ts                   # BUILT ✅ — 8 tests
+    orderSizing.ts                      # BUILT ✅ — Rule 15, pure Kelly/edge-floor/temp-buffer/sizing math
+    orderSizing.test.ts                 # BUILT ✅ — 14 tests
+    orderBuilder.ts                     # BUILT ✅ — Rule 15, the Order Builder: reads weather_probability_estimate, writes sized paper trades to weather_position
+    managePositions.ts                  # not yet built — position CLOSEOUT/settlement, not entry (entry is now orderBuilder.ts's job)
     updatePnl.ts                        # not yet built — weather_pnl_snapshot rollup
 ```
 
 `packages/weather/package.json` scripts, built: `ingest:metar`, `prune:historical`,
 `discover:markets`, `backfill:historical`, `ingest:openmeteo`, `prune:forecasts`,
-`calculate:probability`, `check:markets`. Not yet built: `manage-positions`, `update-pnl`. Each is
-its own future `launchd` job (mechanism decided, jobs not yet scheduled — see §3). `verifySettlement.ts`
-deliberately has **no** script/job of its own — it's a function called from `discoverMarkets.ts`
-and `managePositions.ts`, never an independent poll.
+`calculate:probability`, `check:markets`, `build:orders`. Not yet built: `manage-positions`,
+`update-pnl`. Each is its own future `launchd` job (mechanism decided, jobs not yet scheduled — see
+§3). `verifySettlement.ts` deliberately has **no** script/job of its own — it's a function called
+from `discoverMarkets.ts` and `managePositions.ts`, never an independent poll.
 
 ---
 
@@ -329,9 +344,9 @@ and `managePositions.ts`, never an independent poll.
 
 - NOAA ingestion and the live Wunderground fetch (`verifySettlement.ts`) — see §4's file table for
   the current built/not-built split.
-- **The Order Builder** — entry-rule / position-sizing logic for `weather_position`, enforcing
-  Rule 11's 5% capital cap and Rule 12's 1.5°F temperature buffer against a real `checkMarkets.ts`
-  edge. Explicitly deferred by Joey (2026-07-20) to "the phase after this."
+- **Position closeout / settlement-driven PnL** (`managePositions.ts`'s remaining job, `updatePnl.ts`) —
+  `orderBuilder.ts` (Rule 15) only opens positions; nothing yet closes one, computes realized PnL,
+  or rolls up `weather_pnl_snapshot`.
 - **The "Buy Low, Sell High" early-exit strategy** — the odds-history table
   (`weather_market_odds_snapshot`) exists to make this possible later; the shift-detection/exit
   logic itself is not built.

@@ -18,9 +18,9 @@ before proposing a new restriction so a decision already made here doesn't get s
 re-thought. `docs/weather/WEATHER_ARCHITECTURE.md` is the companion: data flow, schema, and scheduling
 detail that explains *how* these rules get implemented mechanically.
 
-**Rules 1-13 are implemented and live-verified except where noted (position-sizing/temperature-
-buffer/anomaly-detector/`verifySettlement.ts` still planned, see Roadmap). Rule 14 (the EV Bridge —
-`parseMarketThreshold.ts`, `calculateClimatology.ts`, `checkMarkets.ts`, odds-history tracking) is
+**Rules 1-15 are implemented and live-verified except where noted (the anomaly-detector's general
+bounds-check and `verifySettlement.ts` still planned, see Roadmap). Rule 14 (the EV Bridge) and
+Rule 15 (the Order Builder — Rules 7/11/12 now actually enforced, not just documented) are both
 implemented and live-verified end-to-end as of 2026-07-20.**
 
 This document is intentionally separate from `docs/copy-trading/RISK_MANAGEMENT.md` (the Copy Bot's rules
@@ -338,16 +338,24 @@ reconciliation exercise was run to prevent.
 bucket-boundary markets require a minimum edge margin *beyond* zero before they're considered
 tradeable — the model is never allowed to treat "we read Wunderground" as "basis risk is zero."
 
-**How it works mechanically (future — entry-rule logic not yet built):** `weather_probability_estimate.inputs_json`
-carries an explicit residual-basis-uncertainty note per estimate. `managePositions.ts`'s
-(not-yet-designed) entry rule must require `edge` to clear a floor derived from the ~1-2°F gap the
-reconciliation PoC actually measured — a concrete, evidence-based lower bound on the margin
-required, not a hypothetical safety factor picked out of the air.
+**How it works mechanically: implemented and live-verified (2026-07-20), `orderBuilder.ts` /
+`orderSizing.ts`.** `checkEdgeFloor(edge, floorPp)` requires `|edge| >= MIN_EDGE_FLOOR` (0.05, i.e.
+5 percentage points) before a trade is even considered — evaluated before Rule 12's temp-buffer
+check and before any Kelly sizing math runs. **A real interpretation call, disclosed rather than
+hidden**: this rule's original text described the floor as "derived from the ~1-2°F gap the
+reconciliation PoC measured," but that PoC measured a *temperature* gap, not a *probability-edge*
+gap, and no formula in this codebase converts one into the other. Rather than invent an unjustified
+conversion, `MIN_EDGE_FLOOR` was set to 5 percentage points — the same order of magnitude already
+approved for `checkMarkets.ts`'s notable-edge threshold — as an explicit, named starting value
+pending real calibration, not a rigorous derivation from the °F figure. Added to the Order Builder
+at Joey's direction even though it wasn't in her original 3-item build list for this phase, since
+it was already fully specified here as a required gate for exactly this component.
 
 **System costs & trade-offs:** this margin requirement will mean passing on some marginal-edge
 trades that a naive model (treating the settlement read as ground truth with zero uncertainty)
 would take — fewer trades, a real opportunity cost, in exchange for not repeating the specific
-overconfidence the PoC caught.
+overconfidence the PoC caught. The 5pp floor itself is unvalidated against real outcomes (no
+settlement history exists yet) — a real gap, tracked in the Roadmap.
 
 **Why it exists:** there is no confirmation that Polymarket's own resolution/dispute process reads
 the identical Wunderground endpoint, at the identical instant, with the identical rounding, that
@@ -513,20 +521,27 @@ should spend its attention and capital strictly inside the actively-contested tr
 **What it does:** no single market may ever receive more than **5% of total capital**
 (`MAX_CAPITAL_PER_TRADE = 0.05`) in one trade.
 
-**How it works mechanically (planned — formalized 2026-07-19, not yet implemented):** this
-requires `managePositions.ts`'s entry-rule logic (not yet built) and a defined capital base for
-the Weather Bot (also not yet defined — the Copy Bot has `PAPER_BANKROLL_USD`; the Weather Bot has
-no equivalent constant yet, a real prerequisite this rule is blocked on). Once both exist, sizing
-a new position must clamp `positionSize <= 0.05 * totalCapital`, evaluated at the moment of entry
-against current capital (realized + unrealized), the same equity-computation shape as the Copy
-Bot's `risk_manager.py compute_equity`.
+**How it works mechanically: implemented and live-verified (2026-07-20), `orderBuilder.ts` /
+`orderSizing.ts` (see Rule 15 for the full orchestrator).** `computePositionSize()` computes the
+standard binary-market Kelly fraction (`computeKellyFraction`: for buying "Yes" at price `P` when
+our estimate `pHat` is higher, `f* = (pHat - P) / (1 - P)`; buying "No" is the mirror image), scales
+it by `KELLY_MULTIPLIER = 0.25` (**Quarter-Kelly, Joey's explicit call, 2026-07-20** — full Kelly
+was rejected specifically because it over-bets on a probability estimate this codebase's own docs
+already flag as uncalibrated; see Rule 15's design-review note for the fuller reasoning), then hard
+-caps at `MAX_CAPITAL_PER_TRADE = 0.05` against `WEATHER_PAPER_BANKROLL_USD = 10000` — **the first
+concrete value for the capital-base constant this rule was blocked on**, a stated mock default
+(Joey's own suggestion), not yet a real bankroll figure. **Live-verified**: a real -20.4pp edge on
+`highest-temperature-in-seoul-on-july-21-2026-28c` computed a full-Kelly fraction of 67.0% — the 5%
+cap was the binding constraint, not the quarter-Kelly scaling, exactly the scenario this rule
+exists to prevent (an extreme, largely-unvalidated edge estimate translating directly into a
+max-size bet).
 
-**System costs & trade-offs:** 5% is a hard ceiling per market, not a Kelly-criterion-computed
-optimal fraction — true Kelly sizing would vary per trade based on edge and odds, which needs a
-calibrated edge estimate this system doesn't have yet (Rule 7's residual basis-risk margin and
-Rule 12's temperature buffer are both prerequisites for a trustworthy edge number). Treat this 5%
-as a conservative ceiling that a future real Kelly calculation should sit BELOW, not as the Kelly
-fraction itself.
+**System costs & trade-offs:** 5% is a hard ceiling per market, and in practice — per the live
+result above — it's usually the binding constraint over quarter-Kelly for anything but a small
+edge, meaning most trades size to exactly 5% rather than a graduated Kelly-derived amount. This is
+accepted, not a bug: given the blend model and edge threshold are both still uncalibrated, having
+the ceiling bind hard is safer than trusting a large Kelly-implied fraction on an unproven
+estimate. Revisit once real paper-trade outcomes exist to validate the probability model against.
 
 **Why it exists:** direct instruction (Joey, 2026-07-19) — no single weather event's outcome,
 however well-modeled, should be able to inflict capital loss disproportionate to one bet's worth
@@ -543,23 +558,32 @@ yet the way the Copy Bot's `PAPER_BANKROLL_USD` is.
 strike boundary and the model's own forecast point estimate is less than **1.5°F**
 (`TEMP_BUFFER = 1.5`).
 
-**How it works mechanically (planned — formalized 2026-07-19, not yet implemented):** requires
-`computeProbability.ts` (not yet built). At evaluation time, for a given strike boundary (e.g.
-"80°F or above"), compute `abs(forecastPointEstimateF - strikeBoundaryF)`; if that's below
-`TEMP_BUFFER`, the trade is skipped regardless of how favorable `edge` (Rule 7) otherwise looks —
-this check happens BEFORE the edge/margin check, not instead of it. Needs explicit unit handling:
-some markets bucket in whole-degree Celsius (most Asian cities observed so far), others in 2°F
-bands (NYC) — the comparison must happen in one consistent unit (°F, per how this rule is stated)
-with both sides converted consistently, not compared raw.
+**How it works mechanically: implemented and live-verified (2026-07-20), `orderBuilder.ts` /
+`orderSizing.ts`.** `checkTempBuffer(meanForecastF, range, bufferF)` compares the ensemble's own
+mean point-estimate forecast (a new field added to `calculateProbability.ts`'s `StationProbability`
+— the mean of every combined member's forecast, both models pooled) against the strike range, and
+requires clearance from EVERY finite boundary, not just one. **A deliberate generalization,
+disclosed rather than silent**: this rule's original text used a one-sided example ("80°F or
+above" — a single boundary), but most real markets found live are two-sided exact-degree buckets
+(e.g. a "27C" market, already widened by `parseMarketThreshold.ts`'s rounding-boundary math to
+`[26.5, 27.5]`°C). For a two-sided bucket, `checkTempBuffer` takes the MINIMUM distance to either
+edge and requires that to clear the buffer — this reduces to exactly the original single-boundary
+rule when only one bound is set, and is the more conservative choice for two-sided buckets (a
+forecast centered inside a narrow bucket can still be close to BOTH edges at once, which is exactly
+the jump-risk scenario this rule exists to catch). **Live-verified doing real work**: of 7 active
+Seoul markets tested end-to-end, 4 were correctly rejected for sitting within 0.1-0.6°F of a strike
+boundary (the ensemble's 79.1°F point estimate landed almost exactly between two adjacent 1.8°F-
+wide buckets), while 3 with real 1.9-4.2°F clearance passed.
 
 **System costs & trade-offs:** this is a DIFFERENT margin from Rule 7's residual basis-risk
 margin — Rule 7 protects against the settlement READ being imprecise (scraper/oracle
 disagreement); this rule protects against the FORECAST itself being imprecise (a point forecast is
 never exactly right, and a strike sitting inside the forecast's own normal error band is a coin
-flip dressed up as an edge). Both margins likely need to be cleared simultaneously before a trade
-is allowed — a real design detail for whoever builds `computeProbability.ts`/`managePositions.ts`,
-not resolved further here. A tight buffer band around any given strike will mean some real edge
-gets left on the table; accepted, since trading inside forecast noise isn't edge at all.
+flip dressed up as an edge). Both margins are enforced simultaneously in `orderBuilder.ts` before
+any Kelly sizing runs. A tight buffer band around any given strike means some real edge gets left
+on the table — confirmed live: half of the tested Seoul candidates were rejected on this gate alone
+despite having already cleared Rule 7's edge floor, which is exactly the intended trade-off, not an
+overly-blunt filter (each rejected market's forecast genuinely sat within the buffer zone).
 
 **Why it exists:** direct instruction (Joey, 2026-07-19) — "jump risk": a forecast can be
 directionally right and still land on the wrong side of a hard whole-degree resolution boundary
@@ -723,17 +747,23 @@ The run correctly fetched live odds (71.0%), computed climatology (9.7%) and for
 probabilities, blended them (7.4%), and wrote both DB rows — proving every piece of the pipeline
 works against real data, not just synthetic test fixtures.
 
-**A real gap surfaced by that same smoke test, disclosed here rather than hidden**: the edge
-computed was a huge -63.6 percentage points — not because of a genuine mispricing, but because the
-market's `forecast_for` date (July 19) had already fully elapsed by the time the test ran (July
-20), while the ensemble forecast feeding `forecastProb` was issued mid-day on the 19th itself. The
-market's 71% price almost certainly reflects the real, now-largely-known outcome; our forecast does
-not. **`checkMarkets.ts` does not currently check whether a market's `forecast_for` date has
-already passed or is imminent** — it will happily compute and log a large "edge" that is actually
-just forecast staleness, not tradeable signal. This is a known, real limitation, not a hidden one:
-a freshness/staleness guard (e.g. skip or down-weight any mapping whose `forecast_for` is not
-strictly in the future) is needed before any future Order Builder is allowed to treat a
-`checkMarkets.ts` edge as a real trading signal. Tracked in Roadmap below.
+**A real gap surfaced by that same smoke test, closed the same day (2026-07-20) — the Staleness
+Guard, `staleness.ts`.** The edge computed in that smoke test was a huge -63.6 percentage points —
+not because of a genuine mispricing, but because the market's `forecast_for` date (July 19) had
+already fully elapsed by the time the test ran (July 20), while the ensemble forecast feeding
+`forecastProb` was issued mid-day on the 19th itself. `checkStaleness(forecastFor, timezone, now)`
+now gates every mapping in `checkMarkets.ts` BEFORE any odds fetch or probability math runs: a
+market is stale (skipped, no edge calculated at all) if its `forecast_for` day is strictly before
+the STATION's own current local calendar day, or if it's the current local day but the station-
+local clock has passed `STALE_CUTOFF_HOUR = 18` (6pm) — same-day trading before that cutoff is
+explicitly allowed (Joey's call, 2026-07-20). Station-local time, not server/UTC time, is used
+throughout — computed via `Intl.DateTimeFormat` against `weather_station.timezone` (already
+resolved live via `geo-tz`, Rule 8), so DST transitions are handled correctly by the runtime, not
+approximated. 8 unit tests cover positive- and negative-offset zones, UTC-midnight day-rollover in
+both directions, and the exact cutoff-hour boundary. `checkMarkets.ts` also now stores
+`isSameDay`/`stationLocalTime` in each estimate's `inputsJson.staleness` for later reuse, and Rule
+15's Order Builder independently re-checks staleness fresh at its own run time rather than trusting
+a possibly-stale flag from an earlier `checkMarkets.ts` pass.
 
 **System costs & trade-offs:** the 0.35/0.65 blend weight and the 5% notable-edge threshold are
 both stated defaults, not calibrated values — real outcome data (positions taken, actual
@@ -757,6 +787,87 @@ market's price has moved, which is unrecoverable after the fact if not logged as
 
 ---
 
+## 15. The Order Builder — translating EV into a sized paper trade
+
+**What it does:** `orderBuilder.ts` is the "hands" of the bot — it reads `checkMarkets.ts`'s
+logged edge for every active market, enforces Rules 7, 11, and 12 as hard gates, and if (and only
+if) a market clears all three, writes a sized, paper-only trade to `weather_position`. This is the
+first component in the pipeline that actually creates a position, not just logs a signal — every
+prior EV-related component (Rule 13's probability engine, Rule 14's bridge) only computes and
+records.
+
+**How it works mechanically: implemented and live-verified end-to-end (2026-07-20).**
+
+- **`orderSizing.ts`** — pure, unit-tested functions with zero DB/network I/O (same split this
+  codebase already uses elsewhere: `computeHitRate` vs. `calculateProbability.ts`, `checkOddsFilter`
+  vs. `discoverMarkets.ts`). `computeKellyFraction(pHat, marketProb)` implements the standard
+  binary-market Kelly formula; `checkEdgeFloor` (Rule 7), `checkTempBuffer` (Rule 12), and
+  `computePositionSize` (Rule 11) are each described in their own rule sections above. 14 unit
+  tests, including a direct reproduction of the real Seoul smoke-test numbers (a -26.5pp edge
+  correctly produces a 65.4% full-Kelly fraction on the "No" side).
+- **Gate order, deliberate**: no-usable-estimate check → staleness re-check → duplicate-position
+  guard → Rule 7 (edge floor) → Rule 12 (temp buffer) → Rule 11 (Kelly sizing) → zero-size check →
+  write. Cheaper/structural checks run before the rule gates so a market that can never trade
+  (e.g. no estimate yet) doesn't pay for temp-buffer computation it doesn't need.
+- **Duplicate-exposure guard, added proactively (not explicitly requested, but a clear gap left
+  open otherwise)**: `hasOpenPosition(marketSlug)` skips any market that already has a `status =
+  'open'` `weather_position` row, so re-running `orderBuilder.ts` — which will happen routinely,
+  since `checkMarkets.ts` re-logs new estimates on every pass — never stacks a second position on
+  a market it's already holding. Mirrors the Copy Bot's own equivalent guard (`bot.py`). **Live-
+  verified idempotent**: re-running immediately after 3 real orders were placed correctly skipped
+  all 3 as duplicates and re-evaluated (and correctly re-rejected, same reasons) the other 4.
+- **Telemetry, per Joey's explicit spec (2026-07-20)**: `weather_position` (the pre-existing,
+  previously-unused 7th table — reused rather than creating a redundant new table, since it was
+  already shaped exactly for this: `marketSlug`/`outcome`/`entryPrice`/`ourSizeUsd`/`status`) gained
+  8 new columns via migration `0006_goofy_grey_gargoyle.sql`: `ensemble_prob`, `polymarket_prob`,
+  `probability_difference`, `is_same_day`, `station_local_time`, `temp_buffer_f`,
+  `full_kelly_fraction`, `applied_fraction` — the exact execution metrics that justified each
+  trade, recorded at build time for later audit rather than needing to be re-derived.
+- **Capital base, resolved**: `WEATHER_PAPER_BANKROLL_USD = 10000` — the first concrete value for
+  the constant Rule 11 was blocked on, a stated mock default (Joey's own suggestion, 2026-07-20),
+  not a real bankroll figure.
+
+**Live end-to-end proof (2026-07-20), against the 7 real active Seoul markets** (the same ones
+Rule 14's smoke test used, this time genuinely activated by Joey's own review, forecasting a
+genuinely future day): 4 of 7 correctly rejected on Rule 12's temp buffer (forecasts sitting
+0.1-0.6°F from a bucket edge), 0 rejected on Rule 7 (all 7 already had real edges well above the 5pp
+floor), 3 orders placed — `BUY YES $154.21` on the 25°C low-temperature bucket (a genuine
+quarter-Kelly-bound size, 1.54% of capital, edge 5.5pp), and `BUY NO $500.00` on both the 28°C and
+29°C high-temperature buckets (both hit the 5% hard cap — full-Kelly fractions of 67.0% and 82.1%
+respectively, on -20.4pp and -13.9pp edges, exactly the scenario Rule 11 exists to bound). Re-run
+immediately after: idempotent, 0 new orders, all 3 correctly skipped as duplicates. **Kept as the
+first real paper-trading positions**, per Joey's explicit choice (2026-07-20) — not cleared as test
+artifacts, since all three genuinely cleared every gate on real data, not a smoke-test bypass.
+
+**A design review happened before this was built, worth recording.** Joey asked explicitly whether
+this was a good next step and invited pushback. Three concerns were raised and resolved before any
+code was written: (1) full Kelly sizing on an edge estimate this codebase's own docs already flag
+as uncalibrated was judged too aggressive — resolved via quarter-Kelly (`KELLY_MULTIPLIER = 0.25`);
+(2) Rule 7's edge floor, though not in Joey's original 3-item scope, was judged a natural and
+already-specified companion gate to Rule 12 — resolved by building it now; (3) the Staleness Guard's
+"too close to end of day" needed a concrete, non-vague definition — resolved as the 18:00
+station-local cutoff described above. None of these were reasons to NOT build — paper trading is
+exactly the environment where this component should be built and exercised, since it's the only way
+to accumulate the real outcome data needed to eventually validate/calibrate the blend weights (Rule
+14) and the edge floor (Rule 7) this component depends on.
+
+**System costs & trade-offs:** every numeric default here — `MIN_EDGE_FLOOR`, `KELLY_MULTIPLIER`,
+`TEMP_BUFFER_F`, `MAX_CAPITAL_PER_TRADE`, `WEATHER_PAPER_BANKROLL_USD` — is a stated starting value,
+not empirically calibrated, and the live result already shows the 5% cap binding harder than
+quarter-Kelly scaling for anything but a small edge (see Rule 11). This means early paper-trading
+volume will skew toward capped-size trades on the largest apparent edges, which is a real behavior
+to watch for: if the blend model is systematically miscalibrated in one direction, this sizing
+approach would concentrate risk exactly where the model is most confident and potentially most
+wrong. No calibration correction exists yet — this is the reason paper trading, not real capital,
+runs first.
+
+**Why it exists:** direct instruction (Joey, 2026-07-20) — "build the 'Hands' of our bot." Every
+risk rule enforced here (7, 11, 12) was already fully documented before this component existed;
+this rule is where they actually bind for the first time, closing the gap between "a rule is
+written down" and "a rule is enforced by running code."
+
+---
+
 ## Roadmap / explicitly not yet built
 
 - `detectAnomaly.ts`'s general bounds-check (physically-impossible-jump detection on raw
@@ -765,23 +876,23 @@ market's price has moved, which is unrecoverable after the fact if not logged as
 - `verifySettlement.ts` — the actual Playwright fetch against `wunderground.com`. Deliberately
   deferred as its own dedicated step (2026-07-19) rather than built alongside the pure
   comparison logic, given how much care the earlier evasion-tooling discussion (Rule 5) required.
-- Entry-rule / position-sizing logic for `weather_position` (Rule 7 depends on this existing;
-  Rules 11 and 12 must both be enforced there once it's built).
-- **A forecast-staleness/freshness guard for `checkMarkets.ts`** — real gap found live 2026-07-20
-  (Rule 14): a market whose `forecast_for` date has already elapsed produces a large but
-  meaningless apparent edge, since the market's price has converged toward the now-largely-known
-  real outcome while the stored ensemble forecast has not. Needed before any future Order Builder
-  trusts a `checkMarkets.ts` edge number without a human first checking the date.
-- **The Order Builder** — explicitly deferred by Joey (2026-07-20) to "the phase after this": the
-  actual trade-execution logic enforcing Rule 11's 5% capital cap and Rule 12's 1.5°F temperature
-  buffer against a real `checkMarkets.ts` edge. `checkMarkets.ts` itself only computes and logs EV
-  today — it does not decide or place a trade.
+- **Calibration of every stated-default numeric constant** — `MIN_EDGE_FLOOR` (5pp), the
+  `checkMarkets.ts` blend weights (0.35/0.65), `NOTABLE_EDGE_THRESHOLD` (5%), `KELLY_MULTIPLIER`
+  (0.25), `TEMP_BUFFER_F` (1.5), `STALE_CUTOFF_HOUR` (18:00) — all are explicitly-flagged starting
+  values, not empirically derived. Needs real paper-trade settlement outcomes to validate against;
+  the 3 real positions opened 2026-07-20 are the first data toward that.
 - **The "Buy Low, Sell High" early-exit strategy** — trading the spread dynamically as odds shift,
   rather than only holding every position to settlement (Joey, 2026-07-20). The odds-history table
   (`weather_market_odds_snapshot`, Rule 14) exists specifically to make this possible later; the
   actual shift-detection/exit-decision logic is not built yet.
-- A defined capital-base constant for the Weather Bot (Rule 11 is blocked on this — no
-  `PAPER_BANKROLL_USD`-equivalent exists yet for this system).
+- **Position closeout / settlement-driven PnL** — `orderBuilder.ts` only opens positions; nothing
+  yet closes a `weather_position` row, computes `realizedPnlUsd`, or rolls up `weather_pnl_snapshot`.
+  This is the natural next gap once real positions exist to close.
+- `WEATHER_PAPER_BANKROLL_USD` is currently a static mock constant (10,000), not a real,
+  accounted-for capital base — Rule 11's sizing math is correct, but nothing yet tracks capital
+  consumed by open positions against it (a second open position sized off the same static 10,000
+  rather than remaining capital), which the 3-open-position portfolio right now doesn't yet expose
+  but a larger one would.
 - The `weather_rule_set` table, if/when entry-threshold logic needs its own versioned audit trail.
 - `launchd` plist files (mechanism decided in `docs/weather/WEATHER_ARCHITECTURE.md`; concrete job
   definitions come with the scripts they invoke).

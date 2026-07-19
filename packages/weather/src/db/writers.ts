@@ -10,6 +10,7 @@ import {
   db,
   weatherMarketMapping,
   weatherMarketOddsSnapshot,
+  weatherPosition,
   weatherProbabilityEstimate,
   weatherStation,
 } from "@copybot/db";
@@ -163,5 +164,59 @@ export async function insertProbabilityEstimate(params: UpsertProbabilityEstimat
     edge: params.edge,
     modelVersion: params.modelVersion,
     inputsJson: JSON.stringify(params.inputsJson),
+  });
+}
+
+/** True if `marketSlug` already has an open (status='open') paper position — the duplicate-
+ * exposure guard orderBuilder.ts uses so re-running it never stacks a second position on a market
+ * it's already holding (mirrors the Copy Bot's own duplicate-exposure guard, `bot.py`). */
+export async function hasOpenPosition(marketSlug: string): Promise<boolean> {
+  const rows = await db
+    .select({ id: weatherPosition.id })
+    .from(weatherPosition)
+    .where(and(eq(weatherPosition.marketSlug, marketSlug), eq(weatherPosition.status, "open")))
+    .limit(1);
+  return rows.length > 0;
+}
+
+export interface InsertPaperTradeOrderParams {
+  marketSlug: string;
+  outcome: "Yes" | "No";
+  entryProb: number;
+  entryPrice: number;
+  sizeUsd: number;
+  ensembleProb: number;
+  polymarketProb: number;
+  probabilityDifference: number;
+  isSameDay: boolean;
+  stationLocalTime: string;
+  tempBufferF: number;
+  fullKellyFraction: number;
+  appliedFraction: number;
+}
+
+/** Writes one paper trade order as an open weather_position row. Reuses the pre-existing
+ * weather_position table (Rule 2's own pipeline design: weather_probability_estimate ->
+ * weather_position -> weather_pnl_snapshot) rather than a new table — it was already shaped
+ * exactly for this (marketSlug/outcome/entryPrice/ourSizeUsd/status), just unused until now. */
+export async function insertPaperTradeOrder(params: InsertPaperTradeOrderParams): Promise<void> {
+  await db.insert(weatherPosition).values({
+    marketSlug: params.marketSlug,
+    outcome: params.outcome,
+    status: "open",
+    entryProb: params.entryProb,
+    entryPrice: params.entryPrice,
+    ourSizeUsd: params.sizeUsd,
+    ourShares: params.sizeUsd / params.entryPrice,
+    avgEntryPrice: params.entryPrice,
+    isDemoData: false,
+    ensembleProb: params.ensembleProb,
+    polymarketProb: params.polymarketProb,
+    probabilityDifference: params.probabilityDifference,
+    isSameDay: params.isSameDay,
+    stationLocalTime: params.stationLocalTime,
+    tempBufferF: params.tempBufferF,
+    fullKellyFraction: params.fullKellyFraction,
+    appliedFraction: params.appliedFraction,
   });
 }

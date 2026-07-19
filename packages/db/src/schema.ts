@@ -478,6 +478,16 @@ export const weatherPosition = sqliteTable("weather_position", {
   closeReason: text("close_reason"),
   realizedPnlUsd: real("realized_pnl_usd"),
   isDemoData: integer("is_demo_data", { mode: "boolean" }).notNull().default(false),
+  // Order Builder telemetry (Joey, 2026-07-20) — the exact execution metrics that justified the
+  // trade, recorded at build time so they can be audited later without re-deriving them.
+  ensembleProb: real("ensemble_prob"),
+  polymarketProb: real("polymarket_prob"),
+  probabilityDifference: real("probability_difference"),
+  isSameDay: integer("is_same_day", { mode: "boolean" }),
+  stationLocalTime: text("station_local_time"),
+  tempBufferF: real("temp_buffer_f"),
+  fullKellyFraction: real("full_kelly_fraction"),
+  appliedFraction: real("applied_fraction"),
 });
 
 export const weatherPnlSnapshot = sqliteTable("weather_pnl_snapshot", {

@@ -31,6 +31,7 @@ import { db, weatherMarketMapping, weatherStation } from "@copybot/db";
 import { calculateClimatology } from "./calculateClimatology";
 import { calculateProbability, type ThresholdRange } from "./calculateProbability";
 import { insertProbabilityEstimate, logOddsSnapshot } from "./db/writers";
+import { checkStaleness } from "./staleness";
 
 // v1 heuristic, deliberately simple — see module comment. Weighted toward the ensemble forecast
 // (0.65) over pure historical climatology (0.35): a specific multi-model forecast for THIS date
@@ -48,6 +49,10 @@ const NOTABLE_EDGE_THRESHOLD = 0.05;
 interface ActiveMapping {
   marketSlug: string;
   stationExternalId: string;
+  /** Wunderground-sourced station's own timezone — resolved identically to the METAR-sourced
+   * station's, since both rows share the same real-world coordinates (Rule 8), used here purely
+   * for the Staleness Guard's station-local clock. */
+  timezone: string;
   metric: "max" | "min" | null;
   forecastFor: string | null;
   targetTempMinF: number | null;
@@ -59,6 +64,7 @@ async function fetchActiveMappings(): Promise<ActiveMapping[]> {
     .select({
       marketSlug: weatherMarketMapping.marketSlug,
       stationExternalId: weatherStation.externalId,
+      timezone: weatherStation.timezone,
       metric: weatherMarketMapping.metric,
       forecastFor: weatherMarketMapping.forecastFor,
       targetTempMinF: weatherMarketMapping.targetTempMinF,
@@ -99,6 +105,7 @@ async function main() {
 
   let evaluated = 0;
   let skippedNoThreshold = 0;
+  let skippedStale = 0;
   let skippedNoOdds = 0;
   let skippedNoData = 0;
   let notable = 0;
@@ -107,6 +114,20 @@ async function main() {
     if (!mapping.metric || !mapping.forecastFor || (mapping.targetTempMinF === null && mapping.targetTempMaxF === null)) {
       console.log(`SKIP ${mapping.marketSlug}: no parsed threshold on this mapping (re-run discoverMarkets.ts to backfill).`);
       skippedNoThreshold++;
+      continue;
+    }
+
+    // The Staleness Guard (Rule 14 addendum, 2026-07-20) — do not calculate an edge for a market
+    // whose forecast_for day has already fully elapsed, or whose station-local clock has passed
+    // the 18:00 cutoff on the target day itself (see staleness.ts's module comment for the full
+    // finding this patches). Evaluated BEFORE any odds fetch or probability math for this mapping.
+    const staleness = checkStaleness(mapping.forecastFor, mapping.timezone);
+    if (staleness.isStale) {
+      console.log(
+        `SKIP ${mapping.marketSlug}: stale (forecast_for ${mapping.forecastFor}, station-local now ` +
+          `${staleness.stationLocalTime}) — outcome is practically decided, not a real edge.`
+      );
+      skippedStale++;
       continue;
     }
 
@@ -151,8 +172,19 @@ async function main() {
         metric: mapping.metric,
         range,
         climatology: { probability: climatologyProb, sampleSize: climatology.result.totalCount, yearsUsed: climatology.yearsUsed, windowDays: climatology.windowDays },
-        forecast: { probability: forecastProb, byModel: forecast.byModel },
+        // meanForecastF: the ensemble's point-estimate forecast (both models pooled) — stored here
+        // specifically so orderBuilder.ts's Rule 12 temp-buffer check can read it back without
+        // re-querying weather_ensemble_forecast itself (single source of truth stays
+        // calculateProbability.ts; this is just carrying its output forward for later reuse).
+        forecast: { probability: forecastProb, byModel: forecast.byModel, meanForecastF: forecast.meanForecastF },
         blendClimatologyWeight: BLEND_CLIMATOLOGY_WEIGHT,
+        // staleness: recorded at the moment the edge was actually computed (not re-derived later)
+        // — orderBuilder.ts re-checks staleness fresh at its own run time regardless, since time
+        // may have passed between this estimate and an order actually being built from it.
+        staleness: {
+          isSameDay: staleness.isSameDay,
+          stationLocalTime: staleness.stationLocalTime,
+        },
       },
     });
 
@@ -170,6 +202,7 @@ async function main() {
   console.log(`Active mappings:              ${mappings.length}`);
   console.log(`Evaluated (EV logged):        ${evaluated}`);
   console.log(`Skipped (no parsed threshold):${skippedNoThreshold}`);
+  console.log(`Skipped (stale):              ${skippedStale}`);
   console.log(`Skipped (no current odds):    ${skippedNoOdds}`);
   console.log(`Skipped (no ensemble/climate data): ${skippedNoData}`);
   console.log(`Notable (|edge| >= ${(NOTABLE_EDGE_THRESHOLD * 100).toFixed(0)}%):     ${notable}`);

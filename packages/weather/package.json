@@ -12,6 +12,7 @@
     "prune:forecasts": "tsx src/pruneForecasts.ts",
     "calculate:probability": "tsx src/calculateProbability.ts",
     "check:markets": "tsx src/checkMarkets.ts",
+    "build:orders": "tsx src/orderBuilder.ts",
     "test": "vitest run"
   },
   "dependencies": {

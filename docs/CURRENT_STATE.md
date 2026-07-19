@@ -4,7 +4,7 @@
 "Last reviewed" date below before trusting a number in here over the live system (`bot.out.log`,
 `data/app.db`, `bullpen status`).
 
-**Last reviewed: 2026-07-20** (updated same-day: Weather Bot EV Bridge — `checkMarkets.ts` — built and live-verified)
+**Last reviewed: 2026-07-20** (updated same-day: Weather Bot Order Builder — Staleness Guard + `orderBuilder.ts` — built and live-verified, 3 real paper positions opened)
 
 ## Snapshot, right now
 
@@ -128,9 +128,34 @@
   deferred to a future phase (Joey, 2026-07-20): the Order Builder (Rule 11/12 enforcement) and the
   "Buy Low, Sell High" early-exit strategy the odds-history table exists to enable. Full detail:
   `docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 14.
+- **The Staleness Guard + the Order Builder — both built and live-verified** (2026-07-20;
+  `staleness.ts`, `orderSizing.ts`, `orderBuilder.ts`, 19th-21st scripts; migration
+  `0006_goofy_grey_gargoyle.sql` extends `weather_position`). Closes the forecast-staleness gap the
+  previous entry flagged: `checkMarkets.ts` now skips any mapping whose target day is fully past,
+  or whose station-local clock has passed 18:00 on the target day itself (same-day trading earlier
+  than that is allowed) — station-local time via `Intl.DateTimeFormat` against each station's
+  real timezone, not server/UTC time. `orderBuilder.ts` is the "hands" of the bot: reads
+  `checkMarkets.ts`'s logged edges and, for every active mapping, enforces Rule 7 (edge must clear
+  a 5pp floor), Rule 12 (ensemble forecast must clear a 1.5°F buffer from every strike boundary —
+  generalized from a one-sided to a two-sided check for real exact-degree buckets), and Rule 11
+  (Quarter-Kelly sizing, hard-capped at 5% of a new `WEATHER_PAPER_BANKROLL_USD = 10000` mock
+  capital base — the first concrete value for a constant Rule 11 was previously blocked on) — only
+  writing a sized paper trade to `weather_position` if all three pass. Also added, proactively: a
+  duplicate-exposure guard so re-running never stacks a second position on an already-open market.
+  **Live-verified against the 7 real, human-approved Seoul markets**: 4 correctly rejected on the
+  temp buffer (forecasts sitting 0.1-0.6°F from a bucket edge), 3 real paper trades placed — BUY
+  YES $154 (quarter-Kelly-bound) and two BUY NO $500 trades (both hit the 5% cap; full-Kelly
+  fractions were 67% and 82%, exactly the over-betting scenario the cap exists to catch). Re-run
+  confirmed idempotent (0 new orders, all 3 correctly skipped as duplicates). **Joey explicitly
+  asked for a design review before this was built** (not just "proceed") — three concerns were
+  raised and resolved first: full Kelly was judged too aggressive given the still-uncalibrated edge
+  model (resolved: quarter-Kelly), Rule 7's edge floor wasn't in the original scope but was judged
+  a natural companion to Rule 12 (resolved: built now), and "too close to end of day" needed a
+  concrete number (resolved: 18:00 station-local). **Kept as real paper-trading positions**, Joey's
+  explicit choice — not cleared as test artifacts. 70 unit tests passing across the weather package.
   Still not built: `verifySettlement.ts` (the live Wunderground/Playwright fetch — deliberately
-  deferred as its own step), `detectAnomaly.ts`'s general bounds-check, the Order Builder, position
-  management. Full design in `docs/weather/WEATHER_ARCHITECTURE.md` /
+  deferred as its own step), `detectAnomaly.ts`'s general bounds-check, position closeout/PnL
+  rollup, the early-exit strategy. Full design in `docs/weather/WEATHER_ARCHITECTURE.md` /
   `docs/weather/WEATHER_RISK_MANAGEMENT.md`.
 - **Database schema ownership:** TypeScript/Drizzle owns schema and migrations; Python
   (`db.py`) uses CRUD only — see `docs/copy-trading/SAFETY.md` §2.

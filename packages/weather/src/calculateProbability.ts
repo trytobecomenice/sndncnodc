@@ -53,6 +53,11 @@ export interface StationProbability {
   range: ThresholdRange;
   combined: ProbabilityResult;
   byModel: Record<string, ProbabilityResult>;
+  /** Mean of every combined ensemble member's forecast (both models pooled) — the "model's own
+   * forecast point estimate" Rule 12's temperature-buffer check (orderSizing.ts) needs. Added
+   * 2026-07-20 alongside the Order Builder; not used by calculateProbability.ts's own hit-rate
+   * math, which deliberately never collapses the distribution to a point. */
+  meanForecastF: number;
 }
 
 /** Queries the LATEST ensemble generation (per model, via getLatestIssuedAt so this always
@@ -101,6 +106,8 @@ export async function calculateProbability(
 
   if (allValues.length === 0) return null;
 
+  const meanForecastF = allValues.reduce((sum, v) => sum + v, 0) / allValues.length;
+
   return {
     stationExternalId,
     forecastFor,
@@ -108,6 +115,7 @@ export async function calculateProbability(
     range,
     combined: computeHitRate(allValues, range),
     byModel,
+    meanForecastF,
   };
 }
 
