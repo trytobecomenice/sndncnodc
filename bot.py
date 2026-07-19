@@ -416,6 +416,21 @@ def _parse_market_resolution(market_info):
     return {str(name).lower(): float(p) for name, p in zip(outcomes, prices)}
 
 
+# Consecutive closeout-sweep fetch failures per market_slug, used ONLY to
+# throttle repeated error logging (added 2026-07-19). During a bullpen
+# backend outage the hourly sweep re-logged an identical "market check
+# failed" error for every held market every sweep — hundreds of rows of
+# pure repetition in bot_event_log. Now: the FIRST failure per market is
+# logged normally, repeats are suppressed until either the fetch succeeds
+# again (counter resets silently) or every 24th consecutive failure
+# (~daily at the hourly sweep rate) logs a reminder that includes the
+# running count, so a market that stays unfetchable can't disappear from
+# the log entirely. In-memory on purpose: a restart re-logging one error
+# per still-failing market is acceptable, and persisting throttle state
+# would be bookkeeping with no decision value.
+_closeout_fetch_failures = {}
+
+
 def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_lower):
     """Resolved-market sweep (hourly, see CLOSEOUT_INTERVAL_SECONDS).
 
@@ -426,6 +441,10 @@ def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_
     position in: if it has resolved, book the final 0/1 outcome price as
     the close (position_resolved event, realized pnl fed to the circuit
     breaker like any other close) and drop the position.
+
+    A market whose lookup FAILS (vs. cleanly reporting "not resolved") is
+    left alone and retried next sweep; repeated identical failures are
+    throttled in the log — see _closeout_fetch_failures above.
 
     In LIVE mode, additionally runs `bullpen polymarket closeout` to
     actually redeem winners on-chain. That call moves real funds, so it is
@@ -452,10 +471,17 @@ def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_
                     retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS,
                 )
                 resolution_cache[market_slug] = _parse_market_resolution(market_info)
+                _closeout_fetch_failures.pop(market_slug, None)
             except Exception as e:
-                append_log({"timestamp": now_iso(), "event_type": "error",
-                            "market_slug": market_slug,
-                            "error": f"closeout sweep market check failed: {e}"})
+                failures = _closeout_fetch_failures.get(market_slug, 0) + 1
+                _closeout_fetch_failures[market_slug] = failures
+                if failures == 1 or failures % 24 == 0:
+                    append_log({"timestamp": now_iso(), "event_type": "error",
+                                "market_slug": market_slug,
+                                "consecutive_failures": failures,
+                                "error": f"closeout sweep market check failed "
+                                         f"({failures} consecutive sweep(s), repeats "
+                                         f"throttled): {e}"})
                 resolution_cache[market_slug] = None
 
         final_prices = resolution_cache[market_slug]

@@ -78,8 +78,12 @@ def start_bot():
     if bot_pid():
         return
     log_f = open(BOT_LOG_PATH, "a")
+    # -u matches how the bot is started manually: unbuffered stdout, so
+    # bot.out.log updates line-by-line instead of in block-buffered bursts
+    # (buffered output caused a false "bot is silent/frozen" reading on
+    # 2026-07-18 — keep these two launch paths identical).
     proc = subprocess.Popen(
-        [sys.executable, "bot.py"],
+        [sys.executable, "-u", "bot.py"],
         cwd=config.BASE_DIR,
         stdout=log_f,
         stderr=subprocess.STDOUT,

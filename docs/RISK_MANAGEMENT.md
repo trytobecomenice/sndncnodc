@@ -235,7 +235,12 @@ be arbitrarily stale and must never fire an exit on its own. A separate closeout
 sweeps can erode gains below the intended drawdown trigger before the bot reacts — a deliberate
 latency/API-load trade-off, not a bug. Exit logic depends entirely on `bullpen`'s live pricing
 being available; if `bullpen polymarket price` fails, that position simply isn't re-evaluated
-that cycle (fails soft, not closed) rather than forcing a stale-priced exit.
+that cycle (fails soft, not closed) rather than forcing a stale-priced exit. The same fails-soft
+principle applies to the closeout sweep: a market whose lookup fails is left alone and retried
+next sweep, and since 2026-07-19 repeated identical lookup failures are throttled in the event
+log (first failure logged, then one reminder per ~24 consecutive failures with a running count —
+`_closeout_fetch_failures` in `bot.py`) so a bullpen backend outage can't flood `bot_event_log`
+with hundreds of duplicate error rows the way one did before the throttle existed.
 
 **Why it exists:** without an active exit mechanism, a profitable copy relies entirely on the
 source trader eventually selling — which may happen too late, or not before a resolution.
