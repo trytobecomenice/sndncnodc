@@ -7,9 +7,10 @@ exists — precise enough to extend, tune, or challenge without re-deriving the 
 **Status: early implementation.** This rules ledger was written *before* any code, per an explicit
 documentation-first requirement, and is kept in sync as pieces get built — see each rule's "How it
 works mechanically" for what's implemented and unit-tested today (`ingestMetar.ts`,
-`pruneHistorical.ts`, `emergencyCloseoutGuard.ts`, `checkSettlementAgainstMetar.ts`,
-`discoverMarkets.ts`, `oddsFilter.ts`, `db/writers.ts`, `stationReconciliation.ts`) versus what's
-still planned (Rules 11-13's position-sizing/temperature-buffer/ensemble requirements,
+`pruneHistorical.ts`, `backfillHistorical.ts`, `emergencyCloseoutGuard.ts`,
+`checkSettlementAgainstMetar.ts`, `discoverMarkets.ts`, `oddsFilter.ts`, `db/writers.ts`,
+`stationReconciliation.ts`) versus what's still planned (Rules 11-13's
+position-sizing/temperature-buffer/ensemble requirements,
 `detectAnomaly.ts`'s general bounds-check, `verifySettlement.ts`'s live Wunderground fetch, and
 all entry-rule/position-sizing logic). **This is the single source of truth for what rules will
 apply to the Weather Bot** — check it
@@ -117,9 +118,54 @@ enforced by a scheduled job, not a database constraint. Verified end-to-end: run
 `data/app.db`, correctly left a genuine 2026-07-18 row untouched, then correctly deleted a
 deliberately-inserted 2020-01-01 test row while leaving everything else intact. Not yet wired to
 a scheduler (no `launchd` job exists in this repo today, per `docs/weather/WEATHER_ARCHITECTURE.md`'s
-execution-cycle table) — run manually until that's built. Historical backfill on onboarding a new
-station is capped at the same 2-year window from day one, rather than backfilling everything
-available and pruning down afterward.
+execution-cycle table) — run manually until that's built.
+
+**Global historical backfill, implemented and live-run across the full fleet (2026-07-19).**
+`packages/weather/src/backfillHistorical.ts` (`pnpm --filter @copybot/weather backfill:historical`)
+builds the actual climatology "memory" this rule's retention window exists to bound — one real
+2-year daily min/max row per station, for every onboarded station, not just the one or two spot-
+checked earlier. **This required a data-source change, discovered live, not assumed:**
+`aviationweather.gov`'s `/api/data/metar` endpoint — `ingestMetar.ts`'s source — was tested
+directly against a multi-year request and found to have a hard ceiling around **8-9 days** of
+real history (its `hours` parameter tops out at 750 before the API rejects the request, and even
+within that it silently caps at ~400 records) — it's a live "recent conditions" feed, not an
+archive, and no amount of pacing or chunking gets around a server-side limit. The real free,
+public source for multi-year historical METAR is the **Iowa Environmental Mesonet's ASOS archive**
+(`mesonet.agron.iastate.edu`, Iowa State University) — verified live to return a station's entire
+2-year window in ONE request (44,626 raw readings for RKSI alone), and confirmed to accept the
+same ICAO station code unchanged for both US and non-US stations (IEM's response labels drop the
+leading "K" for US airports — e.g. `KLGA` → `LGA` — but that's cosmetic only; the *query* uses the
+same code weather_station already stores, no remapping needed). Results are written with the same
+`source: "metar"` tag `ingestMetar.ts` uses (same underlying METAR data, different access point),
+sharing the identical `(station_id, obs_date, source)` upsert target. Daily aggregation uses each
+station's own **real local timezone** (already resolved via Rule 8's auto-onboarding) rather than
+`ingestMetar.ts`'s UTC-day simplification — a genuine correctness improvement, worth doing here
+since this backfill is meant to be the trustworthy long-term record, not just a fast nowcast input.
+
+**Live result, full fleet**: all 43 onboarded stations backfilled in one run, zero failures,
+31,384 total daily rows (~730 days × 43 stations, a handful of stations landing slightly under —
+708-728 days — from genuine gaps in their real historical record, not a bug: every other station
+landed at exactly 730-731). **Idempotency verified two ways**: (1) `onConflictDoUpdate` on the
+existing unique index means a re-run can never create a duplicate row, confirmed by direct query
+after re-running (zero `(station_id, obs_date)` pairs with `count > 1`); (2) a resume optimization
+(`countExistingDays`) skips a station's network request entirely if it's already within 2 days of
+full coverage, confirmed on immediate re-run — 39 of 43 stations were skipped with zero requests
+made, only the handful with genuine data gaps re-checked (harmless — IEM re-serves the same cached
+range cheaply, no new rows result, verified by row count staying at exactly 31,384 across re-runs).
+**Pacing, taken seriously because it had to be**: this script triggered IEM's rate limiter
+("Too many requests from your IP address, slow down.") after just two rapid manual test requests
+during development — `fetchStationCsv` detects that exact response text and backs off 60s (up to 3
+attempts) rather than treating it as a hard failure, on top of a 5s base delay between the 43
+station requests (more conservative than the 2-3s originally proposed, a deliberate choice after
+seeing how easily the limiter triggered). The full 43-station run needed zero rate-limit backoffs
+in practice — the 5s pacing was sufficient — but the detection/backoff path exists and would
+trigger automatically if IEM's tolerance ever tightens.
+
+**Window discipline**: exactly 2 years, not the 2.5 originally requested — reuses
+`pruneHistorical.ts`'s own `historicalObservationCutoff()` function directly (not a duplicated
+constant) specifically so the backfill window and the prune cutoff can never drift out of sync;
+backfilling past the documented retention window would just have had `pruneHistorical.ts` delete
+the oldest data right back out the next time it runs.
 
 **System costs & trade-offs:** 1-2 years is enough for a meaningful climatology baseline
 (day-of-year historical distribution) but explicitly not enough for long-cycle climate pattern
@@ -570,8 +616,9 @@ begins.
 - The `weather_rule_set` table, if/when entry-threshold logic needs its own versioned audit trail.
 - `launchd` plist files (mechanism decided in `docs/weather/WEATHER_ARCHITECTURE.md`; concrete job
   definitions come with the scripts they invoke).
-- Calibrated anomaly-detection thresholds for `detectAnomaly.ts` (needs real station data first).
-- Historical backfill for auto-onboarded stations (`discoverMarkets.ts`'s auto-onboarding, Rule 8,
-  creates a `weather_station` row with real coordinates but does not itself trigger
-  `ingestMetar.ts` to backfill observations for it — that's still a separate, manually-triggered
-  step today).
+- Calibrated anomaly-detection thresholds for `detectAnomaly.ts` (needs real station data first —
+  now available: `backfillHistorical.ts` has run for all 43 stations, Rule 3).
+- Auto-triggering `backfillHistorical.ts` when `discoverMarkets.ts` auto-onboards a brand-new
+  station (Rule 8) — today the two are still separate, manually-triggered steps; a newly
+  auto-onboarded station has real coordinates/timezone immediately but no historical rows until
+  `backfill:historical` is run again by hand.

@@ -71,7 +71,20 @@
   Rule 11 (5% max capital per
   trade), Rule 12 (1.5°F minimum forecast-vs-strike buffer), Rule 13 (ensemble forecasting
   required, not a single deterministic model). `packages/weather`/`packages/copy-trading`
-  isolation re-verified clean. Still not built: `verifySettlement.ts` (the live Wunderground/Playwright fetch — deliberately
+  isolation re-verified clean.
+- **Global historical backfill — the full fleet's climatology "memory," built and live-run**
+  (2026-07-19, `backfillHistorical.ts`, 10th script). Real finding first: `aviationweather.gov`
+  (`ingestMetar.ts`'s source) was verified to cap at ~8-9 days of history, physically incapable of
+  a multi-year backfill — switched to the Iowa Environmental Mesonet's ASOS archive (free, public,
+  one request per station covers the whole 2-year window). All 43 stations backfilled in one run,
+  zero failures, 31,384 daily rows total. Window is exactly 2 years (not the 2.5 first proposed —
+  Joey's call, to match Rule 3's retention policy exactly, reusing `pruneHistorical.ts`'s own
+  cutoff function so the two can't drift apart). Idempotent both by upsert (re-run confirmed zero
+  duplicate rows) and by a resume optimization (re-run skipped 39/43 stations with zero network
+  calls, since they were already fully backfilled). Rate-limit-aware by necessity, not caution for
+  its own sake — the archive's rate limiter triggered after just 2 manual test requests during
+  development; the real 43-station run needed zero backoffs at the 5s pacing used.
+  Still not built: `verifySettlement.ts` (the live Wunderground/Playwright fetch — deliberately
   deferred as its own step), NOAA/Open-Meteo ingestion, probability computation, position
   management. Full design in `docs/weather/WEATHER_ARCHITECTURE.md` /
   `docs/weather/WEATHER_RISK_MANAGEMENT.md`.

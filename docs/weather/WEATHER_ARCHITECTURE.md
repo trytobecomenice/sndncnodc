@@ -203,7 +203,7 @@ Copy Bot's `scoreWallets.ts` already uses within a single run (its pass-1/pass-2
 ## 4. Proposed `packages/weather/` structure
 
 `packages/weather/` is now a real, wired-in pnpm workspace member — `package.json`/`tsconfig.json`
-exist, and nine scripts/modules are built, tested, and live-verified against `data/app.db` and
+exist, and ten scripts/modules are built, tested, and live-verified against `data/app.db` and
 real Polymarket data (2026-07-19). Structure mirrors `packages/copy-trading`'s conventions: plain
 `tsx`-executed scripts, an `isMainModule` guard so files stay test-importable, vitest for
 pure-function tests. **`db/writers.ts` is now built** — introduced exactly when
@@ -217,6 +217,7 @@ packages/weather/
   src/
     ingestMetar.ts                      # BUILT ✅ — aviationweather.gov, nowcast/forecast input, never settlement
     pruneHistorical.ts                  # BUILT ✅ — Rule 3, enforces 2yr/60-day rolling retention
+    backfillHistorical.ts               # BUILT ✅ — Rule 3, one-shot full-fleet 2yr backfill via IEM ASOS archive (NOT aviationweather.gov — see Rule 3)
     emergencyCloseoutGuard.ts           # BUILT ✅ — Rule 4's slippage ceiling (5% / $0.05 floor)
     emergencyCloseoutGuard.test.ts      # BUILT ✅ — 8 tests
     checkSettlementAgainstMetar.ts      # BUILT ✅ — Rule 6's Dual Oracle Cross-Check (4°F threshold)

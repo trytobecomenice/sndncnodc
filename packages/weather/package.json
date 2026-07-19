@@ -7,6 +7,7 @@
     "ingest:metar": "tsx src/ingestMetar.ts",
     "prune:historical": "tsx src/pruneHistorical.ts",
     "discover:markets": "tsx src/discoverMarkets.ts",
+    "backfill:historical": "tsx src/backfillHistorical.ts",
     "test": "vitest run"
   },
   "dependencies": {
