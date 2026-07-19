@@ -121,6 +121,16 @@ covers that."*
 - **Equity refresh lag**: Rule 6's drawdown kill switch only refreshes equity every ~5 minutes
   (tied to the TTP sweep interval) — a sharp intra-window drawdown that reverses before the next
   sweep is invisible to the kill switch entirely.
+- **Whole-process freeze (e.g. machine sleep)**: on 2026-07-18 the Mac suspending overnight froze
+  `bot.py` mid-subprocess-call, and it stayed silently wedged after wake. Defense-in-depth added
+  2026-07-19: every bullpen subprocess call has a hard timeout
+  (`config.BULLPEN_CALL_TIMEOUT_SECONDS`, 60s default), and the tracker-feed poll — the highest-
+  frequency call and the one that froze — gets a tighter `config.FEED_POLL_TIMEOUT_SECONDS`
+  (20s). Deliberately NOT tightened for buy/sell: a tight ceiling on a money-moving call
+  manufactures `unknown_fill_state` outcomes (order submitted, response leg cut off), which is
+  the worst failure mode available. A timeout cannot prevent an OS suspend itself — it only
+  bounds how long a call can wedge the loop once the machine is awake again; the residual gap
+  (nothing external restarts or alerts on a dead `bot.py`) remains open.
 
 **How it works mechanically:** n/a — this section is a map of gaps, not a control.
 

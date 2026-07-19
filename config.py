@@ -221,6 +221,23 @@ LIVE_MODE = False
 FEED_FETCH_RETRIES = 3
 FEED_FETCH_RETRY_DELAY_SECONDS = 0.5
 
+# Hard subprocess timeouts (seconds) for bullpen calls, split by call class
+# (added 2026-07-19, defense-in-depth after the 2026-07-18 overnight freeze
+# — the machine suspending mid-call froze the whole poll loop; a timeout
+# can't prevent an OS suspend, but it guarantees no single call can wedge
+# the loop for longer than this once the machine is awake again).
+#
+# - BULLPEN_CALL_TIMEOUT_SECONDS: default for every call. Deliberately
+#   generous for buy/sell — a tight ceiling there would create MORE
+#   unknown_fill_state outcomes (order submitted, response leg cut off),
+#   which is the worst failure mode we have. Don't lower this one.
+# - FEED_POLL_TIMEOUT_SECONDS: tracker-feed poll only — the bot's highest-
+#   frequency call and the one that froze. A feed read slower than the
+#   30s poll interval is already a failed cycle in practice, so it gets a
+#   tight ceiling; with FEED_FETCH_RETRIES=3 the worst case stays ~1 min.
+BULLPEN_CALL_TIMEOUT_SECONDS = 60
+FEED_POLL_TIMEOUT_SECONDS = 20
+
 # Optional private Polygon RPC endpoint (e.g. an Alchemy/QuickNode app URL)
 # to cut latency and get `eth_getLogs` support the public fallback RPC
 # lacks. Leave as None to use bullpen's built-in public Polygon RPC.

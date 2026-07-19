@@ -972,6 +972,7 @@ def main():
                 ["tracker", "feed", "--limit", str(config.FEED_LIMIT)],
                 retries=config.FEED_FETCH_RETRIES,
                 retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS,
+                timeout=config.FEED_POLL_TIMEOUT_SECONDS,
             )
             trades = feed.get("trades", [])
             for t in trades:
@@ -996,6 +997,7 @@ def main():
                 ["tracker", "feed", "--limit", str(config.FEED_LIMIT)],
                 retries=config.FEED_FETCH_RETRIES,
                 retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS,
+                timeout=config.FEED_POLL_TIMEOUT_SECONDS,
             )
             trades = feed.get("trades", [])
             new_trades = [t for t in trades if t.get("trade_id") not in seen_set]

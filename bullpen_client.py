@@ -34,17 +34,24 @@ class BullpenTimeoutError(RuntimeError):
     """
 
 
-def run_bullpen_json(args, retries=1, retry_delay=0.5):
+def run_bullpen_json(args, retries=1, retry_delay=0.5, timeout=None):
     """retries=1 means "try once, no retry" — that's the default and MUST stay
     the default for any call that can move funds (buy/sell). Only read-only
     calls (tracker feed) should pass retries>1: a retried buy/sell risks
     double-executing a trade that actually filled but errored on the
     response leg.
+
+    timeout is the hard subprocess ceiling in seconds; None means
+    config.BULLPEN_CALL_TIMEOUT_SECONDS (60 — generous ON PURPOSE for
+    buy/sell, see that constant's doc comment). Only read-only,
+    high-frequency call sites should pass a tighter value (the tracker-
+    feed poll passes config.FEED_POLL_TIMEOUT_SECONDS) — never tighten a
+    money-moving call, that manufactures unknown_fill_state outcomes.
     """
     last_error = None
     for attempt in range(1, retries + 1):
         try:
-            return _run_bullpen_json_once(args)
+            return _run_bullpen_json_once(args, timeout)
         except RuntimeError as e:
             last_error = e
             if attempt < retries:
@@ -52,20 +59,22 @@ def run_bullpen_json(args, retries=1, retry_delay=0.5):
     raise last_error
 
 
-def _run_bullpen_json_once(args):
+def _run_bullpen_json_once(args, timeout=None):
+    if timeout is None:
+        timeout = config.BULLPEN_CALL_TIMEOUT_SECONDS
     try:
         result = subprocess.run(
             ["bullpen"] + args + ["--output", "json"],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         # Raised as a RuntimeError subclass so the retry loop above still
         # retries read-only calls, while trade call sites can distinguish
         # "timed out, fill state unknown" from a clean rejection.
         raise BullpenTimeoutError(
-            f"bullpen {' '.join(args)} timed out after 60s; "
+            f"bullpen {' '.join(args)} timed out after {timeout}s; "
             f"if this was a trade, the order MAY still have executed"
         )
     data = None
