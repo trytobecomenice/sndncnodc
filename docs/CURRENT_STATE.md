@@ -93,11 +93,19 @@
   zero failures. Chunked bulk upserts (`onConflictDoUpdate`, 300 rows/statement) confirmed via
   `EXPLAIN QUERY PLAN` to actually use the new lookup index. Real signal surfaced immediately:
   RKSI's next-day forecast has `ecmwf_ifs025` putting 11/51 members (~22%) at/above 80°F vs.
-  `gfs_seamless`'s 1/31 (~3%) — a genuine cross-model disagreement. **Open risk, not yet closed**:
-  each run is a new forecast generation by design (two test runs produced 70,520 rows, zero
-  pruning) — this table must not be scheduled unattended until a retention policy exists (see
-  `docs/weather/WEATHER_RISK_MANAGEMENT.md` Roadmap). Also fixed while here: `dashboard.py`
-  (port 8787) had been stopped since before this session and was restarted.
+  `gfs_seamless`'s 1/31 (~3%) — a genuine cross-model disagreement. Also fixed while here:
+  `dashboard.py` (port 8787) had been stopped since before this session and was restarted.
+- **Retention closed + probability engine built, both live-verified** (2026-07-20, `pruneForecasts.ts`
+  12th script, `calculateProbability.ts` 13th script). Prune policy: keep only the latest
+  `issuedAt` generation per (station, model), one atomic correlated-subquery `DELETE`, supported
+  by a new index (migration `0004_flashy_rawhide_kid.sql`). Live-proven against the real
+  accumulated dataset: 70,520 → 35,260 rows, then confirmed idempotent (re-run deleted 0 rows).
+  `calculateProbability.ts` queries the latest generation and computes hit-rate probability,
+  combined and per-model — real results pulled live: RKSI next-day ≥80°F came back 31.7% combined
+  but `ecmwf_ifs025` 19.6% vs. `gfs_seamless` 51.6%; KLGA's 78-79°F bucket was `ecmwf_ifs025` 31.4%
+  vs. `gfs_seamless` a flat 0.0%. Scope deliberately stops at the math: not yet wired to real
+  market thresholds (needs `weather_market_mapping` extended, or slug-parsing) or to
+  `weather_probability_estimate` writes — both real next steps, not silently skipped.
   Still not built: `verifySettlement.ts` (the live Wunderground/Playwright fetch — deliberately
   deferred as its own step), the ensemble retention policy above, probability computation, position
   management. Full design in `docs/weather/WEATHER_ARCHITECTURE.md` /

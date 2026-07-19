@@ -1,0 +1,1 @@
+CREATE INDEX `weather_ensemble_forecast_station_model_issued_idx` ON `weather_ensemble_forecast` (`station_id`,`model`,`issued_at`);

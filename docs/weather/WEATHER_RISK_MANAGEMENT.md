@@ -599,15 +599,31 @@ the entire justification for this rule.
 
 **System costs & trade-offs:** real, quantified, not hand-waved — confirmed ~35,000 rows per
 refresh cycle (not an estimate: the live run hit 35,260 exactly), at the same 3-6h cadence as the
-existing forecast snapshot job. **Retention is a real, currently-unclosed gap, not a future nice-
-to-have**: each run is a NEW forecast generation by design (`issuedAt` set fresh per run, same
-"reissued forecasts accumulate" pattern `weather_forecast_snapshot` already uses) — two
-consecutive test runs produced 70,520 rows with zero pruning. This table must not run unattended
-in production until a retention policy is added to `pruneHistorical.ts` (or a sibling script) —
-noted in Roadmap as a blocker, not a polish item. Fetching two models instead of one roughly
-doubles both the row volume and the API calls per refresh cycle (2 calls per station instead of 1)
-— accepted specifically because tail-risk representation was
+existing forecast snapshot job. **Retention gap closed same-day (2026-07-20) by
+`pruneForecasts.ts`** — see Rule 3-style treatment below (this is really an addendum to Rule 3's
+retention philosophy, applied to this table specifically): keeps only the latest `issuedAt`
+generation per (station, model), deleted via one atomic correlated-subquery `DELETE`. Live-proven
+against the real accumulated 70,520-row dataset: pruned to exactly 35,260, then confirmed
+idempotent (re-running when only one generation remains deletes 0 rows, not everything). Fetching
+two models instead of one roughly doubles both the row volume and the API calls per refresh cycle
+(2 calls per station instead of 1) — accepted specifically because tail-risk representation was
 judged worth the cost, the same trade-off already justified below.
+
+**Probability calculation — built and live-verified (2026-07-20), `calculateProbability.ts`.**
+Queries the latest ensemble generation per model for a station/day and computes what fraction of
+members land inside a target range — combined AND broken out per model, deliberately never
+collapsed into one blended number by default, since hiding cross-model disagreement would defeat
+this rule's entire purpose. **Real, live results**: RKSI's next-day ≥80°F probability came back
+combined 31.7% (26/82) — but `ecmwf_ifs025` said 19.6% while `gfs_seamless` said 51.6%, a 32-point
+spread on the same question. KLGA's 78-79°F bucket was starker still: `ecmwf_ifs025` at 31.4%
+versus `gfs_seamless` at a flat 0.0%. Pure hit-rate math (`computeHitRate`) is unit-tested
+independent of the DB, including a direct reproduction of the RKSI 22%/3% finding from the first
+ingestion run. **Scope, deliberate**: this module is the probability math only — it does not yet
+parse a market's actual temperature bucket from its `market_slug` (no stored min/max columns
+exist on `weather_market_mapping` yet) and does not yet write to `weather_probability_estimate`
+(keyed by `market_slug`/`outcome`, which this module has no way to populate without that parsing
+step). Both are real, distinct next steps — most naturally `checkMarkets.ts`'s job — not silently
+done here.
 
 **Why it exists:** direct instruction (Joey, 2026-07-19) — a single deterministic model gives a
 false sense of precision on exactly the kind of question (will tomorrow's high cross this precise
@@ -630,11 +646,10 @@ begins.
   Rules 11 and 12 must both be enforced there once it's built).
 - `computeProbability.ts`'s actual climatology/forecast blend math (Rule 13's ensemble
   requirement applies here once built).
-- **Retention policy for `weather_ensemble_forecast` — a real blocker, not a polish item.**
-  `ingestOpenMeteo.ts` is built and live-verified (Rule 13), but every run is a new, un-pruned
-  forecast generation (35,260 rows/run, confirmed). Must not be scheduled to run unattended until
-  a short retention window (shorter than `weather_forecast_snapshot`'s 60 days — an ensemble row
-  has no value once `forecastFor` resolves) is added to `pruneHistorical.ts` or a sibling script.
+- Wiring `calculateProbability.ts` to real market thresholds — needs `weather_market_mapping`
+  extended with stored min/max bucket columns (or a slug-parsing step), plus writing the result
+  into `weather_probability_estimate` (keyed by `market_slug`/`outcome`). Most naturally
+  `checkMarkets.ts`'s job once it exists — the probability math itself is done (Rule 13).
 - A defined capital-base constant for the Weather Bot (Rule 11 is blocked on this — no
   `PAPER_BANKROLL_USD`-equivalent exists yet for this system).
 - The `weather_rule_set` table, if/when entry-threshold logic needs its own versioned audit trail.

@@ -9,6 +9,8 @@
     "discover:markets": "tsx src/discoverMarkets.ts",
     "backfill:historical": "tsx src/backfillHistorical.ts",
     "ingest:openmeteo": "tsx src/ingestOpenMeteo.ts",
+    "prune:forecasts": "tsx src/pruneForecasts.ts",
+    "calculate:probability": "tsx src/calculateProbability.ts",
     "test": "vitest run"
   },
   "dependencies": {

@@ -195,13 +195,23 @@ scan). Real result pulled this way, RKSI's next day: `ecmwf_ifs025` put 11/51 me
 above 80°F, `gfs_seamless` put only 1/31 (~3%) — a genuine cross-model disagreement, exactly the
 signal a single deterministic forecast would have hidden.
 
-**Retention gap, real and not yet closed**: each `ingestOpenMeteo.ts` run is a NEW forecast
-generation (`issuedAt` is set fresh per run) — by design, matching `weather_forecast_snapshot`'s
-existing "reissued forecasts accumulate" pattern, not a bug. But that means this table has **no
-prune policy yet** and grows every refresh cycle. Live-confirmed: two consecutive runs produced
-70,520 rows (2 × 35,260, 2 distinct `issuedAt` values) — real, correct data, but a real,
-un-addressed growth-rate problem at a 3-6h production cadence. Needs a short retention window
-added to `pruneHistorical.ts` (or a sibling script) before this runs unattended — see Roadmap.
+**Retention gap — closed same-day (2026-07-20) by `pruneForecasts.ts`.** Each `ingestOpenMeteo.ts`
+run is a NEW forecast generation (`issuedAt` set fresh per run) — by design, matching
+`weather_forecast_snapshot`'s existing "reissued forecasts accumulate" pattern, not a bug. Policy
+(Joey's call): keep ONLY the latest `issuedAt` generation per (station, model) pair, delete
+everything older — no rolling window, since `calculateProbability.ts` only ever needs the current
+distribution. Implemented as a single correlated-subquery `DELETE`, atomic by construction (one
+SQL statement, no read-then-delete race window against a concurrent ingestion run), supported by
+a dedicated index (`weather_ensemble_forecast_station_model_issued_idx` on
+`(stationId, model, issuedAt)`, migration `0004_flashy_rawhide_kid.sql`). **Live-verified**: ran
+against the real 70,520-row dataset from two accumulated test generations — pruned to exactly
+35,260 (one generation × 43 stations × 2 models), then re-ran immediately and confirmed 0 rows
+deleted (correct: nothing is "older than the max" once only one generation remains — proves the
+query doesn't over-delete on a single-generation table). **Trade-off, named explicitly**: this
+policy makes it impossible to later ask "how did our forecast change as the event approached" — a
+real forecast-skill-validation question for a future `reviewOutcomes.ts` — since only the single
+latest snapshot ever survives. Revisit toward a short rolling window if that question becomes
+important; not needed for the "make today's trading decision" use case this serves now.
 
 ---
 

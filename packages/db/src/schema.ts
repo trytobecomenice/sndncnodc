@@ -396,6 +396,10 @@ export const weatherEnsembleForecast = sqliteTable(
     // station+day+model, or this station+day across models") — SQLite can also use this
     // index's leading columns for narrower (stationId) / (stationId, forecastFor) filters.
     index("weather_ensemble_forecast_lookup_idx").on(t.stationId, t.forecastFor, t.model),
+    // Supports pruneForecasts.ts's "keep only the latest generation per (station, model)"
+    // correlated-subquery DELETE — that query's inner MAX(issued_at) lookup is grouped by
+    // exactly (station_id, model), so this index lets it be an index seek, not a table scan.
+    index("weather_ensemble_forecast_station_model_issued_idx").on(t.stationId, t.model, t.issuedAt),
   ]
 );
 
