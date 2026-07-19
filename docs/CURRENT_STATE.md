@@ -19,6 +19,14 @@
   `docs/RISK_MANAGEMENT.md` Rules 3–6 and 11 for full detail). All portfolio-level checks are
   unit-tested (`python3 -m unittest test_risk_manager test_bot_risk_checks`, 26/26 passing as of
   this review).
+- **Operational hardening (2026-07-19 evening):** every bullpen subprocess call now has an
+  explicit hard timeout (60s default; the tracker-feed poll is tightened to 20s — see
+  `docs/SAFETY.md` §3, "Whole-process freeze"), and repeated identical closeout-sweep fetch
+  failures are throttled in the event log (first logged, then ~daily reminders with a running
+  count — `docs/RISK_MANAGEMENT.md` Rule 7) after a transient bullpen outage produced hundreds
+  of duplicate error rows. `dashboard.py`'s Start button now launches the bot with `-u`,
+  matching the manual launch path. Known remaining gap, accepted for now: nothing external
+  restarts or alerts on a dead `bot.py` process.
 - **Wallet-research pipeline:** `scanLeaderboard.ts` / `scoreWallets.ts` are built, but a fresh
   re-run is currently **blocked** — bullpen's `data leaderboard` endpoint has been returning
   `NETWORK_TIMEOUT` (its `smart-money` endpoint is healthy, so this is a partial outage, not a
