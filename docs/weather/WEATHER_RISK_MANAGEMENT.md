@@ -334,14 +334,25 @@ mapping was only written if an existing `weather_station` row for that external 
 coordinates to borrow — meaning any city not already manually onboarded via `ingestMetar.ts` was
 silently skipped forever, which does not scale as Polymarket adds new city markets continuously
 (Joey, 2026-07-19: "Tomorrow it might be London or Tokyo, and the bot will get stuck again"). Now,
-when a station is unknown AND at least one of its markets passes the odds filter (Rule 10),
 `resolveWundergroundStation()` calls `stationReconciliation.ts`'s `resolveStationMetadata()` to
 fetch real lat/lon/name from `aviationweather.gov` (the same free source `ingestMetar.ts` already
 uses) and derive a real IANA timezone from those coordinates via `geo-tz` (an offline lookup
-library — no network call, no manual per-station map). **Live-verified**: KLGA (NYC) and ZSPD
-(Shanghai) — neither previously known to this system — were auto-onboarded with correct real
-coordinates and timezones (`America/New_York`, `Asia/Shanghai`) on first contact, confirmed via
-direct query. Still never fabricated: if the parsed code isn't a real METAR-reporting station,
+library — no network call, no manual per-station map). **Corrected again, same day**: the first
+version of this fix only resolved a station when one of ITS OWN markets happened to pass the odds
+filter at scan time — Joey caught that this still left most cities unknown, since a city's markets
+are only briefly in-band and a scan that misses that window would never learn the station at all
+("it shouldn't only have 2 [stations]"). Station knowledge is now fully decoupled from Rule 10:
+every Wunderground-sourced event's station gets resolved/onboarded on every scan regardless of
+current odds — Rule 10 still gates which *markets* get written to `weather_market_mapping` (a real
+capital/attention decision), but never gates which *stations* this system simply knows about,
+since station metadata alone commits no capital and carries no risk. **Live-verified**: a single
+scan onboarded 6 real stations across 3 continents (KLGA/NYC, ZSPD/Shanghai, RCSS/Taipei,
+WMKK/Kuala Lumpur, ZGGG/Guangzhou, ZHHH/Wuhan, ZGSZ/Shenzhen) with correct real names, coordinates,
+and timezones — including `Asia/Singapore` for Kuala Lumpur, the geographically-correct IANA zone
+name for Malaysia (there is no separate `Asia/Kuala_Lumpur` zone), which a manual per-city map
+would have had to know rather than derive. Re-running is confirmed idempotent (0 newly onboarded
+on a second scan, same 8 stations, same 5 mappings). Still never fabricated: if the parsed code
+isn't a real METAR-reporting station,
 resolution returns `null` and the market is skipped and logged, exactly as before.
 
 **System costs & trade-offs:** reviewing once per city/event (rather than once per individual

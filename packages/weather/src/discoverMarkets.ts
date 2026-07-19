@@ -16,12 +16,22 @@
 // DYNAMIC STATION AUTO-ONBOARDING (2026-07-19): Polymarket adds new city markets continuously —
 // a station allowlist that only worked for cities seen so far would break the moment an
 // unfamiliar one appeared (Joey: "Tomorrow it might be London or Tokyo, and the bot will get
-// stuck again"). So when an in-band market's station ISN'T already known, this script calls
-// stationReconciliation.ts's resolveStationMetadata() to fetch real lat/lon/name from
-// aviationweather.gov and derive a real timezone (geo-tz, offline) automatically — the exact
-// same free, ToS-clean source ingestMetar.ts already uses, just triggered on demand instead of
-// manually. STILL NEVER FABRICATES: if the parsed ICAO code isn't a real METAR-reporting
-// station, resolution returns null and the market is skipped and logged, not guessed at.
+// stuck again"). This script calls stationReconciliation.ts's resolveStationMetadata() to fetch
+// real lat/lon/name from aviationweather.gov and derive a real timezone (geo-tz, offline)
+// automatically — the exact same free, ToS-clean source ingestMetar.ts already uses, just
+// triggered on demand instead of manually. STILL NEVER FABRICATES: if the parsed ICAO code isn't
+// a real METAR-reporting station, resolution returns null and is skipped and logged.
+//
+// STATION KNOWLEDGE IS DECOUPLED FROM THE ODDS FILTER (2026-07-19 — corrected from this file's
+// original design). Every Wunderground-sourced event's station gets resolved/onboarded
+// regardless of whether any of its markets currently pass Rule 10's odds band — a real gap Joey
+// caught: the first version only resolved a station when a market happened to be in-band AT SCAN
+// TIME, so a city whose markets were only briefly in-band between two scans could go forever
+// unknown to this system even though it's a real, actively-traded Polymarket city. Station
+// metadata is cheap, harmless reference data (no capital committed, no market tracked) — Rule 10
+// still gates which MARKETS get written to weather_market_mapping (that's the real
+// risk/attention decision), it should never have gated which STATIONS this system simply knows
+// about.
 
 import { runBullpenJson } from "@copybot/bullpen-client";
 import { findStationByExternalId, upsertMarketMapping, upsertWeatherStation } from "./db/writers";
@@ -81,9 +91,8 @@ async function fetchWeatherEvents(limit: number): Promise<DiscoverEvent[]> {
  * ICAO code, borrowing/writing coordinates as needed. Returns null only if the station genuinely
  * cannot be resolved (not a real METAR-reporting station) — never fabricated.
  *
- * Deliberately only called once we already know at least one market under this event passed the
- * odds filter (see call site) — no point spending a real network call resolving a station for an
- * event none of whose markets are actually worth tracking right now.
+ * Called for EVERY Wunderground-sourced event, independent of odds — see this file's module
+ * comment on why station knowledge is deliberately decoupled from Rule 10's odds filter.
  */
 async function resolveWundergroundStation(icaoId: string): Promise<{ id: string; wasAutoOnboarded: boolean } | null> {
   const known = await findStationByExternalId(icaoId);
@@ -169,9 +178,14 @@ async function main() {
       continue;
     }
 
-    // First pass: which markets even pass the odds filter? Only resolve/auto-onboard the
-    // station if at least one does — never spend a real network call on an event we're about
-    // to skip entirely anyway.
+    // Resolve/auto-onboard the station FIRST, unconditionally — station knowledge is not gated
+    // by odds (see module comment). Only market TRACKING (the mapping write below) is.
+    const station = await resolveWundergroundStation(settlement.icaoId);
+    if (station?.wasAutoOnboarded) {
+      tally.stationsAutoOnboarded++;
+      console.log(`  AUTO-ONBOARDED station ${settlement.icaoId} (real coordinates from aviationweather.gov + geo-tz).`);
+    }
+
     const inBand: Array<{ market: DiscoverMarket; yesProb: number }> = [];
     for (const market of event.markets) {
       tally.strikeMarketsSeen++;
@@ -185,23 +199,19 @@ async function main() {
       }
     }
 
-    if (inBand.length === 0) {
-      console.log(`EVENT ${event.slug}: no strike markets in the 10-90% band this scan — skipped, no station lookup needed.\n`);
-      continue;
-    }
-
-    const station = await resolveWundergroundStation(settlement.icaoId);
     if (!station) {
       console.log(
-        `SKIP event ${event.slug}: ${inBand.length} market(s) pass the odds filter, but station ` +
-          `${settlement.icaoId} could not be resolved (not a real METAR-reporting station) — no data to onboard, not guessing.\n`
+        `EVENT ${event.slug}: station ${settlement.icaoId} could not be resolved (not a real ` +
+          `METAR-reporting station) — no data to onboard, not guessing. ${inBand.length} market(s) ` +
+          `would otherwise have been in-band.\n`
       );
       tally.skippedUnresolvableStation += inBand.length;
       continue;
     }
-    if (station.wasAutoOnboarded) {
-      tally.stationsAutoOnboarded++;
-      console.log(`  AUTO-ONBOARDED station ${settlement.icaoId} (real coordinates from aviationweather.gov + geo-tz).`);
+
+    if (inBand.length === 0) {
+      console.log(`EVENT ${event.slug} (station ${settlement.icaoId} known${station.wasAutoOnboarded ? ", just onboarded" : ""}): no strike markets in the 10-90% band this scan — no mappings written.\n`);
+      continue;
     }
 
     console.log(`EVENT ${event.slug} (station ${settlement.icaoId}, ${inBand.length}/${event.markets.length} strike markets in band):`);
