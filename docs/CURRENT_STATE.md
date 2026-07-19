@@ -4,7 +4,7 @@
 "Last reviewed" date below before trusting a number in here over the live system (`bot.out.log`,
 `data/app.db`, `bullpen status`).
 
-**Last reviewed: 2026-07-19**
+**Last reviewed: 2026-07-19** (updated same-day: Weather Bot architecture docs added)
 
 ## Snapshot, right now
 
@@ -37,8 +37,14 @@
 - **Dashboards:** the built-in `dashboard.py` (port 8787) and the Next.js `apps/dashboard`
   Overview page both read live from `data/app.db`. The Next.js dashboard's other 8 planned pages
   aren't built yet.
-- **Weather Bot:** planned and fully isolated; no production logic implemented yet
-  (`packages/weather/` is an empty scaffold).
+- **Weather Bot:** architecture-only, no code yet (`packages/weather/` is still an empty
+  scaffold) — but the full design is now documented in `docs/WEATHER_ARCHITECTURE.md` and
+  `docs/WEATHER_RISK_MANAGEMENT.md`, written *before* any ingestion code per an explicit
+  documentation-first requirement. Key decision: a live reconciliation check (METAR vs.
+  Wunderground, same station/day) found real whole-degree-Celsius discrepancies, so
+  Wunderground is the settlement oracle (fetched conservatively, on-demand only, no
+  IP-evasion tooling) while NOAA/Open-Meteo/METAR feed prediction only — see
+  `docs/WEATHER_RISK_MANAGEMENT.md` Rules 4-7 for the full reasoning.
 - **Database schema ownership:** TypeScript/Drizzle owns schema and migrations; Python
   (`db.py`) uses CRUD only — see `docs/SAFETY.md` §2.
 

@@ -23,6 +23,7 @@ understanding what you're changing — see `docs/RISK_MANAGEMENT.md` before touc
 | Understand what's running and why, from zero | `docs/SYSTEM_ARCHITECTURE.md` |
 | Know exactly what risk rules are enforced, and why | `docs/RISK_MANAGEMENT.md` |
 | Get the engineering-level detail (file/function names, DB ownership, runbooks) | `docs/SAFETY.md` |
+| Understand the (planned, architecture-only) Weather Bot | `docs/WEATHER_ARCHITECTURE.md` + `docs/WEATHER_RISK_MANAGEMENT.md` |
 | Get oriented as a new operator/contributor | `docs/OPERATOR_ONBOARDING.md` |
 | See what's done, what's in flight, and what's explicitly on hold | `docs/CURRENT_STATE.md` |
 
@@ -32,9 +33,12 @@ understanding what you're changing — see `docs/RISK_MANAGEMENT.md` before touc
    `bullpen_client.py`, `risk_manager.py`) plus a TypeScript "research brain"
    (`packages/copy-trading`) that scores candidate wallets. This is the system every doc above
    describes.
-2. **Weather Bot** (planned, not started) — a separate, intentionally isolated arbitrage bot
-   that will eventually share this repo's dashboard and database, but has no logic yet
-   (`packages/weather/` is an empty scaffold). Never mix its logic with the Copy Bot's.
+2. **Weather Bot** (architecture documented, no code yet) — a separate, intentionally isolated
+   arbitrage bot that will eventually share this repo's dashboard and database, but has no logic
+   yet (`packages/weather/` is an empty scaffold). Full design — data flow, schema, scheduling,
+   and risk rules — is written up in `docs/WEATHER_ARCHITECTURE.md` /
+   `docs/WEATHER_RISK_MANAGEMENT.md` ahead of any implementation. Never mix its logic with the
+   Copy Bot's.
 
 ## Running it
 
