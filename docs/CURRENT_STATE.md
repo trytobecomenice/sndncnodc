@@ -37,14 +37,17 @@
 - **Dashboards:** the built-in `dashboard.py` (port 8787) and the Next.js `apps/dashboard`
   Overview page both read live from `data/app.db`. The Next.js dashboard's other 8 planned pages
   aren't built yet.
-- **Weather Bot:** architecture-only, no code yet (`packages/weather/` is still an empty
-  scaffold) — but the full design is now documented in `docs/weather/WEATHER_ARCHITECTURE.md` and
-  `docs/weather/WEATHER_RISK_MANAGEMENT.md`, written *before* any ingestion code per an explicit
-  documentation-first requirement. Key decision: a live reconciliation check (METAR vs.
-  Wunderground, same station/day) found real whole-degree-Celsius discrepancies, so
-  Wunderground is the settlement oracle (fetched conservatively, on-demand only, no
-  IP-evasion tooling) while NOAA/Open-Meteo/METAR feed prediction only — see
-  `docs/weather/WEATHER_RISK_MANAGEMENT.md` Rules 4-7 for the full reasoning.
+- **Weather Bot:** early implementation. `packages/weather/` is a real pnpm workspace member with
+  four scripts built, tested, and live-verified against `data/app.db`: `ingestMetar.ts` (proven
+  end-to-end against RKSI), `pruneHistorical.ts` (2yr/60-day rolling retention, proven against
+  both a real and a deliberately-old test row), `emergencyCloseoutGuard.ts` (Rule 4's 5%/$0.05
+  slippage ceiling on emergency closeouts), `checkSettlementAgainstMetar.ts` (Rule 6's 4°F
+  Dual Oracle Cross-Check). 16/16 unit tests passing (`pnpm --filter @copybot/weather test`).
+  `packages/weather` and `packages/copy-trading` verified to share zero runtime imports and zero
+  cross-domain table access (repo-wide grep, clean). Still not built: `verifySettlement.ts` (the
+  live Wunderground/Playwright fetch — deliberately deferred as its own step), NOAA/Open-Meteo
+  ingestion, market discovery, probability computation, position management. Full design in
+  `docs/weather/WEATHER_ARCHITECTURE.md` / `docs/weather/WEATHER_RISK_MANAGEMENT.md`.
 - **Database schema ownership:** TypeScript/Drizzle owns schema and migrations; Python
   (`db.py`) uses CRUD only — see `docs/copy-trading/SAFETY.md` §2.
 

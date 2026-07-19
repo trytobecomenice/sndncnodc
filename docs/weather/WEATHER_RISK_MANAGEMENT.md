@@ -4,9 +4,13 @@
 rule below follows What it does / How it works mechanically / System costs & trade-offs / Why it
 exists — precise enough to extend, tune, or challenge without re-deriving the reasoning.
 
-**Status: architecture-only.** No code exists in `packages/weather/` yet — this is the rules
-ledger written *before* implementation, per an explicit requirement that documentation come first.
-**This is the single source of truth for what rules will apply to the Weather Bot** — check it
+**Status: early implementation.** This rules ledger was written *before* any code, per an explicit
+documentation-first requirement, and is kept in sync as pieces get built — see each rule's "How it
+works mechanically" for what's implemented and unit-tested today (`ingestMetar.ts`,
+`pruneHistorical.ts`, `emergencyCloseoutGuard.ts`, `checkSettlementAgainstMetar.ts`) versus what's
+still planned (`detectAnomaly.ts`'s general bounds-check, `verifySettlement.ts`'s live
+Wunderground fetch, and all entry-rule/position-sizing logic). **This is the single source of
+truth for what rules will apply to the Weather Bot** — check it
 before proposing a new restriction so a decision already made here doesn't get silently
 re-thought. `docs/weather/WEATHER_ARCHITECTURE.md` is the companion: data flow, schema, and scheduling
 detail that explains *how* these rules get implemented mechanically.
@@ -98,12 +102,22 @@ from context.
 **What it does:** `weather_historical_observation` never accumulates more than 1-2 years of data
 per station — no multi-year mass backfill, ever.
 
-**How it works mechanically:** a scheduled `pruneHistorical.ts` job (daily, paired with the daily
-historical-obs ingestion job) deletes rows older than the retention cutoff per station:
-`DELETE FROM weather_historical_observation WHERE obs_date < cutoff`. No schema change required —
-this is a data-lifecycle policy enforced by a job, not a database constraint. Historical backfill
-on onboarding a new station is capped at the same 1-2 year window from day one, rather than
-backfilling everything available and pruning down afterward.
+**How it works mechanically: implemented and live-verified (2026-07-19)** —
+`packages/weather/src/pruneHistorical.ts` (`pnpm --filter @copybot/weather prune:historical`)
+deletes `weather_historical_observation` rows with `obs_date` older than
+`HISTORICAL_RETENTION_YEARS = 2` (the wider end of the agreed 1-2yr range — climatology gets more
+reliable with more history, and this stays a small table regardless), and separately prunes
+`weather_forecast_snapshot` rows whose `forecast_for` date is more than
+`FORECAST_SNAPSHOT_RETENTION_DAYS = 60` in the past (a forecast has zero value once its target
+date has already resolved — a much shorter useful lifespan than a historical observation, so it
+gets its own, tighter cutoff). No schema change required — this is a data-lifecycle policy
+enforced by a scheduled job, not a database constraint. Verified end-to-end: run against the real
+`data/app.db`, correctly left a genuine 2026-07-18 row untouched, then correctly deleted a
+deliberately-inserted 2020-01-01 test row while leaving everything else intact. Not yet wired to
+a scheduler (no `launchd` job exists in this repo today, per `docs/weather/WEATHER_ARCHITECTURE.md`'s
+execution-cycle table) — run manually until that's built. Historical backfill on onboarding a new
+station is capped at the same 2-year window from day one, rather than backfilling everything
+available and pruning down afterward.
 
 **System costs & trade-offs:** 1-2 years is enough for a meaningful climatology baseline
 (day-of-year historical distribution) but explicitly not enough for long-cycle climate pattern
@@ -126,21 +140,45 @@ cause) is treated as a fatal data anomaly — never a trade signal, never even t
 reach the probability model.
 
 **How it works mechanically:** a pure bounds-check function, `detectAnomaly(newReading,
-recentReadings, station)` in `detectAnomaly.ts`, sits in front of every write to
-`weather_historical_observation`/`weather_forecast_snapshot` and every settlement read from
-`verifySettlement.ts`, comparing the new value against a plausible delta-per-interval bound for
-that station/season. On trip: (1) the anomalous reading is never written as trusted data, (2) any
-pending order for a position touching that station is aborted immediately, (3) an existing open
-position at that station is force-closed via Emergency Closeout (a market sell), protecting
-principal rather than waiting to see if the reading corrects itself. Same architectural shape as
-the Copy Bot's portfolio kill switch (`risk_manager.py`'s `evaluate_equity`/latch pattern) — a
-tripped condition acts immediately rather than waiting for a human to notice.
+recentReadings, station)` in `detectAnomaly.ts` (not yet built — planned, see Roadmap), will sit
+in front of every write to `weather_historical_observation`/`weather_forecast_snapshot` and every
+settlement read from `verifySettlement.ts`, comparing the new value against a plausible
+delta-per-interval bound for that station/season. On trip: (1) the anomalous reading is never
+written as trusted data, (2) any pending order for a position touching that station is aborted
+immediately, (3) an existing open position at that station is escalated to Emergency Closeout.
+Same architectural shape as the Copy Bot's portfolio kill switch (`risk_manager.py`'s
+`evaluate_equity`/latch pattern) — a tripped condition acts immediately rather than waiting for a
+human to notice.
+
+**Emergency Closeout is NOT an unconditional market sell — implemented and unit-tested
+(2026-07-19), refining the original wording of this rule.** `checkEmergencyCloseoutSlippage()` in
+`packages/weather/src/emergencyCloseoutGuard.ts` gates the sell itself: it compares the current
+executable price against a reference price (the position's last known-good mark, never the
+anomalous reading itself) and blocks the sell if either (a) the executable price sits below an
+absolute floor of **$0.05** (a near-zero quote usually means "no real bid," not "fair value is
+low"), or (b) the adverse move from the reference price exceeds a **5% slippage ceiling**. Both
+numbers are Joey's explicit defaults (2026-07-19), configurable, not yet calibrated against real
+market behavior. **If the check blocks the sell, the position is NOT force-closed** — it must be
+flagged for urgent manual review instead (same fail-closed principle as Rule 6), since dumping
+into an illiquid book can realize a worse loss than the anomaly the switch exists to protect
+against. This mirrors bot.py's `check_slippage_ceiling` in spirit but is deliberately a different
+function for a different context: the Copy Bot's principle is "never gate a sell, only a buy"
+(a risk layer that traps you in a losing position adds risk) — this rule's explicit instruction is
+the opposite for THIS specific mechanism, because an anomaly-driven emergency exit from a
+possibly-illiquid, one-off weather market carries a different risk shape than a routine Copy Bot
+exit in an already-liquid Polymarket sports/politics market. 8 unit tests, all passing
+(`pnpm --filter @copybot/weather test`), including the exact boundary case (5% precisely) and the
+absolute-floor case independent of relative slippage.
 
 **System costs & trade-offs:** a legitimate, fast-moving real weather event (e.g. a genuine rapid
-frontal passage) could in principle trip this gate and force an unnecessary early close — the
-trade-off is deliberately accepted: false positives that close a position early are recoverable
-mistakes, a bad sensor reading feeding a real trade is not. The exact bound thresholds need
-calibration once real station data exists — not yet chosen, since no ingestion has run.
+frontal passage) could in principle trip the anomaly gate and force an unnecessary early close —
+the trade-off is deliberately accepted: false positives that close a position early are
+recoverable mistakes, a bad sensor reading feeding a real trade is not. The slippage ceiling adds
+a second trade-off on top: a blocked emergency sell means the position stays open (under manual
+review) for longer than "immediate" during exactly the conditions that triggered the anomaly in
+the first place — accepted because dumping blind into an illiquid book was judged the worse
+outcome. The anomaly bound thresholds themselves (the `detectAnomaly.ts` piece, not yet built)
+still need calibration once real station data exists.
 
 **Why it exists:** direct requirement — this is a hard, non-negotiable defense against a single
 bad data point (sensor glitch, upstream API bug, a value literally swapped between Fahrenheit and
@@ -205,10 +243,27 @@ doesn't recognize) — the position is flagged, not closed, and does not fall ba
 METAR/Open-Meteo as a silent settlement substitute (doing so would silently reintroduce the exact
 basis-risk gap Rule 5 exists to close); (2) a fetch that *succeeds* but returns an implausible
 value (wrong day, wrong station, a stale cached number, or the effect of an undetected site
-redesign) — every settlement read is sanity-checked against an independent band (climatological
-range for that station/date, plus the same-day METAR/forecast readings already on hand) before
-being trusted, and a reading outside that band trips the Rule 4 anomaly gate rather than being
-accepted as truth.
+redesign) — every settlement read is sanity-checked against an independent band before being
+trusted, and a reading outside that band trips the Rule 4 anomaly gate rather than being accepted
+as truth.
+
+**Dual Oracle Cross-Check — the concrete implementation of failure mode (2)'s sanity check, built
+and unit-tested (2026-07-19).** `checkSettlementAgainstMetar()` in
+`packages/weather/src/checkSettlementAgainstMetar.ts` compares the scraped Wunderground reading
+against the co-located METAR reading for the **same station, same hour** — if they disagree by
+more than **4°F** (`MAX_HOURLY_CROSS_CHECK_DELTA_F`, Joey's stated threshold), the anomaly gate
+trips immediately rather than trusting the Wunderground read. This threshold is deliberately
+tighter than the ~1-2°F systematic gap the reconciliation PoC measured on a DAILY high/low
+comparison (different instruments/aggregation windows genuinely can differ somewhat over a full
+day) — an HOURLY, same-instant comparison has no such aggregation-window excuse, so a large gap
+here is a much stronger "something broke" signal, not normal micro-variation. Verified: the
+function correctly PASSES when given this session's actual PoC-scale gap (1.2°F) replayed as an
+hourly comparison, confirming the 4°F threshold doesn't false-positive on exactly the magnitude of
+discrepancy already proven to occur between these two sources. **Scope note**: this is pure
+comparison logic only, built and tested against synthetic inputs — it does not yet fetch a real
+Wunderground reading itself. Wiring it to a live read is `verifySettlement.ts`'s job (Playwright,
+still not built — deliberately deferred to its own dedicated review before it touches the live
+site, per Rule 5's framing of that fetch as the more sensitive piece).
 
 **System costs & trade-offs:** "flag for manual review" means a human (Joey) is the fallback for
 every settlement-verification failure — this doesn't scale to a large number of simultaneous
@@ -302,9 +357,15 @@ same schema file for no proportionate benefit, since nothing in this system hard
 
 ## Roadmap / explicitly not yet built
 
+- `detectAnomaly.ts`'s general bounds-check (physically-impossible-jump detection on raw
+  readings) — Rule 4's slippage ceiling and Rule 6's dual-oracle cross-check are both built and
+  tested; the general anomaly detector they plug into is not.
+- `verifySettlement.ts` — the actual Playwright fetch against `wunderground.com`. Deliberately
+  deferred as its own dedicated step (2026-07-19) rather than built alongside the pure
+  comparison logic, given how much care the earlier evasion-tooling discussion (Rule 5) required.
 - Entry-rule / position-sizing logic for `weather_position` (Rule 7 depends on this existing).
 - `computeProbability.ts`'s actual climatology/forecast blend math.
 - The `weather_rule_set` table, if/when entry-threshold logic needs its own versioned audit trail.
 - `launchd` plist files (mechanism decided in `docs/weather/WEATHER_ARCHITECTURE.md`; concrete job
   definitions come with the scripts they invoke).
-- Calibrated anomaly-detection thresholds for Rule 4 (needs real station data first).
+- Calibrated anomaly-detection thresholds for `detectAnomaly.ts` (needs real station data first).

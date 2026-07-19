@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "ingest:metar": "tsx src/ingestMetar.ts"
+    "ingest:metar": "tsx src/ingestMetar.ts",
+    "prune:historical": "tsx src/pruneHistorical.ts",
+    "test": "vitest run"
   },
   "dependencies": {
     "@copybot/db": "workspace:*",
@@ -13,6 +15,7 @@
   "devDependencies": {
     "@types/node": "^20.19.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.10"
   }
 }

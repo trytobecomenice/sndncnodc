@@ -1,11 +1,12 @@
 # Weather Bot — System Architecture
 
 **Audience note:** zero prior context assumed, same standard as `docs/copy-trading/SYSTEM_ARCHITECTURE.md`.
-**Status: architecture-only.** No code exists yet in `packages/weather/` — this document (and its
-companion, `docs/weather/WEATHER_RISK_MANAGEMENT.md`) is the first artifact of this system, written
-*before* any ingestion script, per an explicit "documentation first" requirement. If you're
-looking for the running trading bot, that's the Copy Bot (`docs/copy-trading/SYSTEM_ARCHITECTURE.md`) — this
-document describes a planned, separate, currently-unbuilt system.
+**Status: early implementation.** Documentation came first (per an explicit requirement), and four
+scripts now exist and are live-verified: `ingestMetar.ts`, `pruneHistorical.ts`,
+`emergencyCloseoutGuard.ts`, `checkSettlementAgainstMetar.ts` — see §4 below for exactly what's
+built versus still planned. If you're looking for the running trading bot, that's the Copy Bot
+(`docs/copy-trading/SYSTEM_ARCHITECTURE.md`) — this document describes the newer, still-partial
+Weather Bot.
 
 ## What this system will be
 
@@ -188,35 +189,34 @@ Copy Bot's `scoreWallets.ts` already uses within a single run (its pass-1/pass-2
 
 ## 4. Proposed `packages/weather/` structure
 
-`packages/weather/` is currently a literal empty folder — no `package.json`, not wired into the
-pnpm workspace yet. Creating that file is the first *code* step (still not taken as of this
-document — docs come first). Structure mirrors `packages/copy-trading`'s conventions: plain
-`tsx`-executed scripts, an `isMainModule` guard so files stay test-importable, workspace
-dependencies on `@copybot/db` / `@copybot/bullpen-client` / `@copybot/shared`, vitest for
-pure-function tests.
+`packages/weather/` is now a real, wired-in pnpm workspace member — `package.json`/`tsconfig.json`
+exist, and four scripts are built, tested, and live-verified against `data/app.db` (2026-07-19).
+Structure mirrors `packages/copy-trading`'s conventions: plain `tsx`-executed scripts, an
+`isMainModule` guard so files stay test-importable, vitest for pure-function tests. **Deliberately
+no `db/writers.ts` yet** — that shared-guard abstraction (`assertStationExists`) is worth building
+once a second script also writes `weather_station` rows; `ingestMetar.ts` is still the only one.
 
 ```
 packages/weather/
-  package.json                 # @copybot/weather, workspace:* deps, + playwright (new dependency)
-  tsconfig.json
+  package.json                          # @copybot/weather — built ✅
+  tsconfig.json                         # built ✅
   src/
-    ingestNoaa.ts               # NOAA/NWS — forecast + climatology input (never settlement)
-    ingestOpenMeteo.ts          # Open-Meteo — forecast input (never settlement)
-    ingestMetar.ts              # aviationweather.gov — fast nowcast/forecast input (never settlement)
-    verifySettlement.ts         # Playwright, Wunderground, ON-DEMAND ONLY — the settlement oracle
-    discoverMarkets.ts          # bullpen discover --category weather → draft mapping candidates
-    detectAnomaly.ts            # Rule 3 (Sold-Out Switch) — pure bounds-check, unit-tested
-    computeProbability.ts       # climatology + forecast + nowcast blend → weather_probability_estimate
-    checkMarkets.ts             # refresh market-implied prices, recompute edge, runs the anomaly gate
-    managePositions.ts          # future — entry-rule design; calls verifySettlement.ts pre-closeout
-    updatePnl.ts                 # weather_pnl_snapshot rollup
-    pruneHistorical.ts          # Rule 2 — enforces 1-2yr rolling retention
-    stationReconciliation.ts    # shared — source-scoped external_id lookups, unit conversion
-    db/
-      writers.ts                 # single-writer-funnel + assertStationExists guards
-    detectAnomaly.test.ts
-    computeProbability.test.ts
-    stationReconciliation.test.ts
+    ingestMetar.ts                      # BUILT ✅ — aviationweather.gov, nowcast/forecast input, never settlement
+    pruneHistorical.ts                  # BUILT ✅ — Rule 3, enforces 2yr/60-day rolling retention
+    emergencyCloseoutGuard.ts           # BUILT ✅ — Rule 4's slippage ceiling (5% / $0.05 floor)
+    emergencyCloseoutGuard.test.ts      # BUILT ✅ — 8 tests
+    checkSettlementAgainstMetar.ts      # BUILT ✅ — Rule 6's Dual Oracle Cross-Check (4°F threshold)
+    checkSettlementAgainstMetar.test.ts # BUILT ✅ — 8 tests
+    ingestNoaa.ts                       # not yet built — forecast + climatology input
+    ingestOpenMeteo.ts                  # not yet built — forecast input
+    verifySettlement.ts                 # not yet built — Playwright, Wunderground, ON-DEMAND ONLY (deliberately deferred, see docs/weather/WEATHER_RISK_MANAGEMENT.md Rule 5)
+    discoverMarkets.ts                  # not yet built — bullpen discover --category weather → draft mapping candidates
+    detectAnomaly.ts                    # not yet built — Rule 4's general physically-impossible-jump bounds-check
+    computeProbability.ts               # not yet built — climatology + forecast + nowcast blend
+    checkMarkets.ts                     # not yet built — refresh market-implied prices, recompute edge
+    managePositions.ts                  # not yet built — future entry-rule design
+    updatePnl.ts                        # not yet built — weather_pnl_snapshot rollup
+    stationReconciliation.ts            # not yet built — shared source-scoped external_id/unit-conversion helpers
 ```
 
 Root `package.json` scripts (future): `weather:ingest-historical`, `weather:ingest-forecast`,
@@ -229,7 +229,8 @@ function called from `discoverMarkets.ts` and `managePositions.ts`, never an ind
 
 ## Explicitly out of scope, for now
 
-- Actual ingestion/parsing code for any source (this document is architecture only).
+- NOAA/Open-Meteo ingestion, market discovery, probability computation, and the live Wunderground
+  fetch (`verifySettlement.ts`) — see §4's file table for the current built/not-built split.
 - Entry-rule / position-sizing logic for `weather_position`.
 - The `weather_rule_set` table.
 - `launchd` plist files themselves (mechanism decided; concrete job definitions come with the
