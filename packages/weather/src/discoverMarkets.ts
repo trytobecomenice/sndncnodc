@@ -13,16 +13,20 @@
 // non-Wunderground events entirely rather than mislabeling their settlement_source. Handling
 // non-Wunderground settlement sources is a real, separate future capability, not attempted here.
 //
-// STATION COORDINATES: Wunderground's event descriptions name a station and an ICAO-style code
-// (parsed from the cited wunderground.com URL) but never give lat/lon directly. Rather than
-// fabricate coordinates, this script only creates a Wunderground-sourced weather_station row
-// when an existing row for that SAME external_id (any source — typically METAR, from
-// ingestMetar.ts) already has real, verified coordinates to borrow. A market whose station has
-// no known coordinates yet is skipped and logged, not silently guessed.
+// DYNAMIC STATION AUTO-ONBOARDING (2026-07-19): Polymarket adds new city markets continuously —
+// a station allowlist that only worked for cities seen so far would break the moment an
+// unfamiliar one appeared (Joey: "Tomorrow it might be London or Tokyo, and the bot will get
+// stuck again"). So when an in-band market's station ISN'T already known, this script calls
+// stationReconciliation.ts's resolveStationMetadata() to fetch real lat/lon/name from
+// aviationweather.gov and derive a real timezone (geo-tz, offline) automatically — the exact
+// same free, ToS-clean source ingestMetar.ts already uses, just triggered on demand instead of
+// manually. STILL NEVER FABRICATES: if the parsed ICAO code isn't a real METAR-reporting
+// station, resolution returns null and the market is skipped and logged, not guessed at.
 
 import { runBullpenJson } from "@copybot/bullpen-client";
 import { findStationByExternalId, upsertMarketMapping, upsertWeatherStation } from "./db/writers";
 import { checkOddsFilter } from "./oddsFilter";
+import { resolveStationMetadata } from "./stationReconciliation";
 
 const DISCOVER_LIMIT = process.argv[2] ? Number(process.argv[2]) : 10;
 
@@ -72,12 +76,67 @@ async function fetchWeatherEvents(limit: number): Promise<DiscoverEvent[]> {
   return (response?.events ?? []) as DiscoverEvent[];
 }
 
+/**
+ * Finds (or, if unknown, auto-onboards) the Wunderground-sourced weather_station row for an
+ * ICAO code, borrowing/writing coordinates as needed. Returns null only if the station genuinely
+ * cannot be resolved (not a real METAR-reporting station) — never fabricated.
+ *
+ * Deliberately only called once we already know at least one market under this event passed the
+ * odds filter (see call site) — no point spending a real network call resolving a station for an
+ * event none of whose markets are actually worth tracking right now.
+ */
+async function resolveWundergroundStation(icaoId: string): Promise<{ id: string; wasAutoOnboarded: boolean } | null> {
+  const known = await findStationByExternalId(icaoId);
+  if (known) {
+    const id = await upsertWeatherStation({
+      externalId: icaoId,
+      name: known.name,
+      source: "wunderground",
+      lat: known.lat,
+      lon: known.lon,
+      timezone: known.timezone,
+      notes:
+        `Coordinates inherited from an existing '${known.source}' row for the same external_id ` +
+        `(${icaoId}) — not independently verified for Wunderground specifically. See ` +
+        `docs/weather/WEATHER_ARCHITECTURE.md §1 on source-scoped station identity.`,
+    });
+    return { id, wasAutoOnboarded: false };
+  }
+
+  const resolved = await resolveStationMetadata(icaoId);
+  if (!resolved) return null;
+
+  // Auto-onboard BOTH a metar-sourced row (real ground-truth geodata, matches ingestMetar.ts's
+  // own convention so a future ingestMetar.ts run for this station has a consistent source row
+  // to upsert onto) and the wunderground-sourced row this event's mapping actually needs.
+  await upsertWeatherStation({
+    externalId: icaoId,
+    name: resolved.name,
+    source: "metar",
+    lat: resolved.lat,
+    lon: resolved.lon,
+    timezone: resolved.timezone,
+    notes: "Auto-onboarded by discoverMarkets.ts (stationReconciliation.ts) — not yet backfilled with historical observations.",
+  });
+  const id = await upsertWeatherStation({
+    externalId: icaoId,
+    name: resolved.name,
+    source: "wunderground",
+    lat: resolved.lat,
+    lon: resolved.lon,
+    timezone: resolved.timezone,
+    notes: "Auto-onboarded by discoverMarkets.ts (stationReconciliation.ts) from aviationweather.gov + geo-tz.",
+  });
+  return { id, wasAutoOnboarded: true };
+}
+
 interface Tally {
   eventsScanned: number;
   strikeMarketsSeen: number;
   skippedOddsFilter: number;
   skippedNonWunderground: number;
-  skippedNoStationCoords: number;
+  skippedUnresolvableStation: number;
+  stationsAutoOnboarded: number;
   written: number;
 }
 
@@ -87,7 +146,8 @@ async function main() {
     strikeMarketsSeen: 0,
     skippedOddsFilter: 0,
     skippedNonWunderground: 0,
-    skippedNoStationCoords: 0,
+    skippedUnresolvableStation: 0,
+    stationsAutoOnboarded: 0,
     written: 0,
   };
 
@@ -99,84 +159,73 @@ async function main() {
     tally.eventsScanned++;
     const settlement = parseSettlementSource(event.description);
 
-    if (!settlement.isWunderground) {
-      console.log(`SKIP event ${event.slug}: settlement source is not Wunderground (not yet supported).`);
+    if (!settlement.isWunderground || !settlement.icaoId) {
+      const reason = !settlement.isWunderground
+        ? "settlement source is not Wunderground (not yet supported)"
+        : "cites Wunderground but no ICAO code could be parsed from the URL";
+      console.log(`SKIP event ${event.slug}: ${reason}.`);
       tally.skippedNonWunderground += event.markets.length;
       tally.strikeMarketsSeen += event.markets.length;
       continue;
     }
-    if (!settlement.icaoId) {
-      console.log(`SKIP event ${event.slug}: cites Wunderground but no ICAO code could be parsed from the URL.`);
-      tally.skippedNonWunderground += event.markets.length;
-      tally.strikeMarketsSeen += event.markets.length;
-      continue;
-    }
 
-    // Borrow coordinates from any existing station row for this ICAO code (typically a METAR
-    // row from ingestMetar.ts) — never fabricated. Looked up once per event, reused for every
-    // strike market under it.
-    const knownStation = await findStationByExternalId(settlement.icaoId);
-    let wundergroundStationId: string | null = null;
-    if (knownStation) {
-      wundergroundStationId = await upsertWeatherStation({
-        externalId: settlement.icaoId,
-        name: knownStation.name,
-        source: "wunderground",
-        lat: knownStation.lat,
-        lon: knownStation.lon,
-        timezone: knownStation.timezone,
-        notes:
-          `Coordinates inherited from an existing '${knownStation.source}' row for the same ` +
-          `external_id (${settlement.icaoId}) — not independently verified for Wunderground ` +
-          `specifically. See docs/weather/WEATHER_ARCHITECTURE.md §1 on source-scoped station identity.`,
-      });
-    }
-
-    console.log(`EVENT ${event.slug} (station ${settlement.icaoId}, ${event.markets.length} strike markets):`);
-
+    // First pass: which markets even pass the odds filter? Only resolve/auto-onboard the
+    // station if at least one does — never spend a real network call on an event we're about
+    // to skip entirely anyway.
+    const inBand: Array<{ market: DiscoverMarket; yesProb: number }> = [];
     for (const market of event.markets) {
       tally.strikeMarketsSeen++;
       const yesOutcome = market.outcomes.find((o) => o.name === "Yes");
-      if (!yesOutcome) {
-        console.log(`  SKIP ${market.slug}: no "Yes" outcome found in response.`);
-        continue;
-      }
-
+      if (!yesOutcome) continue;
       const odds = checkOddsFilter(yesOutcome.probability);
-      if (!odds.ok) {
+      if (odds.ok) {
+        inBand.push({ market, yesProb: yesOutcome.probability });
+      } else {
         tally.skippedOddsFilter++;
-        console.log(`  skip  ${market.slug}: ${odds.reason}`);
-        continue;
       }
+    }
 
-      if (!wundergroundStationId) {
-        tally.skippedNoStationCoords++;
-        console.log(
-          `  skip  ${market.slug}: Yes=${yesOutcome.probability} passes the odds filter, but station ` +
-            `${settlement.icaoId} has no known coordinates yet (run ingestMetar.ts for it first, or add manually).`
-        );
-        continue;
-      }
+    if (inBand.length === 0) {
+      console.log(`EVENT ${event.slug}: no strike markets in the 10-90% band this scan — skipped, no station lookup needed.\n`);
+      continue;
+    }
 
+    const station = await resolveWundergroundStation(settlement.icaoId);
+    if (!station) {
+      console.log(
+        `SKIP event ${event.slug}: ${inBand.length} market(s) pass the odds filter, but station ` +
+          `${settlement.icaoId} could not be resolved (not a real METAR-reporting station) — no data to onboard, not guessing.\n`
+      );
+      tally.skippedUnresolvableStation += inBand.length;
+      continue;
+    }
+    if (station.wasAutoOnboarded) {
+      tally.stationsAutoOnboarded++;
+      console.log(`  AUTO-ONBOARDED station ${settlement.icaoId} (real coordinates from aviationweather.gov + geo-tz).`);
+    }
+
+    console.log(`EVENT ${event.slug} (station ${settlement.icaoId}, ${inBand.length}/${event.markets.length} strike markets in band):`);
+    for (const { market, yesProb } of inBand) {
       await upsertMarketMapping({
         marketSlug: market.slug,
-        stationId: wundergroundStationId,
+        stationId: station.id,
         settlementSource: "wunderground",
         settlementRule: `Settles via Wunderground station ${settlement.icaoId} (see event description for the full rule text).`,
       });
       tally.written++;
-      console.log(`  WRITE ${market.slug}: Yes=${yesOutcome.probability} — mapping row written (is_active=false, needs review).`);
+      console.log(`  WRITE ${market.slug}: Yes=${yesProb} — mapping row written (is_active=false, needs review).`);
     }
     console.log("");
   }
 
   console.log("=== Summary ===");
-  console.log(`Events scanned:              ${tally.eventsScanned}`);
-  console.log(`Strike markets seen:         ${tally.strikeMarketsSeen}`);
-  console.log(`Skipped (odds filter):       ${tally.skippedOddsFilter}`);
-  console.log(`Skipped (non-Wunderground):  ${tally.skippedNonWunderground}`);
-  console.log(`Skipped (no station coords): ${tally.skippedNoStationCoords}`);
-  console.log(`Written (draft mappings):    ${tally.written}`);
+  console.log(`Events scanned:                ${tally.eventsScanned}`);
+  console.log(`Strike markets seen:           ${tally.strikeMarketsSeen}`);
+  console.log(`Skipped (odds filter):         ${tally.skippedOddsFilter}`);
+  console.log(`Skipped (non-Wunderground):    ${tally.skippedNonWunderground}`);
+  console.log(`Skipped (unresolvable station):${tally.skippedUnresolvableStation}`);
+  console.log(`Stations auto-onboarded:       ${tally.stationsAutoOnboarded}`);
+  console.log(`Written (draft mappings):      ${tally.written}`);
   if (tally.written > 0) {
     console.log(
       `\n${tally.written} mapping(s) need human review (Rule 8) before is_active can be set true — ` +

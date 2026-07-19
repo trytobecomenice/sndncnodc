@@ -203,7 +203,7 @@ Copy Bot's `scoreWallets.ts` already uses within a single run (its pass-1/pass-2
 ## 4. Proposed `packages/weather/` structure
 
 `packages/weather/` is now a real, wired-in pnpm workspace member — `package.json`/`tsconfig.json`
-exist, and seven scripts/modules are built, tested, and live-verified against `data/app.db` and
+exist, and nine scripts/modules are built, tested, and live-verified against `data/app.db` and
 real Polymarket data (2026-07-19). Structure mirrors `packages/copy-trading`'s conventions: plain
 `tsx`-executed scripts, an `isMainModule` guard so files stay test-importable, vitest for
 pure-function tests. **`db/writers.ts` is now built** — introduced exactly when
@@ -225,6 +225,8 @@ packages/weather/
     oddsFilter.test.ts                  # BUILT ✅ — 8 tests
     discoverMarkets.ts                  # BUILT ✅ — bullpen discover --category weather → draft mapping candidates, odds-filtered
     db/writers.ts                       # BUILT ✅ — shared upsertWeatherStation/upsertMarketMapping/findStationByExternalId
+    stationReconciliation.ts            # BUILT ✅ — auto-onboarding: real coords (aviationweather.gov) + timezone (geo-tz, offline)
+    stationReconciliation.test.ts       # BUILT ✅ — 4 tests, incl. cities never hardcoded anywhere (London, Tokyo)
     ingestNoaa.ts                       # not yet built — forecast + climatology input
     ingestOpenMeteo.ts                  # not yet built — forecast input
     verifySettlement.ts                 # not yet built — Playwright, Wunderground, ON-DEMAND ONLY (deliberately deferred, see docs/weather/WEATHER_RISK_MANAGEMENT.md Rule 5)
@@ -233,7 +235,6 @@ packages/weather/
     checkMarkets.ts                     # not yet built — refresh market-implied prices, recompute edge
     managePositions.ts                  # not yet built — future entry-rule design
     updatePnl.ts                        # not yet built — weather_pnl_snapshot rollup
-    stationReconciliation.ts            # not yet built — shared source-scoped external_id/unit-conversion helpers
 ```
 
 Root `package.json` scripts (future): `weather:ingest-historical`, `weather:ingest-forecast`,

@@ -38,22 +38,31 @@
   Overview page both read live from `data/app.db`. The Next.js dashboard's other 8 planned pages
   aren't built yet.
 - **Weather Bot:** early implementation. `packages/weather/` is a real pnpm workspace member with
-  seven scripts/modules built, tested, and live-verified: `ingestMetar.ts` (proven end-to-end
+  nine scripts/modules built, tested, and live-verified: `ingestMetar.ts` (proven end-to-end
   against RKSI), `pruneHistorical.ts` (2yr/60-day rolling retention), `emergencyCloseoutGuard.ts`
   (Rule 4's 5%/$0.05 slippage ceiling), `checkSettlementAgainstMetar.ts` (Rule 6's 4°F Dual Oracle
-  Cross-Check), `oddsFilter.ts` (Rule 10's 10%-90% Extreme Odds Filter), `discoverMarkets.ts`
-  (live-run against real Polymarket weather markets — see below), `db/writers.ts` (shared
-  station/mapping upserts). 24/24 unit tests passing (`pnpm --filter @copybot/weather test`).
+  Cross-Check), `oddsFilter.ts` (Rule 10's 10%-90% Extreme Odds Filter), `discoverMarkets.ts`,
+  `db/writers.ts`, `stationReconciliation.ts` (dynamic station auto-onboarding — see below).
+  28/28 unit tests passing (`pnpm --filter @copybot/weather test`).
   **A real schema bug was found and fixed** (2026-07-19): `weather_station.external_id` had a
   single-column unique constraint that silently contradicted the documented "one row per source"
   design — caught the moment `discoverMarkets.ts` became a second writer, fixed via migration
   `0002_chief_johnny_blaze.sql` (composite `(external_id, source)` unique index), existing data
-  verified intact after. `discoverMarkets.ts`'s first live run scanned 110 real strike markets:
-  94 filtered by the odds band, 11 skipped as non-Wunderground (Hong Kong settles via the Hong
-  Kong Observatory, not Wunderground — a real, unanticipated finding), 5 genuinely in-band markets
-  found (3 NYC, 2 Shanghai) but not yet written since their stations' coordinates aren't onboarded
-  yet — nothing fabricated. `packages/weather`/`packages/copy-trading` isolation re-verified clean.
-  Still not built: `verifySettlement.ts` (the live Wunderground/Playwright fetch — deliberately
+  verified intact after. **Auto-onboarding built and live-verified** (2026-07-19, replacing a
+  hardcoded per-station timezone map in `ingestMetar.ts` too): when `discoverMarkets.ts` finds an
+  in-band market at an unknown station, it now resolves real coordinates from `aviationweather.gov`
+  and a real timezone from `geo-tz` (offline lookup) automatically — no manual code change per
+  city. Live-verified onboarding KLGA (NYC) and ZSPD (Shanghai) with correct real timezones
+  (`America/New_York`, `Asia/Shanghai`) on first contact; `resolveTimezone` unit-tested against
+  cities never hardcoded anywhere (London, Tokyo). `discoverMarkets.ts`'s live runs scanned 110
+  real strike markets: 94 filtered by the odds band, 11 skipped as non-Wunderground (Hong Kong
+  settles via the Hong Kong Observatory — a real, unanticipated finding), 5 genuinely in-band
+  markets (3 NYC, 2 Shanghai) auto-onboarded and written as draft mappings, pending Rule 8 human
+  review. Three more risk parameters formalized in the docs (not yet implemented — blocked on
+  entry-rule logic and a capital-base constant that don't exist yet): Rule 11 (5% max capital per
+  trade), Rule 12 (1.5°F minimum forecast-vs-strike buffer), Rule 13 (ensemble forecasting
+  required, not a single deterministic model). `packages/weather`/`packages/copy-trading`
+  isolation re-verified clean. Still not built: `verifySettlement.ts` (the live Wunderground/Playwright fetch — deliberately
   deferred as its own step), NOAA/Open-Meteo ingestion, probability computation, position
   management. Full design in `docs/weather/WEATHER_ARCHITECTURE.md` /
   `docs/weather/WEATHER_RISK_MANAGEMENT.md`.

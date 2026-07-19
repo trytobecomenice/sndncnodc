@@ -12,22 +12,18 @@
 // whole-degree-Celsius bucket, so this script's output must never be used to validate a market
 // resolution, only to feed climatology_prob/forecast_prob.
 //
-// db/writers.ts now holds the shared upsertWeatherStation helper (added 2026-07-19, once
-// discoverMarkets.ts became a second writer of weather_station — the exact trigger this file
-// originally said would justify the abstraction).
+// db/writers.ts holds the shared upsertWeatherStation helper (added 2026-07-19, once
+// discoverMarkets.ts became a second writer of weather_station). stationReconciliation.ts (also
+// added 2026-07-19) resolves timezone from coordinates automatically (geo-tz, offline lookup) —
+// this file originally had a hand-maintained KNOWN_STATION_TIMEZONES map good for RKSI only,
+// which was exactly the kind of per-station hardcoding that doesn't scale as new cities show up
+// (Joey, 2026-07-19). Any ICAO code works now, not just ones added to a manual list.
 
 import { db, weatherHistoricalObservation } from "@copybot/db";
 import { upsertWeatherStation } from "./db/writers";
+import { resolveTimezone } from "./stationReconciliation";
 
 const AVIATION_WEATHER_BASE = "https://aviationweather.gov/api/data/metar";
-
-// Aviation Weather Center's METAR API returns no timezone field — ICAO airport identity alone
-// doesn't imply one. A real multi-station ingester needs a proper station/timezone database;
-// for this single-station proof, a small explicit map is honest about what's actually known
-// versus guessed, and fails loudly (not silently to UTC) for any station not yet added here.
-const KNOWN_STATION_TIMEZONES: Record<string, string> = {
-  RKSI: "Asia/Seoul", // Incheon Intl Airport — the station this slice proves against
-};
 
 interface MetarReport {
   icaoId: string;
@@ -101,14 +97,7 @@ function computeCompleteDayMinMax(
 const cToF = (c: number) => (c * 9) / 5 + 32;
 
 async function upsertMetarStation(icaoId: string, sample: MetarReport): Promise<string> {
-  const timezone = KNOWN_STATION_TIMEZONES[icaoId];
-  if (!timezone) {
-    throw new Error(
-      `No known timezone for station ${icaoId} — add it to KNOWN_STATION_TIMEZONES before ` +
-        `onboarding a new station (see this file's module comment for why this fails loudly ` +
-        `instead of defaulting to UTC).`
-    );
-  }
+  const timezone = await resolveTimezone(sample.lat, sample.lon);
 
   return upsertWeatherStation({
     externalId: icaoId,

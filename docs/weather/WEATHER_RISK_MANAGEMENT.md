@@ -8,8 +8,9 @@ exists — precise enough to extend, tune, or challenge without re-deriving the 
 documentation-first requirement, and is kept in sync as pieces get built — see each rule's "How it
 works mechanically" for what's implemented and unit-tested today (`ingestMetar.ts`,
 `pruneHistorical.ts`, `emergencyCloseoutGuard.ts`, `checkSettlementAgainstMetar.ts`,
-`discoverMarkets.ts`, `oddsFilter.ts`, `db/writers.ts`) versus what's still planned
-(`detectAnomaly.ts`'s general bounds-check, `verifySettlement.ts`'s live Wunderground fetch, and
+`discoverMarkets.ts`, `oddsFilter.ts`, `db/writers.ts`, `stationReconciliation.ts`) versus what's
+still planned (Rules 11-13's position-sizing/temperature-buffer/ensemble requirements,
+`detectAnomaly.ts`'s general bounds-check, `verifySettlement.ts`'s live Wunderground fetch, and
 all entry-rule/position-sizing logic). **This is the single source of truth for what rules will
 apply to the Weather Bot** — check it
 before proposing a new restriction so a decision already made here doesn't get silently
@@ -324,13 +325,24 @@ Wunderground — Hong Kong's event cites the Hong Kong Observatory directly. `di
 detects this per-event (checking for `wunderground.com` in the description) and skips
 non-Wunderground events entirely rather than mislabeling their `settlement_source`; handling other
 settlement authorities is a real, separate future capability. **Station coordinates are never
-fabricated**: Wunderground's event descriptions name a station and parse to an ICAO-style code
-(from the cited URL — verified the URL's path DEPTH varies by country, e.g. Asian cities use
+fabricated, and unknown stations are auto-onboarded, not hardcoded (upgraded 2026-07-19).**
+Wunderground's event descriptions name a station and parse to an ICAO-style code (from the cited
+URL — verified the URL's path DEPTH varies by country, e.g. Asian cities use
 `.../kr/incheon/RKSI` but NYC uses `.../us/ny/new-york-city/KLGA`, so the parser matches the
-trailing segment, not a fixed path depth) but never give lat/lon directly — a market's mapping is
-only written if an existing `weather_station` row for that same external ID (typically METAR, from
-`ingestMetar.ts`) already has real, verified coordinates to borrow; otherwise it's skipped and
-logged, never guessed.
+trailing segment, not a fixed path depth) but never give lat/lon directly. Originally, a market's
+mapping was only written if an existing `weather_station` row for that external ID already had
+coordinates to borrow — meaning any city not already manually onboarded via `ingestMetar.ts` was
+silently skipped forever, which does not scale as Polymarket adds new city markets continuously
+(Joey, 2026-07-19: "Tomorrow it might be London or Tokyo, and the bot will get stuck again"). Now,
+when a station is unknown AND at least one of its markets passes the odds filter (Rule 10),
+`resolveWundergroundStation()` calls `stationReconciliation.ts`'s `resolveStationMetadata()` to
+fetch real lat/lon/name from `aviationweather.gov` (the same free source `ingestMetar.ts` already
+uses) and derive a real IANA timezone from those coordinates via `geo-tz` (an offline lookup
+library — no network call, no manual per-station map). **Live-verified**: KLGA (NYC) and ZSPD
+(Shanghai) — neither previously known to this system — were auto-onboarded with correct real
+coordinates and timezones (`America/New_York`, `Asia/Shanghai`) on first contact, confirmed via
+direct query. Still never fabricated: if the parsed code isn't a real METAR-reporting station,
+resolution returns `null` and the market is skipped and logged, exactly as before.
 
 **System costs & trade-offs:** reviewing once per city/event (rather than once per individual
 degree-bucket market) trades a small amount of theoretical rigor for a large reduction in manual
@@ -422,6 +434,100 @@ should spend its attention and capital strictly inside the actively-contested tr
 
 ---
 
+## 11. Position sizing cap (Kelly-inspired)
+
+**What it does:** no single market may ever receive more than **5% of total capital**
+(`MAX_CAPITAL_PER_TRADE = 0.05`) in one trade.
+
+**How it works mechanically (planned — formalized 2026-07-19, not yet implemented):** this
+requires `managePositions.ts`'s entry-rule logic (not yet built) and a defined capital base for
+the Weather Bot (also not yet defined — the Copy Bot has `PAPER_BANKROLL_USD`; the Weather Bot has
+no equivalent constant yet, a real prerequisite this rule is blocked on). Once both exist, sizing
+a new position must clamp `positionSize <= 0.05 * totalCapital`, evaluated at the moment of entry
+against current capital (realized + unrealized), the same equity-computation shape as the Copy
+Bot's `risk_manager.py compute_equity`.
+
+**System costs & trade-offs:** 5% is a hard ceiling per market, not a Kelly-criterion-computed
+optimal fraction — true Kelly sizing would vary per trade based on edge and odds, which needs a
+calibrated edge estimate this system doesn't have yet (Rule 7's residual basis-risk margin and
+Rule 12's temperature buffer are both prerequisites for a trustworthy edge number). Treat this 5%
+as a conservative ceiling that a future real Kelly calculation should sit BELOW, not as the Kelly
+fraction itself.
+
+**Why it exists:** direct instruction (Joey, 2026-07-19) — no single weather event's outcome,
+however well-modeled, should be able to inflict capital loss disproportionate to one bet's worth
+of information. Mirrors the Copy Bot's per-event exposure cap (`docs/copy-trading/RISK_MANAGEMENT.md`
+Rule 6) in spirit — a portfolio-concentration guard — but expressed as a percentage of total
+capital rather than a fixed dollar amount, appropriate for a system whose capital base isn't fixed
+yet the way the Copy Bot's `PAPER_BANKROLL_USD` is.
+
+---
+
+## 12. Minimum forecast margin of safety (jump risk defense)
+
+**What it does:** the bot must unconditionally skip a trade if the gap between the Polymarket
+strike boundary and the model's own forecast point estimate is less than **1.5°F**
+(`TEMP_BUFFER = 1.5`).
+
+**How it works mechanically (planned — formalized 2026-07-19, not yet implemented):** requires
+`computeProbability.ts` (not yet built). At evaluation time, for a given strike boundary (e.g.
+"80°F or above"), compute `abs(forecastPointEstimateF - strikeBoundaryF)`; if that's below
+`TEMP_BUFFER`, the trade is skipped regardless of how favorable `edge` (Rule 7) otherwise looks —
+this check happens BEFORE the edge/margin check, not instead of it. Needs explicit unit handling:
+some markets bucket in whole-degree Celsius (most Asian cities observed so far), others in 2°F
+bands (NYC) — the comparison must happen in one consistent unit (°F, per how this rule is stated)
+with both sides converted consistently, not compared raw.
+
+**System costs & trade-offs:** this is a DIFFERENT margin from Rule 7's residual basis-risk
+margin — Rule 7 protects against the settlement READ being imprecise (scraper/oracle
+disagreement); this rule protects against the FORECAST itself being imprecise (a point forecast is
+never exactly right, and a strike sitting inside the forecast's own normal error band is a coin
+flip dressed up as an edge). Both margins likely need to be cleared simultaneously before a trade
+is allowed — a real design detail for whoever builds `computeProbability.ts`/`managePositions.ts`,
+not resolved further here. A tight buffer band around any given strike will mean some real edge
+gets left on the table; accepted, since trading inside forecast noise isn't edge at all.
+
+**Why it exists:** direct instruction (Joey, 2026-07-19) — "jump risk": a forecast can be
+directionally right and still land on the wrong side of a hard whole-degree resolution boundary
+by a small, ordinary amount of forecast error. Requiring real separation between the forecast and
+the strike protects against exactly that failure mode, distinct from (and in addition to) the
+basis-risk margin in Rule 7.
+
+---
+
+## 13. Ensemble oracle requirement
+
+**What it does:** the bot's forecast input must come from an **ensemble of models**, not a single
+deterministic forecast — used specifically to surface fat-tail/low-probability scenarios a single
+point forecast would hide.
+
+**How it works mechanically (planned — formalized 2026-07-19, not yet implemented):** applies to
+`ingestOpenMeteo.ts` (not yet built). Open-Meteo — already the planned primary forecast source
+(`docs/weather/WEATHER_ARCHITECTURE.md`) — offers an ensemble/multi-model forecast product
+alongside its standard deterministic API; the exact integration shape (which models, how spread is
+summarized into `forecast_prob`) is a real design decision for whoever builds `ingestOpenMeteo.ts`,
+not pinned down further here since it hasn't been verified against the live API surface yet.
+Conceptually: instead of one point temperature estimate, an ensemble yields a DISTRIBUTION across
+model runs — `climatology_prob`/`forecast_prob`/`blended_prob` should be derived from that
+distribution's shape (e.g. what fraction of ensemble members land in a given bucket), not from a
+single number treated as certain.
+
+**System costs & trade-offs:** an ensemble API means more data per forecast fetch (multiple model
+runs instead of one number) and more computation to summarize it into a probability — a real cost
+against the "fast, cheap, frequent" framing the rest of this system's forecast-side sources use
+(Rule 5's execution-cycle table). Worth it specifically because a single deterministic forecast
+cannot represent tail risk at all — it has no way to say "usually X, but a real chance of Y" — and
+tail risk is exactly what a whole-degree cliff-edge market is most exposed to.
+
+**Why it exists:** direct instruction (Joey, 2026-07-19) — a single deterministic model gives a
+false sense of precision on exactly the kind of question (will tomorrow's high cross this precise
+threshold) where the honest answer is a probability distribution, not a point guess. This is the
+predictive-side complement to Rule 5's insistence on reading the real settlement oracle rather
+than approximating it — don't approximate the forecast side either, once real modeling work
+begins.
+
+---
+
 ## Roadmap / explicitly not yet built
 
 - `detectAnomaly.ts`'s general bounds-check (physically-impossible-jump detection on raw
@@ -430,9 +536,19 @@ should spend its attention and capital strictly inside the actively-contested tr
 - `verifySettlement.ts` — the actual Playwright fetch against `wunderground.com`. Deliberately
   deferred as its own dedicated step (2026-07-19) rather than built alongside the pure
   comparison logic, given how much care the earlier evasion-tooling discussion (Rule 5) required.
-- Entry-rule / position-sizing logic for `weather_position` (Rule 7 depends on this existing).
-- `computeProbability.ts`'s actual climatology/forecast blend math.
+- Entry-rule / position-sizing logic for `weather_position` (Rule 7 depends on this existing;
+  Rules 11 and 12 must both be enforced there once it's built).
+- `computeProbability.ts`'s actual climatology/forecast blend math (Rule 13's ensemble
+  requirement applies here once built).
+- `ingestOpenMeteo.ts` (Rule 13 depends on this — must use an ensemble/multi-model product, not a
+  single deterministic forecast).
+- A defined capital-base constant for the Weather Bot (Rule 11 is blocked on this — no
+  `PAPER_BANKROLL_USD`-equivalent exists yet for this system).
 - The `weather_rule_set` table, if/when entry-threshold logic needs its own versioned audit trail.
 - `launchd` plist files (mechanism decided in `docs/weather/WEATHER_ARCHITECTURE.md`; concrete job
   definitions come with the scripts they invoke).
 - Calibrated anomaly-detection thresholds for `detectAnomaly.ts` (needs real station data first).
+- Historical backfill for auto-onboarded stations (`discoverMarkets.ts`'s auto-onboarding, Rule 8,
+  creates a `weather_station` row with real coordinates but does not itself trigger
+  `ingestMetar.ts` to backfill observations for it — that's still a separate, manually-triggered
+  step today).
