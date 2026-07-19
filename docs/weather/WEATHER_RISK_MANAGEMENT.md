@@ -18,6 +18,11 @@ before proposing a new restriction so a decision already made here doesn't get s
 re-thought. `docs/weather/WEATHER_ARCHITECTURE.md` is the companion: data flow, schema, and scheduling
 detail that explains *how* these rules get implemented mechanically.
 
+**Rules 1-13 are implemented and live-verified except where noted (position-sizing/temperature-
+buffer/anomaly-detector/`verifySettlement.ts` still planned, see Roadmap). Rule 14 (the EV Bridge —
+`parseMarketThreshold.ts`, `calculateClimatology.ts`, `checkMarkets.ts`, odds-history tracking) is
+implemented and live-verified end-to-end as of 2026-07-20.**
+
 This document is intentionally separate from `docs/copy-trading/RISK_MANAGEMENT.md` (the Copy Bot's rules
 ledger) — per `.claudeprompt`, the two systems' rules, like their code and schema, must never be
 treated as one system. Where a rule below is conceptually similar to a Copy Bot rule (e.g. paper
@@ -618,12 +623,14 @@ combined 31.7% (26/82) — but `ecmwf_ifs025` said 19.6% while `gfs_seamless` sa
 spread on the same question. KLGA's 78-79°F bucket was starker still: `ecmwf_ifs025` at 31.4%
 versus `gfs_seamless` at a flat 0.0%. Pure hit-rate math (`computeHitRate`) is unit-tested
 independent of the DB, including a direct reproduction of the RKSI 22%/3% finding from the first
-ingestion run. **Scope, deliberate**: this module is the probability math only — it does not yet
-parse a market's actual temperature bucket from its `market_slug` (no stored min/max columns
-exist on `weather_market_mapping` yet) and does not yet write to `weather_probability_estimate`
-(keyed by `market_slug`/`outcome`, which this module has no way to populate without that parsing
-step). Both are real, distinct next steps — most naturally `checkMarkets.ts`'s job — not silently
-done here.
+ingestion run. `metric` (`"max"` or `"min"`) is a required parameter, no default — added
+2026-07-20 after `parseMarketThreshold.ts` (Rule 14) confirmed live that Polymarket's Weather
+category has real `lowest-temperature-in-X` events alongside the `highest-temperature-in-X` ones
+already seen, and querying `tMaxF` for a low-temperature market would silently produce a
+confidently-wrong probability rather than an error. **Wired to real market thresholds as of Rule
+14 (2026-07-20)** — see below for `parseMarketThreshold.ts` and `checkMarkets.ts`, which close the
+two gaps this scope note originally flagged (bucket parsing and the `weather_probability_estimate`
+write path).
 
 **Why it exists:** direct instruction (Joey, 2026-07-19) — a single deterministic model gives a
 false sense of precision on exactly the kind of question (will tomorrow's high cross this precise
@@ -631,6 +638,122 @@ threshold) where the honest answer is a probability distribution, not a point gu
 predictive-side complement to Rule 5's insistence on reading the real settlement oracle rather
 than approximating it — don't approximate the forecast side either, once real modeling work
 begins.
+
+---
+
+## 14. The EV Bridge — market-threshold parsing, odds-history tracking, `checkMarkets.ts`
+
+**What it does:** connects the probability engine (Rule 13) to Polymarket's live prices. For every
+market a human has approved (`is_active = true`, Rule 8), the bot parses the market's own strike
+threshold, logs a time-series snapshot of Polymarket's current implied probability, computes a
+blended probability estimate (climatology + ensemble forecast), and logs the resulting edge
+(`blendedProb - marketImpliedProb`). This is a **read-and-log-only** step — it computes and
+records Expected Value, it does not decide or place a trade. Introduced 2026-07-20 at Joey's
+direction, alongside an explicit strategic framing: the bot is not limited to holding every
+position to settlement — a future "Buy Low, Sell High" early-exit strategy (trading the spread
+dynamically as odds shift) is the reason the odds-history table below exists, even though the
+early-exit logic itself is not built yet.
+
+**How it works mechanically: implemented and live-verified end-to-end against real Polymarket/
+ensemble data (2026-07-20).**
+
+- **Schema (migration `0005_magical_captain_britain.sql`, applied to the live DB following the
+  established stop-migrate-restart runbook — `bot.py`/`dashboard.py`/the Next.js dev server were
+  stopped first, migrated, then restarted).** `weather_market_mapping` gained four nullable
+  columns: `metric` (`"max"`/`"min"`), `forecast_for` (`YYYY-MM-DD`), `target_temp_min_f`,
+  `target_temp_max_f` (both real °F, already rounding-boundary-adjusted — see below). A new table,
+  `weather_market_odds_snapshot` (`market_slug`, `recorded_at`, `implied_probability`, indexed on
+  `(market_slug, recorded_at)`), is the odds-history time series — append-only, one row per
+  `checkMarkets.ts` observation, never upserted, specifically so a probability *shift* over time
+  can be detected later (the whole point of the early-exit strategy Joey described).
+- **`parseMarketThreshold.ts`** — a regex-based title/slug parser, `parseMarketThreshold(slug):
+  ParsedThreshold | null`. Handles every real slug shape found live across the 100-event/48-city
+  scan: exact-degree buckets (`...-27c`, `...-80-81f`), open-ended buckets (`...-32corhigher`,
+  `...-below100f`), and both Celsius and Fahrenheit markets. **Rounding-boundary math, confirmed
+  live against real market description text for both unit systems**: Polymarket weather markets
+  settle on a whole-degree-*rounded* reading, so a bucket stated as exactly `27C` actually covers
+  the true range `[26.5, 27.5]` in that market's native unit — every parsed threshold is widened by
+  ±0.5° in its native unit BEFORE Fahrenheit conversion, not after (converting the ±0.5°C margin
+  itself to °F would silently produce a different, wrong margin). Validated against all 100 live
+  events, not just hand-picked cases: 1,024 of 1,052 real strike markets parsed successfully; all
+  28 non-matches independently confirmed to be genuinely non-temperature markets (air quality,
+  earthquake counts, a hantavirus-pandemic market, "hottest year on record" — the same 6 markets
+  Rule 8 already found fall through the non-Wunderground skip path). 9 unit tests cover
+  exact-Celsius, Celsius-below/above, Fahrenheit-range, Fahrenheit-below/above, the
+  `min`-vs-`max` metric split, and confirm real non-temperature slugs correctly return `null`
+  rather than a wrong guess.
+- **`discoverMarkets.ts` extended** to call `parseMarketThreshold()` on every market slug and pass
+  the result into `upsertMarketMapping` alongside the existing settlement fields — idempotent, so
+  re-running it backfilled the parsed fields onto every mapping still inside the current odds-filter
+  band without any separate migration script. Live re-run (2026-07-20): 207 of 260 total mapping
+  rows now carry `metric`/`forecast_for`/threshold values (the remaining rows are mappings from
+  markets that have since moved outside Rule 10's 10-90% band and were correctly not re-touched —
+  not a bug, matches the rule's own documented at-scan-time-only scope).
+- **`calculateClimatology.ts`** — the second, independent probability input the blend needs. For a
+  target date, builds a ±7-day day-of-year window (real `Date` arithmetic, not string matching, so
+  month/year boundaries and leap years are handled correctly — 5 unit tests cover exactly these
+  cases) across every year actually present in `weather_historical_observation` (discovered from
+  the data itself, not hardcoded, so it stays correct as the Rule 3 backfill window rolls forward),
+  and computes the historical hit-rate for the target range using the same `computeHitRate`
+  function Rule 13's ensemble math already uses. **Genuinely small sample, disclosed not hidden**:
+  with the current 2-year backfill this is roughly 30 data points per station/date — a starting
+  climatology baseline, explicitly not a mature one.
+- **`checkMarkets.ts`** — the orchestrator. For every `is_active = true` mapping: (1) fetches
+  current odds via one `bullpen polymarket discover --category weather` call (same data shape
+  `discoverMarkets.ts` already uses, not a new API pattern) and logs a
+  `weather_market_odds_snapshot` row; (2) computes `climatologyProb` and `forecastProb` in
+  parallel; (3) blends them via `blendedProb = 0.35 * climatologyProb + 0.65 * forecastProb` — a
+  **deliberately simple v1 heuristic**, weighted toward the specific multi-model forecast over the
+  thinner historical base rate, not a rigorously-derived optimal weighting (flagged in-code as a
+  first-pass to revisit once real outcome data exists to validate against); (4) computes
+  `edge = blendedProb - marketImpliedProb` and writes a full `weather_probability_estimate` row
+  (both individual probabilities, the blend, the market price, the edge, `inputsJson` carrying the
+  full climatology/forecast breakdown including per-model detail, for later auditability); (5)
+  flags (log-only, does not gate or filter anything written) any market whose `|edge|` crosses
+  `NOTABLE_EDGE_THRESHOLD = 0.05` (5%) as worth a human look — chosen to match the order of
+  magnitude of Rule 11's 5% position-sizing cap, a starting point pending real calibration, not an
+  empirically-derived optimal value.
+
+**Live end-to-end proof (2026-07-20)**: one real mapping (`highest-temperature-in-nyc-on-
+july-19-2026-80-81f`, station KLGA) was temporarily activated to smoke-test the full pipeline
+against live data, then deactivated again immediately — genuine activation for trading remains a
+human decision (Rule 8), this was a code-verification step only, and the test odds-snapshot/
+probability-estimate rows were deleted afterward so no synthetic data pollutes the real EV history.
+The run correctly fetched live odds (71.0%), computed climatology (9.7%) and forecast (6.1%)
+probabilities, blended them (7.4%), and wrote both DB rows — proving every piece of the pipeline
+works against real data, not just synthetic test fixtures.
+
+**A real gap surfaced by that same smoke test, disclosed here rather than hidden**: the edge
+computed was a huge -63.6 percentage points — not because of a genuine mispricing, but because the
+market's `forecast_for` date (July 19) had already fully elapsed by the time the test ran (July
+20), while the ensemble forecast feeding `forecastProb` was issued mid-day on the 19th itself. The
+market's 71% price almost certainly reflects the real, now-largely-known outcome; our forecast does
+not. **`checkMarkets.ts` does not currently check whether a market's `forecast_for` date has
+already passed or is imminent** — it will happily compute and log a large "edge" that is actually
+just forecast staleness, not tradeable signal. This is a known, real limitation, not a hidden one:
+a freshness/staleness guard (e.g. skip or down-weight any mapping whose `forecast_for` is not
+strictly in the future) is needed before any future Order Builder is allowed to treat a
+`checkMarkets.ts` edge as a real trading signal. Tracked in Roadmap below.
+
+**System costs & trade-offs:** the 0.35/0.65 blend weight and the 5% notable-edge threshold are
+both stated defaults, not calibrated values — real outcome data (positions taken, actual
+settlement vs. predicted probability) is needed before either can be tuned with confidence, and
+neither should be treated as more rigorous than it is. The odds-history table is pure overhead
+today (nothing reads it yet) in exchange for making the future early-exit strategy possible at all
+— logging it from day one avoids a gap in the time series that would otherwise need to be
+backfilled (impossible, since past odds can't be reconstructed) once that strategy is actually
+built. The forecast-staleness gap above is a real, currently-unmitigated risk for any market whose
+`forecast_for` is at or near the present day — until the freshness guard is built, a human
+reviewing candidates for `is_active` should independently check that the forecast date is
+meaningfully in the future, not rely on `checkMarkets.ts`'s edge number alone for same-day or
+past-date markets.
+
+**Why it exists:** direct instruction (Joey, 2026-07-20) — "wire the brain and the eyes together."
+The probability engine (Rule 13) and the settlement/mapping infrastructure (Rules 5, 8) were both
+real and tested in isolation but had no path connecting them to Polymarket's actual live price;
+this rule is that connection. The odds-history table specifically exists because the stated future
+strategy is "not just holding to settlement" — an early-exit decision requires knowing how the
+market's price has moved, which is unrecoverable after the fact if not logged as it happens.
 
 ---
 
@@ -644,12 +767,19 @@ begins.
   comparison logic, given how much care the earlier evasion-tooling discussion (Rule 5) required.
 - Entry-rule / position-sizing logic for `weather_position` (Rule 7 depends on this existing;
   Rules 11 and 12 must both be enforced there once it's built).
-- `computeProbability.ts`'s actual climatology/forecast blend math (Rule 13's ensemble
-  requirement applies here once built).
-- Wiring `calculateProbability.ts` to real market thresholds — needs `weather_market_mapping`
-  extended with stored min/max bucket columns (or a slug-parsing step), plus writing the result
-  into `weather_probability_estimate` (keyed by `market_slug`/`outcome`). Most naturally
-  `checkMarkets.ts`'s job once it exists — the probability math itself is done (Rule 13).
+- **A forecast-staleness/freshness guard for `checkMarkets.ts`** — real gap found live 2026-07-20
+  (Rule 14): a market whose `forecast_for` date has already elapsed produces a large but
+  meaningless apparent edge, since the market's price has converged toward the now-largely-known
+  real outcome while the stored ensemble forecast has not. Needed before any future Order Builder
+  trusts a `checkMarkets.ts` edge number without a human first checking the date.
+- **The Order Builder** — explicitly deferred by Joey (2026-07-20) to "the phase after this": the
+  actual trade-execution logic enforcing Rule 11's 5% capital cap and Rule 12's 1.5°F temperature
+  buffer against a real `checkMarkets.ts` edge. `checkMarkets.ts` itself only computes and logs EV
+  today — it does not decide or place a trade.
+- **The "Buy Low, Sell High" early-exit strategy** — trading the spread dynamically as odds shift,
+  rather than only holding every position to settlement (Joey, 2026-07-20). The odds-history table
+  (`weather_market_odds_snapshot`, Rule 14) exists specifically to make this possible later; the
+  actual shift-detection/exit-decision logic is not built yet.
 - A defined capital-base constant for the Weather Bot (Rule 11 is blocked on this — no
   `PAPER_BANKROLL_USD`-equivalent exists yet for this system).
 - The `weather_rule_set` table, if/when entry-threshold logic needs its own versioned audit trail.

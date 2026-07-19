@@ -4,16 +4,12 @@
 // generation per model for a given station+day, and computes what fraction of the (up to 82)
 // ensemble members forecast a daily max temperature inside a target range.
 //
-// SCOPE, DELIBERATE: this is the probability MATH, verified against real data — it is NOT YET
-// wired to real Polymarket market thresholds. weather_market_mapping has no stored min/max
-// bucket columns today (a market's threshold currently only exists implicitly in its slug text,
-// e.g. "...-80-81f" or "...-22c"); parsing that into a real ThresholdRange is a distinct next
-// step, most naturally checkMarkets.ts's job once it exists — not attempted here so this module
-// stays a clean, independently-testable building block rather than getting tangled up with
-// slug-parsing edge cases in the same file. Also NOT yet writing to weather_probability_estimate
-// (that table is keyed by market_slug/outcome, which this module doesn't have yet for the same
-// reason). Exported as a clean function specifically so wiring both of those in later is additive,
-// not a rewrite.
+// EXTENDED 2026-07-20 to support both metrics: parseMarketThreshold.ts confirmed live that
+// Polymarket's "Weather" category has real "lowest-temperature-in-X" events alongside
+// "highest-temperature-in-X" ones (e.g. lowest-temperature-in-seoul, lowest-temperature-in-nyc)
+// — a "lowest temperature >= 25F" market needs tMinF, not tMaxF; querying the wrong column would
+// silently produce a confidently-wrong probability, not an error. `metric` is now a required
+// parameter for exactly that reason — no default, so a caller can't forget to specify it.
 //
 // BOTH MODELS BROKEN OUT, NOT JUST COMBINED: Rule 13's entire justification for an ensemble
 // (docs/weather/WEATHER_RISK_MANAGEMENT.md) is that models can genuinely disagree — RKSI's real
@@ -53,6 +49,7 @@ export function computeHitRate(values: number[], range: ThresholdRange): Probabi
 export interface StationProbability {
   stationExternalId: string;
   forecastFor: string;
+  metric: "max" | "min";
   range: ThresholdRange;
   combined: ProbabilityResult;
   byModel: Record<string, ProbabilityResult>;
@@ -60,12 +57,13 @@ export interface StationProbability {
 
 /** Queries the LATEST ensemble generation (per model, via getLatestIssuedAt so this always
  * matches whatever pruneForecasts.ts considers "current") for one station/day, and computes the
- * probability of the daily max landing inside `range`. Returns null if the station is unknown or
- * no ensemble data exists yet for this day (distinct from "0% probability" — an absent forecast
- * is not evidence of anything). */
+ * probability of the daily max OR min (per `metric`) landing inside `range`. Returns null if the
+ * station is unknown or no ensemble data exists yet for this day (distinct from "0% probability"
+ * — an absent forecast is not evidence of anything). */
 export async function calculateProbability(
   stationExternalId: string,
   forecastFor: string,
+  metric: "max" | "min",
   range: ThresholdRange
 ): Promise<StationProbability | null> {
   const stationRows = await db
@@ -84,7 +82,7 @@ export async function calculateProbability(
     if (!latestIssuedAt) continue;
 
     const rows = await db
-      .select({ tMaxF: weatherEnsembleForecast.tMaxF })
+      .select({ tMaxF: weatherEnsembleForecast.tMaxF, tMinF: weatherEnsembleForecast.tMinF })
       .from(weatherEnsembleForecast)
       .where(
         and(
@@ -95,7 +93,7 @@ export async function calculateProbability(
         )
       );
 
-    const values = rows.map((r) => r.tMaxF);
+    const values = rows.map((r) => (metric === "max" ? r.tMaxF : r.tMinF));
     if (values.length === 0) continue;
     byModel[model] = computeHitRate(values, range);
     allValues.push(...values);
@@ -106,6 +104,7 @@ export async function calculateProbability(
   return {
     stationExternalId,
     forecastFor,
+    metric,
     range,
     combined: computeHitRate(allValues, range),
     byModel,
@@ -120,22 +119,23 @@ function parseThresholdArg(v: string | undefined): number | null {
 }
 
 async function main() {
-  const [icao, forecastFor, minArg, maxArg] = process.argv.slice(2);
-  if (!icao || !forecastFor) {
-    console.error('Usage: tsx src/calculateProbability.ts <ICAO> <YYYY-MM-DD> [thresholdMinF|none] [thresholdMaxF|none]');
-    console.error('Example: tsx src/calculateProbability.ts RKSI 2026-07-21 80 none   # P(max >= 80F)');
+  const [icao, forecastFor, metricArg, minArg, maxArg] = process.argv.slice(2);
+  if (!icao || !forecastFor || (metricArg !== "max" && metricArg !== "min")) {
+    console.error('Usage: tsx src/calculateProbability.ts <ICAO> <YYYY-MM-DD> <max|min> [thresholdMinF|none] [thresholdMaxF|none]');
+    console.error('Example: tsx src/calculateProbability.ts RKSI 2026-07-21 max 80 none   # P(daily max >= 80F)');
     process.exit(1);
   }
+  const metric = metricArg;
   const range: ThresholdRange = { min: parseThresholdArg(minArg), max: parseThresholdArg(maxArg) };
 
-  const result = await calculateProbability(icao, forecastFor, range);
+  const result = await calculateProbability(icao, forecastFor, metric, range);
   if (!result) {
     console.log(`No ensemble data found for ${icao} / ${forecastFor} — has ingestOpenMeteo.ts been run for this station/day?`);
     return;
   }
 
   const rangeLabel = `[${range.min ?? "-inf"}, ${range.max ?? "+inf"}]F`;
-  console.log(`${result.stationExternalId} / ${result.forecastFor}, target range ${rangeLabel}:`);
+  console.log(`${result.stationExternalId} / ${result.forecastFor} (${metric}), target range ${rangeLabel}:`);
   console.log(
     `  Combined: ${result.combined.hitCount}/${result.combined.totalCount} members ` +
       `(${(result.combined.probability * 100).toFixed(1)}%)`

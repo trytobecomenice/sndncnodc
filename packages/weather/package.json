@@ -11,6 +11,7 @@
     "ingest:openmeteo": "tsx src/ingestOpenMeteo.ts",
     "prune:forecasts": "tsx src/pruneForecasts.ts",
     "calculate:probability": "tsx src/calculateProbability.ts",
+    "check:markets": "tsx src/checkMarkets.ts",
     "test": "vitest run"
   },
   "dependencies": {

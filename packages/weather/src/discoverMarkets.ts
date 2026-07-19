@@ -40,6 +40,7 @@
 import { runBullpenJson } from "@copybot/bullpen-client";
 import { findStationByExternalId, upsertMarketMapping, upsertWeatherStation } from "./db/writers";
 import { checkOddsFilter } from "./oddsFilter";
+import { parseMarketThreshold } from "./parseMarketThreshold";
 import { resolveStationMetadata } from "./stationReconciliation";
 
 // Default 100: verified live (2026-07-19) that `bullpen polymarket discover --category weather`
@@ -60,6 +61,7 @@ interface DiscoverMarket {
   slug: string;
   question: string;
   outcomes: DiscoverOutcome[];
+  endDateIso: string; // YYYY-MM-DD — the market's own target date, straight from bullpen, no parsing needed
 }
 
 interface DiscoverEvent {
@@ -226,14 +228,28 @@ async function main() {
 
     console.log(`EVENT ${event.slug} (station ${settlement.icaoId}, ${inBand.length}/${event.markets.length} strike markets in band):`);
     for (const { market, yesProb } of inBand) {
+      const threshold = parseMarketThreshold(market.slug);
+      if (!threshold) {
+        // Shouldn't happen for a real temperature-bucket market (live-validated against all 100
+        // real events, 1024/1052 markets parsed correctly, 28/28 non-matches were genuinely
+        // non-temperature markets) — but this event passed the Wunderground/odds gates, so if the
+        // slug still doesn't parse, that's worth a loud log, not a silent skip.
+        console.log(`  SKIP ${market.slug}: passed all gates but parseMarketThreshold couldn't parse it — investigate.`);
+        continue;
+      }
       await upsertMarketMapping({
         marketSlug: market.slug,
         stationId: station.id,
         settlementSource: "wunderground",
         settlementRule: `Settles via Wunderground station ${settlement.icaoId} (see event description for the full rule text).`,
+        metric: threshold.metric,
+        forecastFor: market.endDateIso,
+        targetTempMinF: threshold.targetTempMinF,
+        targetTempMaxF: threshold.targetTempMaxF,
       });
       tally.written++;
-      console.log(`  WRITE ${market.slug}: Yes=${yesProb} — mapping row written (is_active=false, needs review).`);
+      const rangeLabel = `[${threshold.targetTempMinF?.toFixed(1) ?? "-inf"}, ${threshold.targetTempMaxF?.toFixed(1) ?? "+inf"}]F`;
+      console.log(`  WRITE ${market.slug}: Yes=${yesProb}, ${threshold.metric} target ${rangeLabel} — mapping row written (is_active=false, needs review).`);
     }
     console.log("");
   }

@@ -412,7 +412,37 @@ export const weatherMarketMapping = sqliteTable("weather_market_mapping", {
   settlementSource: text("settlement_source").notNull(), // noaa | wunderground | ...
   settlementRule: text("settlement_rule").notNull(), // free text, e.g. "YES if official NWS max >= 90F"
   isActive: integer("is_active", { mode: "boolean" }).notNull().default(true),
+  // --- Added 2026-07-20 for the EV bridge (checkMarkets.ts) ---
+  // Nullable rather than NOT NULL: 181 existing mapping rows predate this column and are
+  // backfilled by re-running discoverMarkets.ts (idempotent upsert), not a blocking migration.
+  // A null here means "not yet parsed" — consumers (checkMarkets.ts) must treat that as skip,
+  // never guess a threshold.
+  metric: text("metric"), // "max" | "min" — highest- vs lowest-temperature market
+  forecastFor: text("forecast_for"), // YYYY-MM-DD, the event's own endDateIso from bullpen discover
+  // Both in Fahrenheit (converted from Celsius at parse time where the market is C-denominated,
+  // for unit consistency with weather_ensemble_forecast/weather_historical_observation). Already
+  // expanded to the true continuous-value boundary implied by the market's stated whole-degree
+  // rounding precision (e.g. a "22C" bucket's true boundary is [21.5C, 22.5C], not the point 22)
+  // — see parseMarketThreshold.ts for the exact math. Null min = open-ended below; null max =
+  // open-ended above; both set = a bounded bucket.
+  targetTempMinF: real("target_temp_min_f"),
+  targetTempMaxF: real("target_temp_max_f"),
 });
+
+// Time-series log of Polymarket's own implied probability for actively-tracked markets — the
+// "eyes" half of the early-exit ("buy low, sell high") strategy: you can't trade a probability
+// SHIFT without a history of what it used to be. Append-only by design (like
+// weather_forecast_snapshot's reissue pattern), one row per (market, observation time).
+export const weatherMarketOddsSnapshot = sqliteTable(
+  "weather_market_odds_snapshot",
+  {
+    id: id(),
+    marketSlug: text("market_slug").notNull(),
+    recordedAt: timestampCol("recorded_at"),
+    impliedProbability: real("implied_probability").notNull(), // the "Yes" outcome price, 0..1
+  },
+  (t) => [index("weather_market_odds_snapshot_lookup_idx").on(t.marketSlug, t.recordedAt)]
+);
 
 export const weatherProbabilityEstimate = sqliteTable(
   "weather_probability_estimate",

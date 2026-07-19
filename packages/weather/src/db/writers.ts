@@ -6,7 +6,13 @@
 // database-level foreign keys (docs/weather/WEATHER_RISK_MANAGEMENT.md Rule 9).
 
 import { and, eq } from "drizzle-orm";
-import { db, weatherMarketMapping, weatherStation } from "@copybot/db";
+import {
+  db,
+  weatherMarketMapping,
+  weatherMarketOddsSnapshot,
+  weatherProbabilityEstimate,
+  weatherStation,
+} from "@copybot/db";
 
 export interface StationRow {
   id: string;
@@ -78,10 +84,18 @@ export interface UpsertMarketMappingParams {
   /** Defaults to false — Rule 8 (docs/weather/WEATHER_RISK_MANAGEMENT.md) requires human review
    * before a mapping is trusted. No caller should pass true without that review having happened. */
   isActive?: boolean;
+  /** All four added 2026-07-20 for the EV bridge (parseMarketThreshold.ts). Null when a market's
+   * slug doesn't match a recognized temperature-bucket shape (e.g. the non-station "Weather"
+   * markets — air quality, earthquakes — confirmed live to exist). */
+  metric?: "max" | "min" | null;
+  forecastFor?: string | null;
+  targetTempMinF?: number | null;
+  targetTempMaxF?: number | null;
 }
 
 /** Idempotent — matches on market_slug's unique constraint. Re-running discoverMarkets.ts
- * updates the mapping (e.g. a corrected settlement_rule) rather than duplicating it, but
+ * updates the mapping (e.g. a corrected settlement_rule, or backfilling the threshold columns
+ * onto a row written before parseMarketThreshold.ts existed) rather than duplicating it, but
  * deliberately does NOT overwrite is_active on conflict — a human's prior approval must never be
  * silently reset by a routine re-scan. */
 export async function upsertMarketMapping(params: UpsertMarketMappingParams): Promise<void> {
@@ -91,6 +105,10 @@ export async function upsertMarketMapping(params: UpsertMarketMappingParams): Pr
     settlementSource: params.settlementSource,
     settlementRule: params.settlementRule,
     isActive: params.isActive ?? false,
+    metric: params.metric ?? null,
+    forecastFor: params.forecastFor ?? null,
+    targetTempMinF: params.targetTempMinF ?? null,
+    targetTempMaxF: params.targetTempMaxF ?? null,
   };
 
   await db
@@ -102,7 +120,48 @@ export async function upsertMarketMapping(params: UpsertMarketMappingParams): Pr
         stationId: values.stationId,
         settlementSource: values.settlementSource,
         settlementRule: values.settlementRule,
+        metric: values.metric,
+        forecastFor: values.forecastFor,
+        targetTempMinF: values.targetTempMinF,
+        targetTempMaxF: values.targetTempMaxF,
         // isActive deliberately omitted from the update set — see doc comment above.
       },
     });
+}
+
+/** Append-only — logs one point-in-time reading of a market's implied "Yes" probability. Never
+ * upserted/deduplicated: the whole point is a time series, per-observation, for the early-exit
+ * strategy's odds-shift detection (Joey, 2026-07-20). */
+export async function logOddsSnapshot(marketSlug: string, impliedProbability: number): Promise<void> {
+  await db.insert(weatherMarketOddsSnapshot).values({ marketSlug, impliedProbability });
+}
+
+export interface UpsertProbabilityEstimateParams {
+  marketSlug: string;
+  outcome: string;
+  climatologyProb: number;
+  forecastProb: number | null;
+  blendedProb: number;
+  marketImpliedProb: number | null;
+  edge: number | null;
+  modelVersion: string;
+  inputsJson: Record<string, unknown>;
+}
+
+/** Append-only, matching the existing append-only research-log pattern already used for
+ * leaderboard_scan and weather_probability_estimate's own original design — every checkMarkets.ts
+ * pass writes a new row rather than overwriting the last one, so the EV history over time is
+ * preserved (needed for the early-exit strategy just as much as the raw odds history is). */
+export async function insertProbabilityEstimate(params: UpsertProbabilityEstimateParams): Promise<void> {
+  await db.insert(weatherProbabilityEstimate).values({
+    marketSlug: params.marketSlug,
+    outcome: params.outcome,
+    climatologyProb: params.climatologyProb,
+    forecastProb: params.forecastProb,
+    blendedProb: params.blendedProb,
+    marketImpliedProb: params.marketImpliedProb,
+    edge: params.edge,
+    modelVersion: params.modelVersion,
+    inputsJson: JSON.stringify(params.inputsJson),
+  });
 }

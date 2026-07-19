@@ -72,15 +72,19 @@ weather_station (one row per source per real-world location)
         │  human-reviewed ONCE per city/event (not per strike market)
         ▼
 weather_market_mapping  (market_slug ↔ SETTLEMENT station — Wunderground; forecast station noted
-                          in settlement_rule free text)
+                          in settlement_rule free text; metric/forecast_for/target_temp_min_f/
+                          target_temp_max_f parsed from the slug itself — Rule 14, 2026-07-20)
         │
+        ├──→ weather_market_odds_snapshot  (append-only time series of Polymarket's own implied
+        │                                   probability — the "eyes" half of a future early-exit
+        │                                   strategy — Rule 14, 2026-07-20)
         ▼
-weather_probability_estimate  (climatology + forecast + same-day METAR nowcast → blended_prob;
-                                market_implied_prob from bullpen; edge = blended - implied)
+weather_probability_estimate  (climatology + forecast → blended_prob; market_implied_prob from
+                                bullpen; edge = blended - implied — checkMarkets.ts, Rule 14)
         │
         ├── sparse, on-demand only ──→ verifySettlement.ts (Wunderground — Rule 4/5, pre-closeout ONLY)
         ▼
-weather_position  (future entry-rule logic, not yet designed)
+weather_position  (future entry-rule logic — the "Order Builder," not yet designed)
         │
         ▼
 weather_pnl_snapshot
@@ -122,14 +126,20 @@ alternative (reviewing every individual degree-bucket market) was considered and
 excess manual effort for no added safety — the risky judgment call is which station to trust, not
 which bucket.
 
-**Probability computation** (future logic, not yet built): `climatology_prob` from the settlement
-station's historical observations; `forecast_prob` from the paired NOAA/Open-Meteo forecast
-station; both blend into `blended_prob`, tagged with a `model_version` string so blending
-strategies stay comparable over time; same-day METAR readings sharpen the estimate intraday as an
-event's day arrives (a genuine nowcast edge source, not just a safety net); `market_implied_prob`
-comes from the current strike price via `bullpen`; `edge = blended_prob - market_implied_prob`.
-Every row is appended, never mutated, to `weather_probability_estimate` — an append-only research
-log, same pattern as the Copy Bot's `leaderboard_scan`.
+**Probability computation — built and live-verified end-to-end (2026-07-20), `checkMarkets.ts`
+(Rule 14).** `climatology_prob` comes from `calculateClimatology.ts` (a ±7-day day-of-year window
+across every backfilled year of `weather_historical_observation`); `forecast_prob` comes from
+`calculateProbability.ts`'s ensemble query (Rule 13); both blend into `blended_prob = 0.35 *
+climatology + 0.65 * forecast` (a stated v1 heuristic, not a calibrated weighting), tagged with a
+`model_version` string so blending strategies stay comparable over time; `market_implied_prob`
+comes from the current strike price via `bullpen` and is also logged, on every check, as its own
+row in `weather_market_odds_snapshot`; `edge = blended_prob - market_implied_prob`. Every row is
+appended, never mutated, to `weather_probability_estimate` — an append-only research log, same
+pattern as the Copy Bot's `leaderboard_scan`. **A real gap found live**: a market whose
+`forecast_for` date has already elapsed produces a large but meaningless edge, since the stored
+ensemble forecast predates the market's price having converged toward the actual outcome — see
+`docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 14 for the full finding; a freshness guard is not
+yet built.
 
 ---
 
@@ -158,6 +168,20 @@ station — this is the one place the original design assumption changed after t
 finding. The paired forecast station lives in the existing free-text `settlement_rule` column
 (e.g. *"Settles via Wunderground RKSI page; forecast/nowcast paired to METAR RKSI + Open-Meteo
 grid 37.47,126.45"*) — no schema change needed.
+
+**BUILT AND LIVE-VERIFIED (2026-07-20): `weather_market_mapping` extended, plus a 9th table,
+`weather_market_odds_snapshot`** (migration `0005_magical_captain_britain.sql`, applied following
+the established stop-`bot.py`/`dashboard.py`/Next.js-dev-server, migrate, restart runbook).
+`weather_market_mapping` gained four nullable columns — `metric` (`"max"`/`"min"`), `forecast_for`
+(`YYYY-MM-DD`), `target_temp_min_f`, `target_temp_max_f` — populated by `parseMarketThreshold.ts`
+regex-parsing the market's own slug (nullable because ~28 real Weather-category markets aren't
+temperature buckets at all — air quality, earthquakes, etc. — and correctly parse to nothing).
+`weather_market_odds_snapshot` is a new, separate, append-only table (`market_slug`, `recorded_at`,
+`implied_probability`, indexed on `(market_slug, recorded_at)`) — deliberately never upserted,
+since it exists specifically to be a time series a future early-exit strategy can read for a
+probability *shift*, which an upserted "latest value" table can't answer. See
+`docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 14 for the full parsing-engine and
+rounding-boundary-math detail.
 
 **No connection to Copy Bot tables**, and no reuse of the Copy Bot's `rule_set`/`rule_change`
 tables — those are shaped around copy-trading-specific concepts (mute streaks, TTP activation,
@@ -251,8 +275,9 @@ Copy Bot's `scoreWallets.ts` already uses within a single run (its pass-1/pass-2
 ## 4. Proposed `packages/weather/` structure
 
 `packages/weather/` is now a real, wired-in pnpm workspace member — `package.json`/`tsconfig.json`
-exist, and eleven scripts/modules are built, tested, and live-verified against `data/app.db` and
-real Polymarket data (2026-07-19). Structure mirrors `packages/copy-trading`'s conventions: plain
+exist, and eighteen scripts/modules are built, tested, and live-verified against `data/app.db` and
+real Polymarket/Open-Meteo data (2026-07-19 through 2026-07-20). Structure mirrors
+`packages/copy-trading`'s conventions: plain
 `tsx`-executed scripts, an `isMainModule` guard so files stay test-importable, vitest for
 pure-function tests. **`db/writers.ts` is now built** — introduced exactly when
 `discoverMarkets.ts` became a second writer of `weather_station` rows, the trigger this section
@@ -278,27 +303,38 @@ packages/weather/
     stationReconciliation.test.ts       # BUILT ✅ — 4 tests, incl. cities never hardcoded anywhere (London, Tokyo)
     ingestNoaa.ts                       # not yet built — forecast + climatology input
     ingestOpenMeteo.ts                  # BUILT ✅ — ecmwf_ifs025 (51 members) + gfs_seamless (31 members), 35,260 rows/run live-verified across all 43 stations
+    pruneForecasts.ts                   # BUILT ✅ — Rule 13, keeps only latest issuedAt generation per (station, model)
+    calculateProbability.ts             # BUILT ✅ — Rule 13, ensemble hit-rate probability, combined + per-model
+    calculateClimatology.ts             # BUILT ✅ — Rule 14, ±7-day day-of-year historical base rate
+    parseMarketThreshold.ts             # BUILT ✅ — Rule 14, slug → metric/threshold parser, 1024/1052 real markets parsed
+    parseMarketThreshold.test.ts        # BUILT ✅ — 9 tests
+    calculateClimatology.test.ts        # BUILT ✅ — 5 tests (window/leap-year/boundary math)
+    checkMarkets.ts                     # BUILT ✅ — Rule 14, the EV Bridge: odds snapshot + blended prob + edge, live-verified end-to-end
     verifySettlement.ts                 # not yet built — Playwright, Wunderground, ON-DEMAND ONLY (deliberately deferred, see docs/weather/WEATHER_RISK_MANAGEMENT.md Rule 5)
     detectAnomaly.ts                    # not yet built — Rule 4's general physically-impossible-jump bounds-check
-    computeProbability.ts               # not yet built — climatology + forecast + nowcast blend
-    checkMarkets.ts                     # not yet built — refresh market-implied prices, recompute edge
-    managePositions.ts                  # not yet built — future entry-rule design
+    managePositions.ts                  # not yet built — future entry-rule design; the "Order Builder" (Rule 11/12 enforcement), explicitly deferred
     updatePnl.ts                        # not yet built — weather_pnl_snapshot rollup
 ```
 
-Root `package.json` scripts (future): `weather:ingest-historical`, `weather:ingest-forecast`,
-`weather:ingest-metar`, `weather:discover-markets`, `weather:check-markets`,
-`weather:manage-positions`, `weather:update-pnl`, `weather:prune-historical` — each its own
-`launchd` job. `verifySettlement.ts` deliberately has **no** script/job of its own — it's a
-function called from `discoverMarkets.ts` and `managePositions.ts`, never an independent poll.
+`packages/weather/package.json` scripts, built: `ingest:metar`, `prune:historical`,
+`discover:markets`, `backfill:historical`, `ingest:openmeteo`, `prune:forecasts`,
+`calculate:probability`, `check:markets`. Not yet built: `manage-positions`, `update-pnl`. Each is
+its own future `launchd` job (mechanism decided, jobs not yet scheduled — see §3). `verifySettlement.ts`
+deliberately has **no** script/job of its own — it's a function called from `discoverMarkets.ts`
+and `managePositions.ts`, never an independent poll.
 
 ---
 
 ## Explicitly out of scope, for now
 
-- NOAA/Open-Meteo ingestion, market discovery, probability computation, and the live Wunderground
-  fetch (`verifySettlement.ts`) — see §4's file table for the current built/not-built split.
-- Entry-rule / position-sizing logic for `weather_position`.
+- NOAA ingestion and the live Wunderground fetch (`verifySettlement.ts`) — see §4's file table for
+  the current built/not-built split.
+- **The Order Builder** — entry-rule / position-sizing logic for `weather_position`, enforcing
+  Rule 11's 5% capital cap and Rule 12's 1.5°F temperature buffer against a real `checkMarkets.ts`
+  edge. Explicitly deferred by Joey (2026-07-20) to "the phase after this."
+- **The "Buy Low, Sell High" early-exit strategy** — the odds-history table
+  (`weather_market_odds_snapshot`) exists to make this possible later; the shift-detection/exit
+  logic itself is not built.
 - The `weather_rule_set` table.
 - `launchd` plist files themselves (mechanism decided; concrete job definitions come with the
   scripts they invoke).

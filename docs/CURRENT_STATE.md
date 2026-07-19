@@ -4,7 +4,7 @@
 "Last reviewed" date below before trusting a number in here over the live system (`bot.out.log`,
 `data/app.db`, `bullpen status`).
 
-**Last reviewed: 2026-07-19** (updated same-day: Weather Bot architecture docs added)
+**Last reviewed: 2026-07-20** (updated same-day: Weather Bot EV Bridge — `checkMarkets.ts` — built and live-verified)
 
 ## Snapshot, right now
 
@@ -103,11 +103,33 @@
   `calculateProbability.ts` queries the latest generation and computes hit-rate probability,
   combined and per-model — real results pulled live: RKSI next-day ≥80°F came back 31.7% combined
   but `ecmwf_ifs025` 19.6% vs. `gfs_seamless` 51.6%; KLGA's 78-79°F bucket was `ecmwf_ifs025` 31.4%
-  vs. `gfs_seamless` a flat 0.0%. Scope deliberately stops at the math: not yet wired to real
-  market thresholds (needs `weather_market_mapping` extended, or slug-parsing) or to
-  `weather_probability_estimate` writes — both real next steps, not silently skipped.
+  vs. `gfs_seamless` a flat 0.0%.
+- **The EV Bridge — built and live-verified end-to-end** (2026-07-20, migration
+  `0005_magical_captain_britain.sql`; `parseMarketThreshold.ts`, `calculateClimatology.ts`,
+  `checkMarkets.ts`, 16th-18th scripts; `weather_market_odds_snapshot`, 9th table). Closes the two
+  gaps the previous entry flagged. `weather_market_mapping` gained `metric`/`forecast_for`/
+  `target_temp_min_f`/`target_temp_max_f`, populated by a new regex slug-parser
+  (`parseMarketThreshold.ts`) that also applies the confirmed rounding-boundary math (a stated
+  `27C` bucket is really `[26.5, 27.5]`) — validated against all 100 live events: 1,024/1,052 real
+  strike markets parsed, all 28 non-matches confirmed genuinely non-temperature. Re-running
+  `discoverMarkets.ts` backfilled 207 mapping rows with the new fields. `calculateClimatology.ts`
+  adds the second, independent probability input (±7-day day-of-year historical hit-rate).
+  `checkMarkets.ts` orchestrates all of it per `is_active=true` mapping: logs a
+  `weather_market_odds_snapshot` row, computes climatology + ensemble probabilities, blends them
+  (`0.35 * climatology + 0.65 * forecast`, a stated v1 heuristic), writes
+  `weather_probability_estimate` with the edge, and flags `|edge| >= 5%` as notable (log-only, not
+  a trade decision). **Live-tested against a real market** (KLGA, temporarily activated then
+  reverted — no real position taken): correctly fetched live odds (71.0%), computed and blended
+  climatology/forecast probabilities (7.4%), and wrote both DB rows. **A real gap found by that
+  same test, not hidden**: the edge came back a huge -63.6pp, not from real mispricing but because
+  the market's `forecast_for` date had already elapsed relative to the stored (same-day-issued)
+  forecast — `checkMarkets.ts` has no freshness guard yet, so a human reviewing candidates for
+  `is_active` must independently confirm the forecast date is meaningfully in the future. Explicitly
+  deferred to a future phase (Joey, 2026-07-20): the Order Builder (Rule 11/12 enforcement) and the
+  "Buy Low, Sell High" early-exit strategy the odds-history table exists to enable. Full detail:
+  `docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 14.
   Still not built: `verifySettlement.ts` (the live Wunderground/Playwright fetch — deliberately
-  deferred as its own step), the ensemble retention policy above, probability computation, position
+  deferred as its own step), `detectAnomaly.ts`'s general bounds-check, the Order Builder, position
   management. Full design in `docs/weather/WEATHER_ARCHITECTURE.md` /
   `docs/weather/WEATHER_RISK_MANAGEMENT.md`.
 - **Database schema ownership:** TypeScript/Drizzle owns schema and migrations; Python
