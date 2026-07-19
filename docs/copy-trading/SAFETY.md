@@ -1,6 +1,6 @@
 # Safety
 
-**Audience note:** this document assumes zero prior context, same as `docs/RISK_MANAGEMENT.md`.
+**Audience note:** this document assumes zero prior context, same as `docs/copy-trading/RISK_MANAGEMENT.md`.
 That document is the plain-numbered rules ledger — the single source of truth for "what rules
 currently apply," each written as What it does / How it works mechanically / System costs &
 trade-offs / Why it exists. **This document does not repeat that mechanical detail.** It covers
@@ -14,7 +14,7 @@ they never silently drift apart.
 
 ## 1. Paper trading only (technical implementation)
 
-**What it does:** `config.LIVE_MODE = False` — see `docs/RISK_MANAGEMENT.md` Rule 1 for the full
+**What it does:** `config.LIVE_MODE = False` — see `docs/copy-trading/RISK_MANAGEMENT.md` Rule 1 for the full
 mechanics.
 
 **How it works mechanically:** `LIVE_MODE = True` places real orders with real funds via

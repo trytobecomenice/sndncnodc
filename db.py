@@ -11,7 +11,7 @@ bot.py already used with the JSON files, so bot.py's trading logic
 run_closeout_sweep) does not change at all — only these four functions'
 storage backend does.
 
-Ownership boundary (see docs/SAFETY.md): this module writes
+Ownership boundary (see docs/copy-trading/SAFETY.md): this module writes
 wallet_profile.circuit_breaker_muted/mute_reason/muted_at/consecutive_losses/
 recent_results_json (bot.py's own circuit-breaker fields) but NEVER
 wallet_profile.status — that column belongs to the TS leaderboard-scan/

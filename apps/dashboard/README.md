@@ -1,7 +1,7 @@
 # Copybot Dashboard (Next.js)
 
 **Audience note:** zero prior context assumed. For the full system this dashboard is one piece
-of, start at the repo root `README.md`, then `docs/SYSTEM_ARCHITECTURE.md`.
+of, start at the repo root `README.md`, then `docs/copy-trading/SYSTEM_ARCHITECTURE.md`.
 
 ## What this is
 
@@ -15,7 +15,7 @@ once it covers everything that one does.
 activity, all live). The other planned pages — Wallet Rankings, Trade Signals, Decision Journal,
 Performance, Rules, Reports, and more — don't exist yet. Its one write action (start/stop the
 bot) never touches `data/app.db` directly — it only signals a PID file, matching the
-"dashboard stays near-read-only" boundary documented in `docs/SAFETY.md` §2.
+"dashboard stays near-read-only" boundary documented in `docs/copy-trading/SAFETY.md` §2.
 
 ## Running it
 
@@ -36,7 +36,7 @@ or seeding needed if the rest of the system has already run at least once.
 
 This app never talks to `bullpen` or Polymarket directly — it only reads the database that
 `bot.py` (Python) and the wallet-scoring scripts (`packages/copy-trading`) write to. See
-`docs/SYSTEM_ARCHITECTURE.md` §3 for exactly how a Python process and a TypeScript app safely
+`docs/copy-trading/SYSTEM_ARCHITECTURE.md` §3 for exactly how a Python process and a TypeScript app safely
 share one SQLite file, and §4 for the full trading/scoring cycle whose output this dashboard
 displays.
 

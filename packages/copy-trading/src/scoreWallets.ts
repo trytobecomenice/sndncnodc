@@ -140,7 +140,7 @@
 // API.
 //
 // =============================================================================
-// DATABASE SAFETY BOUNDARY (see docs/SAFETY.md)
+// DATABASE SAFETY BOUNDARY (see docs/copy-trading/SAFETY.md)
 // =============================================================================
 // READS FROM:  leaderboard_scan (who are the candidates?), rule_set (what
 //              scoring weights/thresholds are currently active?),

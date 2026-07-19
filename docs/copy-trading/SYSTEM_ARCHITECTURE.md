@@ -4,7 +4,7 @@
 exists in this repo right now: what was built, how the pieces fit together, and exactly what
 happens when the bot runs. It's meant to be the one place you can come back to and re-orient
 yourself. For the risk controls themselves (what's enforced, exact numbers, why), see
-`docs/RISK_MANAGEMENT.md` — this document explains the *system*, that one explains the *rules*.
+`docs/copy-trading/RISK_MANAGEMENT.md` — this document explains the *system*, that one explains the *rules*.
 
 ---
 
@@ -48,7 +48,7 @@ foundation to grow from**:
 7. **Built the first piece of the new "research brain"**: `scanLeaderboard.ts`, a script that
    pulls real wallet data from Polymarket via the `bullpen` CLI and saves it to the database.
    Already run successfully against live data.
-8. **Wrote `docs/SAFETY.md`**, documenting the safety rules and boundaries between the pieces.
+8. **Wrote `docs/copy-trading/SAFETY.md`**, documenting the safety rules and boundaries between the pieces.
 9. **Built `scoreWallets.ts`**, the second research-brain script: it reads the candidates
    `scanLeaderboard.ts` found, scores each one (ROI + consistency + a one-hit-wonder penalty +
    copyability), and writes a `track`/`watch`/`ignore` verdict onto `wallet_profile.status`.
@@ -144,7 +144,7 @@ never silently overwrite each other's work:
 `bot.py` checks *both* `wallet_profile` fields before copying a trade (muted OR not-tracked
 blocks a copy), but it only ever *writes* the mute-related ones. This is why `db.py`'s code has
 comments like *"status is deliberately never written here."* Full detail on why this split
-exists and how it's structurally enforced (not just convention): `docs/RISK_MANAGEMENT.md`
+exists and how it's structurally enforced (not just convention): `docs/copy-trading/RISK_MANAGEMENT.md`
 Rule 9.
 
 ### Making it safe for multiple writers at once
@@ -181,7 +181,7 @@ This is the same logic that existed before today, just reading/writing SQLite in
 2. For every new trade found:
    - If it's a **BUY**: check the wallet isn't muted, check no other tracked wallet already
      holds this exact market+outcome and that this trader hasn't hit their same-outcome buy cap
-     (avoids doubling up — `docs/RISK_MANAGEMENT.md` Rule 3), then check the portfolio-level
+     (avoids doubling up — `docs/copy-trading/RISK_MANAGEMENT.md` Rule 3), then check the portfolio-level
      exposure ceiling / per-event cap / drawdown kill switch (`risk_manager.py`, Rule 6). In LIVE
      mode only, also check the spread/liquidity guard and the pre-trade slippage ceiling
      (Rules 4 and 11) before an order is ever submitted. Only after every check passes does it
@@ -279,7 +279,7 @@ built yet.
 | `config.py` | All tuning constants — tracked wallets, risk thresholds, live/paper switch. |
 | `bullpen_client.py` | Talks to the `bullpen` CLI (the only thing that ever touches Polymarket/keys). |
 | `db.py` | Python's bridge to the shared SQLite database. |
-| `risk_manager.py` | Pure-function portfolio risk controls (exposure ceiling, event cap, drawdown kill switch) — see `docs/RISK_MANAGEMENT.md` Rule 6. |
+| `risk_manager.py` | Pure-function portfolio risk controls (exposure ceiling, event cap, drawdown kill switch) — see `docs/copy-trading/RISK_MANAGEMENT.md` Rule 6. |
 | `reset_kill_switch.py` | Standalone script to clear a latched kill-switch halt after human review. Deliberately not a dashboard button. |
 | `dashboard.py` | The original small built-in web dashboard (port 8787). |
 | `migrate_to_sqlite.py` | One-time script that moved old JSON data into SQLite. Already run. |
@@ -290,8 +290,8 @@ built yet.
 | `packages/copy-trading/src/scoreWallets.ts` | Scores those candidates and writes `track`/`watch`/`ignore` onto `wallet_profile.status`. |
 | `packages/shared/src/concurrency.ts` | Small "run N at once" concurrency pool used by `scoreWallets.ts`'s two passes. |
 | `apps/dashboard/` | The new Next.js web dashboard (Overview page built so far). |
-| `docs/RISK_MANAGEMENT.md` | Every risk rule currently enforced — what, how, cost, why. The rules ledger. |
-| `docs/SAFETY.md` | Database ownership boundaries, migration runbooks, and known residual risks. |
+| `docs/copy-trading/RISK_MANAGEMENT.md` | Every risk rule currently enforced — what, how, cost, why. The rules ledger. |
+| `docs/copy-trading/SAFETY.md` | Database ownership boundaries, migration runbooks, and known residual risks. |
 | `test_risk_manager.py`, `test_bot_risk_checks.py` | Unit tests for the portfolio risk controls and the slippage ceiling (pure-function, no DB/network). |
 
 ## 6. What's not built yet

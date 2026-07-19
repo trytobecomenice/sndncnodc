@@ -157,7 +157,7 @@ export default async function OverviewPage() {
       </section>
 
       <p className={`mt-10 text-xs ${pnlClass}`}>
-        Paper trading only — no real trades are placed. See docs/SAFETY.md.
+        Paper trading only — no real trades are placed. See docs/copy-trading/SAFETY.md.
       </p>
     </main>
   );

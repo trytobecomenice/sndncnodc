@@ -1,6 +1,6 @@
 # Weather Bot — Risk Management & Rules
 
-**Audience note:** zero prior context assumed, same standard as `docs/RISK_MANAGEMENT.md`. Every
+**Audience note:** zero prior context assumed, same standard as `docs/copy-trading/RISK_MANAGEMENT.md`. Every
 rule below follows What it does / How it works mechanically / System costs & trade-offs / Why it
 exists — precise enough to extend, tune, or challenge without re-deriving the reasoning.
 
@@ -8,10 +8,10 @@ exists — precise enough to extend, tune, or challenge without re-deriving the 
 ledger written *before* implementation, per an explicit requirement that documentation come first.
 **This is the single source of truth for what rules will apply to the Weather Bot** — check it
 before proposing a new restriction so a decision already made here doesn't get silently
-re-thought. `docs/WEATHER_ARCHITECTURE.md` is the companion: data flow, schema, and scheduling
+re-thought. `docs/weather/WEATHER_ARCHITECTURE.md` is the companion: data flow, schema, and scheduling
 detail that explains *how* these rules get implemented mechanically.
 
-This document is intentionally separate from `docs/RISK_MANAGEMENT.md` (the Copy Bot's rules
+This document is intentionally separate from `docs/copy-trading/RISK_MANAGEMENT.md` (the Copy Bot's rules
 ledger) — per `.claudeprompt`, the two systems' rules, like their code and schema, must never be
 treated as one system. Where a rule below is conceptually similar to a Copy Bot rule (e.g. paper
 trading only), it's restated here in full rather than cross-referenced, so this document stands
@@ -138,7 +138,7 @@ on-demand fetch, never a continuously-polled one, and never using tooling built 
 Wunderground's own anti-abuse defenses.
 
 **How it works mechanically:** a same-day reconciliation check (documented in full in
-`docs/WEATHER_ARCHITECTURE.md`) found that NOAA's free METAR feed and Wunderground's own reported
+`docs/weather/WEATHER_ARCHITECTURE.md`) found that NOAA's free METAR feed and Wunderground's own reported
 high/low for the identical airport station disagreed by enough to cross a whole-degree-Celsius
 bucket boundary, on both the day's high and low. Given markets settle on exactly these buckets, an
 approximate source is not acceptable for settlement — so `verifySettlement.ts` (Playwright,
@@ -285,6 +285,6 @@ same schema file for no proportionate benefit, since nothing in this system hard
 - Entry-rule / position-sizing logic for `weather_position` (Rule 7 depends on this existing).
 - `computeProbability.ts`'s actual climatology/forecast blend math.
 - The `weather_rule_set` table, if/when entry-threshold logic needs its own versioned audit trail.
-- `launchd` plist files (mechanism decided in `docs/WEATHER_ARCHITECTURE.md`; concrete job
+- `launchd` plist files (mechanism decided in `docs/weather/WEATHER_ARCHITECTURE.md`; concrete job
   definitions come with the scripts they invoke).
 - Calibrated anomaly-detection thresholds for Rule 4 (needs real station data first).

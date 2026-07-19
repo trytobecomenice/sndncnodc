@@ -1,10 +1,10 @@
 # Weather Bot — System Architecture
 
-**Audience note:** zero prior context assumed, same standard as `docs/SYSTEM_ARCHITECTURE.md`.
+**Audience note:** zero prior context assumed, same standard as `docs/copy-trading/SYSTEM_ARCHITECTURE.md`.
 **Status: architecture-only.** No code exists yet in `packages/weather/` — this document (and its
-companion, `docs/WEATHER_RISK_MANAGEMENT.md`) is the first artifact of this system, written
+companion, `docs/weather/WEATHER_RISK_MANAGEMENT.md`) is the first artifact of this system, written
 *before* any ingestion script, per an explicit "documentation first" requirement. If you're
-looking for the running trading bot, that's the Copy Bot (`docs/SYSTEM_ARCHITECTURE.md`) — this
+looking for the running trading bot, that's the Copy Bot (`docs/copy-trading/SYSTEM_ARCHITECTURE.md`) — this
 document describes a planned, separate, currently-unbuilt system.
 
 ## What this system will be
@@ -14,7 +14,7 @@ temperature in Seoul on July 19?" — by comparing a modeled probability (built 
 forecasts and historical climatology) against the market's current implied price, and opening a
 paper position when the model disagrees with the market by enough margin to matter. Same
 paper-trading-only posture as the Copy Bot: no live funds, no private keys, ever (see
-`docs/WEATHER_RISK_MANAGEMENT.md` Rule 1).
+`docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 1).
 
 ## Why it's a separate system, not a Copy Bot feature
 
@@ -25,7 +25,7 @@ code (`packages/weather/`, never `packages/copy-trading/` or any Python Copy Bot
 database tables (7 already reserved and unused: `weather_station`, `weather_historical_observation`,
 `weather_forecast_snapshot`, `weather_market_mapping`, `weather_probability_estimate`,
 `weather_position`, `weather_pnl_snapshot`, in `packages/db/src/schema.ts` lines 309-411), separate
-docs (this file and its companion, not `docs/RISK_MANAGEMENT.md`/`docs/SAFETY.md`). The only
+docs (this file and its companion, not `docs/copy-trading/RISK_MANAGEMENT.md`/`docs/copy-trading/SAFETY.md`). The only
 shared infrastructure is the physical SQLite file (`data/app.db`) and two already-shared
 TypeScript packages (`packages/bullpen-client`, `packages/db`) — same sharing model the Copy Bot's
 TS research layer already uses, not a new exception.
@@ -52,7 +52,7 @@ conclusion was unambiguous: a free, ToS-clean source that *looks* like it should
 settlement station (same airport, same ICAO code) does not reliably match closely enough for
 whole-degree-bucket settlement. This finding is why the architecture below treats "the source used
 to predict" and "the source used to settle" as two structurally different roles, never conflated —
-see `docs/WEATHER_RISK_MANAGEMENT.md` Rules 4-6 for the full reasoning and the rules that follow
+see `docs/weather/WEATHER_RISK_MANAGEMENT.md` Rules 4-6 for the full reasoning and the rules that follow
 from it.
 
 ---
@@ -164,7 +164,7 @@ scheduling — new infrastructure for this repo, not a copy of an existing patte
 
 **Mechanism: OS-level `launchd`** (this runs on a Mac), one job per cadence below, **not** a
 long-running orchestrator process. Chosen over a `node-cron`-based orchestrator specifically to
-avoid stacking a second always-on Node process next to `bot.py` — `docs/SAFETY.md` §3 already
+avoid stacking a second always-on Node process next to `bot.py` — `docs/copy-trading/SAFETY.md` §3 already
 documents an unresolved "nothing restarts a dead process" gap for `bot.py`; a second orchestrator
 process would compound that same accepted risk rather than just adding a new one.
 
@@ -178,7 +178,7 @@ process would compound that same accepted risk rather than just adding a new one
 | Market discovery | Daily | New city/day events appear roughly daily |
 | Price refresh + edge recompute | Every 1-2h | Cheap `bullpen` calls; price moves faster than forecast |
 | Position management | Same cadence as price refresh | Runs the Rule 3 anomaly gate on every check |
-| **Wunderground settlement verification** | **On-demand only** — once per new mapping, once per position pre-closeout | **Deliberately never polled — see `docs/WEATHER_RISK_MANAGEMENT.md` Rule 4** |
+| **Wunderground settlement verification** | **On-demand only** — once per new mapping, once per position pre-closeout | **Deliberately never polled — see `docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 4** |
 | PnL rollup | Daily or after each position pass | Cheap aggregate query |
 
 This mirrors, at the scheduling level, the same cheap/frequent-vs-expensive/slower instinct the
@@ -241,5 +241,5 @@ function called from `discoverMarkets.ts` and `managePositions.ts`, never an ind
 - `packages/copy-trading/src/scanLeaderboard.ts` / `scoreWallets.ts` — patterns this system mirrors.
 - `packages/bullpen-client/src/index.ts` — `runBullpenJson`; its header already anticipates
   `packages/weather` as a future consumer.
-- `docs/WEATHER_RISK_MANAGEMENT.md` — the rules ledger this document's design choices implement.
+- `docs/weather/WEATHER_RISK_MANAGEMENT.md` — the rules ledger this document's design choices implement.
 - `.claudeprompt` — the isolation mandate this entire system is built to respect.

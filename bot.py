@@ -1023,7 +1023,7 @@ def main():
                 # gated by config.TRACKED_TRADERS_SOURCE. This is the actual
                 # enforcement point for that switch: bot.py, not bullpen,
                 # decides whether a given trader is currently worth copying
-                # (see docs/SAFETY.md's ownership-boundary section).
+                # (see docs/copy-trading/SAFETY.md's ownership-boundary section).
                 trader_addr = trade.get("user_address") or ""
                 if trader_addr.lower() not in tracked_by_lower:
                     append_log({"timestamp": now_iso(), "event_type": "skip_untracked_trader",

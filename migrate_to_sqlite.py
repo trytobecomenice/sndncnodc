@@ -21,7 +21,7 @@ Only once those match, stop bot.py/dashboard.py and run for real:
 
     python3 migrate_to_sqlite.py
 
-See docs/SAFETY.md for the full cutover runbook (why bot.py/dashboard.py
+See docs/copy-trading/SAFETY.md for the full cutover runbook (why bot.py/dashboard.py
 must be stopped first, and how to roll back).
 """
 import argparse
@@ -265,7 +265,7 @@ def main():
         print(
             "WARNING: no --state/--log/--db overrides given — this will migrate the REAL "
             "state.json/trades_log.json into the REAL data/app.db.\n"
-            "Make sure bot.py and dashboard.py are stopped first (see docs/SAFETY.md), and that "
+            "Make sure bot.py and dashboard.py are stopped first (see docs/copy-trading/SAFETY.md), and that "
             "you've already dry-run this against copies. Ctrl-C now to abort.\n"
         )
         time.sleep(5)

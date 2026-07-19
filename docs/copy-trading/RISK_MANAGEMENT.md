@@ -7,7 +7,7 @@ to extend, tune, or challenge any of it without archaeology through the codebase
 
 **This is the single source of truth for "what rules currently apply."** Reference it before
 deciding on a new restriction, so an old decision doesn't get silently re-thought or
-contradicted. `docs/SAFETY.md` is the engineering companion: shared-database ownership rules,
+contradicted. `docs/copy-trading/SAFETY.md` is the engineering companion: shared-database ownership rules,
 migration/cutover runbooks, and deeper implementation notes that don't fit the rule-by-rule
 format below. Keep both current in the same commit when a rule changes — don't let them drift.
 

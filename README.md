@@ -12,18 +12,18 @@ top to bottom, then follow the links.
 ## Is this safe to poke around in?
 
 Yes. As of today, `config.LIVE_MODE = False` — every trade is simulated, no real funds move, and
-no code in this repository ever touches a private key (see `docs/SAFETY.md` §5). The riskiest
+no code in this repository ever touches a private key (see `docs/copy-trading/SAFETY.md` §5). The riskiest
 thing you can do by accident is edit `config.py`'s tuning numbers or flip `LIVE_MODE` without
-understanding what you're changing — see `docs/RISK_MANAGEMENT.md` before touching either.
+understanding what you're changing — see `docs/copy-trading/RISK_MANAGEMENT.md` before touching either.
 
 ## Where to start
 
 | I want to... | Read this |
 |---|---|
-| Understand what's running and why, from zero | `docs/SYSTEM_ARCHITECTURE.md` |
-| Know exactly what risk rules are enforced, and why | `docs/RISK_MANAGEMENT.md` |
-| Get the engineering-level detail (file/function names, DB ownership, runbooks) | `docs/SAFETY.md` |
-| Understand the (planned, architecture-only) Weather Bot | `docs/WEATHER_ARCHITECTURE.md` + `docs/WEATHER_RISK_MANAGEMENT.md` |
+| Understand what's running and why, from zero | `docs/copy-trading/SYSTEM_ARCHITECTURE.md` |
+| Know exactly what risk rules are enforced, and why | `docs/copy-trading/RISK_MANAGEMENT.md` |
+| Get the engineering-level detail (file/function names, DB ownership, runbooks) | `docs/copy-trading/SAFETY.md` |
+| Understand the (planned, architecture-only) Weather Bot | `docs/weather/WEATHER_ARCHITECTURE.md` + `docs/weather/WEATHER_RISK_MANAGEMENT.md` |
 | Get oriented as a new operator/contributor | `docs/OPERATOR_ONBOARDING.md` |
 | See what's done, what's in flight, and what's explicitly on hold | `docs/CURRENT_STATE.md` |
 
@@ -36,23 +36,23 @@ understanding what you're changing — see `docs/RISK_MANAGEMENT.md` before touc
 2. **Weather Bot** (architecture documented, no code yet) — a separate, intentionally isolated
    arbitrage bot that will eventually share this repo's dashboard and database, but has no logic
    yet (`packages/weather/` is an empty scaffold). Full design — data flow, schema, scheduling,
-   and risk rules — is written up in `docs/WEATHER_ARCHITECTURE.md` /
-   `docs/WEATHER_RISK_MANAGEMENT.md` ahead of any implementation. Never mix its logic with the
+   and risk rules — is written up in `docs/weather/WEATHER_ARCHITECTURE.md` /
+   `docs/weather/WEATHER_RISK_MANAGEMENT.md` ahead of any implementation. Never mix its logic with the
    Copy Bot's.
 
 ## Running it
 
 - **The trading loop:** `python3 -u bot.py` (needs a logged-in `bullpen` CLI session — run
   `bullpen status` first). It polls for new trades from the tracked wallets every 30 seconds; see
-  `docs/SYSTEM_ARCHITECTURE.md` §4 for the full cycle.
+  `docs/copy-trading/SYSTEM_ARCHITECTURE.md` §4 for the full cycle.
 - **The built-in dashboard** (quick, no build step): `python3 dashboard.py`, then open
   `http://localhost:8787`.
 - **The Next.js dashboard** (in progress, Overview page only): `pnpm dev` inside
   `apps/dashboard/` — see `apps/dashboard/README.md`.
 - **The wallet-research scripts** (manual, one-off, TypeScript): `pnpm scan:leaderboard` then
-  `pnpm scan:wallets` from the repo root — see `docs/SYSTEM_ARCHITECTURE.md` §4C for what each
+  `pnpm scan:wallets` from the repo root — see `docs/copy-trading/SYSTEM_ARCHITECTURE.md` §4C for what each
   does. These currently only *score* wallets; the bot doesn't trade off their output yet
-  (`docs/RISK_MANAGEMENT.md` Rule 2).
+  (`docs/copy-trading/RISK_MANAGEMENT.md` Rule 2).
 
 ## Repo layout at a glance
 
@@ -71,5 +71,5 @@ polymarket-copybot/
     └── shared/         ← empty scaffold, not built
 ```
 
-See `docs/SYSTEM_ARCHITECTURE.md` §2 for why the repo is split this way (`apps/` vs. `packages/`,
+See `docs/copy-trading/SYSTEM_ARCHITECTURE.md` §2 for why the repo is split this way (`apps/` vs. `packages/`,
 and why Python and TypeScript both write to the exact same database file).
