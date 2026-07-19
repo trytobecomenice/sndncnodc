@@ -255,41 +255,72 @@ important; not needed for the "make today's trading decision" use case this serv
 
 ## 3. Execution cycle
 
-No scheduling infrastructure exists anywhere in this repo today (checked: zero `node-cron`,
-`setInterval`, `cron.schedule`, `vercel.json`, or `.github/workflows` usage). The Copy Bot's
-research pipeline is manual by design (`pnpm scan:leaderboard`, run monthly, by a human). Weather
-can't be: forecasts and prices go stale in hours, not months, so this needs real unattended
-scheduling — new infrastructure for this repo, not a copy of an existing pattern.
+**BUILT AND LIVE-VERIFIED (2026-07-20) — `runWeatherLoop.ts` + one `launchd` job, refining (not
+reversing) the original design below.** The original plan was one `launchd` job PER cadence,
+explicitly to avoid a long-running always-on orchestrator process (reasoning preserved below,
+since it still explains the "not always-on" constraint this design also respects). Joey's explicit
+instruction this session (2026-07-20) asked for one master runner script + one `.plist` instead —
+resolved by making the single script internally cadence-aware (a small JSON state file tracks each
+gated step's last-run time) rather than either contradicting the original non-persistent-process
+goal or building N separate jobs. **The orchestrator itself is still not a long-running process**
+— `launchd` spawns it fresh on each hourly tick, it runs for seconds-to-minutes, then exits; the
+original concern (a second always-on Node process alongside `bot.py`) doesn't apply either way.
 
-**Mechanism: OS-level `launchd`** (this runs on a Mac), one job per cadence below, **not** a
-long-running orchestrator process. Chosen over a `node-cron`-based orchestrator specifically to
-avoid stacking a second always-on Node process next to `bot.py` — `docs/copy-trading/SAFETY.md` §3 already
-documents an unresolved "nothing restarts a dead process" gap for `bot.py`; a second orchestrator
-process would compound that same accepted risk rather than just adding a new one.
+**Sequence, per run**: Ingest (`ingestMetar.ts` every tick; `discoverMarkets.ts` daily-gated;
+`ingestOpenMeteo.ts` 4h-gated) → Prune (`pruneForecasts.ts` only when ensemble ingest just ran;
+`pruneHistorical.ts` daily-gated) → Check Markets (`checkMarkets.ts`, every tick, **critical** —
+see Rule 18) → Order Builder (`orderBuilder.ts`) → Early Exit (`earlyExit.ts`) → PnL Snapshot
+(`updatePnl.ts`, always attempted last). Full failure-handling and cadence-gating detail:
+`docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 18.
 
-| Job | Cadence | Why |
+| Job | Cadence (as actually implemented) | Why |
 |---|---|---|
-| Historical backfill | One-time per station, on onboarding | A backfill, not a stream — capped at 1-2 years per Rule 2 |
-| Daily historical obs | Daily | Official daily obs finalize once |
-| Historical data pruning | Daily, paired with the above | Enforces Rule 2's rolling retention window |
-| Forecast snapshot refresh | Every 3-6h | Open-Meteo/NWS update a few times a day |
-| **Ensemble forecast refresh** (`ingestOpenMeteo.ts`, planned) | **Every 3-6h**, same cadence as forecast snapshot | ~82 members × 43 stations × ~10 forecast days ≈ 35,000 rows per cycle — needs its own short retention (Rule 13, planned), not a "run more often than needed" cost |
-| METAR nowcast pull | Hourly, same-day markets only | Cheap, high-value intraday signal — forecast input, never settlement |
-| Market discovery | Daily | New city/day events appear roughly daily |
-| Price refresh + edge recompute | Every 1-2h | Cheap `bullpen` calls; price moves faster than forecast |
-| Position management | Same cadence as price refresh | Runs the Rule 3 anomaly gate on every check |
-| **Wunderground settlement verification** | **On-demand only** — once per new mapping, once per position pre-closeout | **Deliberately never polled — see `docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 4** |
-| PnL rollup | Daily or after each position pass | Cheap aggregate query |
+| Historical backfill | One-time per station, on onboarding — **not** part of the hourly loop | A backfill, not a stream — capped at 1-2 years per Rule 2; re-running it hourly would be a wasteful full-fleet sweep for data that doesn't change that often |
+| METAR nowcast pull | Every hourly tick | Cheap, high-value intraday signal — forecast input, never settlement |
+| Market discovery | Gated to ~daily within the hourly orchestrator | New city/day events appear roughly daily; running the 100-event scan hourly was judged unnecessary |
+| Ensemble forecast refresh (`ingestOpenMeteo.ts`) | Gated to ~4h within the hourly orchestrator | ~82 members × 43 stations × ~10 forecast days ≈ 35,000 rows per cycle — real, avoidable API/DB load if run hourly instead |
+| Forecast/ensemble pruning | Runs immediately after ensemble ingest, same gated tick | Only meaningful right after new data lands |
+| Historical data pruning | Gated to ~daily within the hourly orchestrator | Enforces Rule 2's rolling retention window |
+| Price refresh + edge recompute (`checkMarkets.ts`) | Every hourly tick | Cheap `bullpen` calls; price moves faster than forecast |
+| Order Builder / Early Exit | Every hourly tick, immediately after Check Markets succeeds | Matches the "position management" cadence the original table specified |
+| **Wunderground settlement verification** | **On-demand only** — once per new mapping, once per position pre-closeout | **Deliberately never polled, and NOT part of the orchestrator at all — see `docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 4** |
+| PnL rollup (`updatePnl.ts`) | Every hourly tick, always attempted last | Cheap aggregate query; doesn't strictly depend on this tick's fresh Check Markets data |
 
 This mirrors, at the scheduling level, the same cheap/frequent-vs-expensive/slower instinct the
 Copy Bot's `scoreWallets.ts` already uses within a single run (its pass-1/pass-2 design).
+
+**Activation — deliberately not done yet.** The `.plist`
+(`packages/weather/launchd/com.copybot.weather.loop.plist`) was written and live-tested, including
+under a simulated launchd environment (`env -i` with a minimal `PATH`, no inherited shell state) —
+this test caught two real bugs before activation, not after (see Rule 18 for both). `launchctl
+load` has NOT been run; Joey chose to review and activate it herself when ready
+(`AskUserQuestion`, 2026-07-20) rather than have it activated automatically. Exact commands, for
+whenever that is:
+
+```bash
+# Install (copies the plist into the per-user LaunchAgents directory, then loads it)
+mkdir -p ~/Library/LaunchAgents
+cp /Users/joeychan/polymarket-copybot/packages/weather/launchd/com.copybot.weather.loop.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.copybot.weather.loop.plist
+
+# Confirm it's loaded (prints its PID if currently running, "-" if idle between ticks, and its last exit status)
+launchctl list | grep com.copybot.weather.loop
+
+# Watch it run (RunAtLoad=true means the load command above also triggers an immediate first run)
+tail -f /Users/joeychan/polymarket-copybot/packages/weather/data/weather-loop.log
+tail -f /Users/joeychan/polymarket-copybot/packages/weather/data/weather-loop.error.log
+
+# Stop and uninstall
+launchctl unload ~/Library/LaunchAgents/com.copybot.weather.loop.plist
+rm ~/Library/LaunchAgents/com.copybot.weather.loop.plist
+```
 
 ---
 
 ## 4. Proposed `packages/weather/` structure
 
 `packages/weather/` is now a real, wired-in pnpm workspace member — `package.json`/`tsconfig.json`
-exist, and twenty-four scripts/modules are built, tested, and live-verified against `data/app.db` and
+exist, and twenty-nine scripts/modules are built, tested, and live-verified against `data/app.db` and
 real Polymarket/Open-Meteo data (2026-07-19 through 2026-07-20). Structure mirrors
 `packages/copy-trading`'s conventions: plain
 `tsx`-executed scripts, an `isMainModule` guard so files stay test-importable, vitest for
@@ -334,16 +365,22 @@ packages/weather/
     exitSignals.ts                      # BUILT ✅ — Rule 16, pure profit-target/stop-loss decision math
     exitSignals.test.ts                 # BUILT ✅ — 11 tests
     earlyExit.ts                        # BUILT ✅ — Rule 16, the Early-Exit Engine: scans open positions, auto-closes on profit-target/stop-loss
-    updatePnl.ts                        # not yet built — weather_pnl_snapshot rollup
+    constants.ts                        # BUILT ✅ — Rule 17, shared WEATHER_PAPER_BANKROLL_USD (correctness-critical, not left as two independent copies)
+    updatePnl.ts                        # BUILT ✅ — Rule 17, the Portfolio Rollup: equity curve, one weather_pnl_snapshot row per run
+    runWeatherLoop.ts                   # BUILT ✅ — Rule 18, the Orchestrator: cadence-aware, runs the full pipeline in sequence
+  launchd/
+    com.copybot.weather.loop.plist      # BUILT ✅ — Rule 18, hourly launchd job — written and tested, NOT YET ACTIVATED (Joey's call)
 ```
 
 `packages/weather/package.json` scripts, built: `ingest:metar`, `prune:historical`,
 `discover:markets`, `backfill:historical`, `ingest:openmeteo`, `prune:forecasts`,
-`calculate:probability`, `check:markets`, `build:orders`, `check:exits`. Not yet built:
-`update-pnl`. Each is its own future `launchd` job (mechanism decided, jobs not yet scheduled — see
-§3). `verifySettlement.ts` deliberately has **no** script/job of its own — it's a function called
-from `discoverMarkets.ts`, never an independent poll (position closeout is now `earlyExit.ts`'s
-job, not a `managePositions.ts` that never got built).
+`calculate:probability`, `check:markets`, `build:orders`, `check:exits`, `update:pnl`, `run:loop`.
+`run:loop` (`runWeatherLoop.ts`) supersedes the original "one `launchd` job per script" plan — see
+§3 for the cadence-aware single-orchestrator design and why it doesn't reintroduce the always-on-
+process problem the original plan was written to avoid. `verifySettlement.ts` deliberately has
+**no** script/job of its own — it's a function called from `discoverMarkets.ts`, never an
+independent poll, and deliberately not part of the orchestrator either (Rule 4/5's on-demand-only
+requirement).
 
 ---
 
@@ -351,12 +388,10 @@ job, not a `managePositions.ts` that never got built).
 
 - NOAA ingestion and the live Wunderground fetch (`verifySettlement.ts`) — see §4's file table for
   the current built/not-built split.
-- **`weather_pnl_snapshot` rollup** (`updatePnl.ts`) — `earlyExit.ts` (Rule 16) now computes and
-  writes `realizedPnlUsd` per closed position, but nothing yet aggregates that into a
-  portfolio-level snapshot (realized + unrealized totals, win rate).
+- **Activating the scheduler** — the `.plist` is written and tested but `launchctl load` has not
+  been run; see §3 and `docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 18 for why this is Joey's
+  call, not a technical gap.
 - The `weather_rule_set` table.
-- `launchd` plist files themselves (mechanism decided; concrete job definitions come with the
-  scripts they invoke).
 
 ## Critical files
 

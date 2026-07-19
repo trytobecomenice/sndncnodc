@@ -27,6 +27,7 @@
 import { and, desc, eq } from "drizzle-orm";
 import { db, weatherMarketMapping, weatherProbabilityEstimate, weatherStation } from "@copybot/db";
 import { type ThresholdRange } from "./calculateProbability";
+import { WEATHER_PAPER_BANKROLL_USD } from "./constants";
 import { hasOpenPosition, insertPaperTradeOrder } from "./db/writers";
 import { checkEdgeFloor, checkTempBuffer, computeKellyFraction, computePositionSize } from "./orderSizing";
 import { checkStaleness } from "./staleness";
@@ -37,8 +38,6 @@ const MIN_EDGE_FLOOR = 0.05; // Rule 7 — 5 percentage points, same order of ma
 const TEMP_BUFFER_F = 1.5; // Rule 12, Joey's stated default.
 const KELLY_MULTIPLIER = 0.25; // Quarter-Kelly, Joey's call 2026-07-20.
 const MAX_CAPITAL_PER_TRADE = 0.05; // Rule 11, Joey's stated default.
-const WEATHER_PAPER_BANKROLL_USD = 10000; // Mock capital base, Joey's stated default 2026-07-20 —
-// resolves the "no PAPER_BANKROLL_USD-equivalent exists yet" gap Rule 11 was blocked on.
 
 interface ActiveMapping {
   marketSlug: string;

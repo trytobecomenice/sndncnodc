@@ -10,6 +10,7 @@ import {
   db,
   weatherMarketMapping,
   weatherMarketOddsSnapshot,
+  weatherPnlSnapshot,
   weatherPosition,
   weatherProbabilityEstimate,
   weatherStation,
@@ -260,5 +261,29 @@ export async function insertPaperTradeOrder(params: InsertPaperTradeOrderParams)
     tempBufferF: params.tempBufferF,
     fullKellyFraction: params.fullKellyFraction,
     appliedFraction: params.appliedFraction,
+  });
+}
+
+export interface InsertPnlSnapshotParams {
+  realizedPnlUsd: number;
+  unrealizedPnlUsd: number;
+  openPositionsCount: number;
+  winRate: number | null;
+  availableCashUsd: number;
+  totalEquityUsd: number;
+}
+
+/** Portfolio Rollup (Joey, 2026-07-20) — one append-only weather_pnl_snapshot row per
+ * updatePnl.ts run, the equity-curve time series. Same append-only research-log pattern as
+ * weather_probability_estimate and the Copy Bot's leaderboard_scan — every run adds a new point,
+ * nothing is ever overwritten. */
+export async function insertPnlSnapshot(params: InsertPnlSnapshotParams): Promise<void> {
+  await db.insert(weatherPnlSnapshot).values({
+    realizedPnlUsd: params.realizedPnlUsd,
+    unrealizedPnlUsd: params.unrealizedPnlUsd,
+    openPositionsCount: params.openPositionsCount,
+    winRate: params.winRate,
+    availableCashUsd: params.availableCashUsd,
+    totalEquityUsd: params.totalEquityUsd,
   });
 }

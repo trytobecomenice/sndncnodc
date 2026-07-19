@@ -18,11 +18,13 @@ before proposing a new restriction so a decision already made here doesn't get s
 re-thought. `docs/weather/WEATHER_ARCHITECTURE.md` is the companion: data flow, schema, and scheduling
 detail that explains *how* these rules get implemented mechanically.
 
-**Rules 1-16 are implemented and live-verified except where noted (the anomaly-detector's general
-bounds-check and `verifySettlement.ts` still planned, see Roadmap). Rule 14 (the EV Bridge), Rule
-15 (the Order Builder — Rules 7/11/12 now actually enforced), and Rule 16 (the Early-Exit Engine —
-profit-target/stop-loss, closing the position lifecycle) are all implemented and live-verified
-end-to-end as of 2026-07-20.**
+**Rules 1-18 are implemented and live-verified except where noted (the anomaly-detector's general
+bounds-check and `verifySettlement.ts` still planned, see Roadmap). Rules 14-17 (the EV Bridge, the
+Order Builder, the Early-Exit Engine, the Portfolio Rollup) are all implemented and live-verified
+end-to-end as of 2026-07-20. Rule 18 (the Orchestrator + `launchd` Scheduler) is implemented and
+tested — including under a simulated launchd environment, which caught two real bugs — but NOT YET
+ACTIVATED; see Rule 18 for why, and `docs/weather/WEATHER_ARCHITECTURE.md` §3 for the exact
+`launchctl` commands to activate it.**
 
 This document is intentionally separate from `docs/copy-trading/RISK_MANAGEMENT.md` (the Copy Bot's rules
 ledger) — per `.claudeprompt`, the two systems' rules, like their code and schema, must never be
@@ -947,6 +949,125 @@ when the odds-history table was first built.
 
 ---
 
+## 17. Portfolio Rollup — equity curve tracking
+
+**What it does:** one snapshot of total paper portfolio equity per run, so performance can be
+tracked over time rather than only inferred from individual position rows.
+
+**How it works mechanically: implemented and live-verified (2026-07-20), `updatePnl.ts`.**
+`weather_pnl_snapshot` (a pre-existing, previously-unused table) gained two new columns —
+`available_cash_usd`, `total_equity_usd` (migration `0007_illegal_jane_foster.sql`) — alongside its
+existing `realized_pnl_usd`/`unrealized_pnl_usd`/`open_positions_count`/`win_rate`. Every run
+computes: `costBasisOpen` (sum of `ourSizeUsd` across open positions), `markToMarketValue` (sum of
+current price × shares for open positions, side-adjusted — a "No" position's current price is
+`1 - latestImpliedYesProb` from the freshest `weather_market_odds_snapshot` row), `unrealizedPnlUsd
+= markToMarketValue - costBasisOpen`, and cumulative `realizedPnlUsd` across every closed position
+ever (not just this period, since an equity-curve point represents total portfolio state at that
+instant). `availableCashUsd = WEATHER_PAPER_BANKROLL_USD - costBasisOpen + cumulativeRealizedPnlUsd`
+— algebraically equivalent to replaying every debit-on-open/credit-on-close from the start without
+needing the full trade history each time. `totalEquityUsd = availableCashUsd + markToMarketValue`.
+**`WEATHER_PAPER_BANKROLL_USD` moved to a new shared `constants.ts`**, imported by both
+`orderBuilder.ts` and `updatePnl.ts` — deliberately NOT left as two independent local copies (this
+codebase's usual per-script-constant convention) specifically because a bankroll figure drifting
+between the sizing script and the accounting script would silently corrupt the equity math itself,
+a different and higher-stakes kind of inconsistency than two unrelated tunables disagreeing.
+**Live-verified**: run against the 3 real open Seoul positions, `availableCashUsd + markToMarket`
+matched `totalEquityUsd` exactly by construction, confirmed against hand-computed arithmetic.
+
+**System costs & trade-offs:** append-only, like every other research-log table in this schema —
+no `weather_pnl_snapshot` row is ever corrected after the fact, so a bug in the accounting logic
+would need a genuinely new snapshot to show the fix, not an edit to history. `WEATHER_PAPER_BANKROLL_USD`
+is still a static mock constant, not a real tracked capital pool — see Rule 15/Roadmap for the
+pre-existing caveat this doesn't resolve.
+
+**Why it exists:** direct instruction (Joey, 2026-07-20) — "track our equity curve over time." No
+prior component computed a single number representing total portfolio state; `weather_position`
+rows show individual trades, not the portfolio.
+
+---
+
+## 18. The Orchestrator and Scheduler
+
+**What it does:** `runWeatherLoop.ts` runs the full pipeline (Ingest → Prune → Check Markets →
+Order Builder → Early Exit → PnL Snapshot) in the correct sequence, as a single script a `launchd`
+job can invoke on a schedule.
+
+**How it works mechanically: implemented and live-verified (2026-07-20), including under a
+launchd-equivalent restricted environment, not just an interactive shell.**
+
+- **Cadence-aware within one script, not one uniform interval — Joey's explicit call (asked and
+  confirmed via `AskUserQuestion`, not assumed).** A single hourly tick does not mean every step
+  runs every hour: `ingestMetar.ts`/`checkMarkets.ts`/`orderBuilder.ts`/`earlyExit.ts`/`updatePnl.ts`
+  run every tick (matching their own already-documented hourly/1-2h cadence), while
+  `ingestOpenMeteo.ts` (paired with `pruneForecasts.ts`) only actually runs once its own 4h
+  interval has elapsed, and `discoverMarkets.ts`/`pruneHistorical.ts` only run once a 24h interval
+  has elapsed — tracked via a small JSON state file
+  (`packages/weather/data/orchestrator-state.json`, gitignored — machine-local runtime state, not
+  source). Avoids real, avoidable waste: running `ingestOpenMeteo.ts`'s ~35,000-row ensemble fetch
+  or a 43-station `discoverMarkets.ts`/`pruneHistorical.ts` sweep every hour instead of their
+  documented cadence, against sources that don't update that often.
+- **Each step runs as a real subprocess** (`node <tsx cli.mjs> src/<script>.ts`, not an in-process
+  function import) — deliberately: this is exactly what a human runs manually today via `pnpm
+  <script>`, so there's no risk of subtly different behavior, and a hung/crashed step can't take
+  the orchestrator process down with it.
+- **Failure handling**: `checkMarkets.ts` is treated as critical — if it fails, Order Builder and
+  Early Exit are both skipped for that run (they'd otherwise act on stale `weather_probability_estimate`
+  data), but PnL Snapshot still runs regardless (mark-to-market and realized PnL don't strictly
+  depend on this tick's fresh data). All other ingest/prune steps log a failure and continue rather
+  than aborting the whole run. **Live-verified, not just designed**: a real failure was deliberately
+  provoked (see the launchd-environment note below) and the orchestrator behaved exactly as
+  designed — skipped Order Builder/Early Exit, still ran PnL Snapshot, exited nonzero.
+- **Absolute paths throughout, and a real launchd-specific bug found and fixed by testing under
+  the actual restricted environment, not assuming it would work.** `runWeatherLoop.ts` resolves
+  every path from `process.execPath`/`import.meta.url`, never `process.cwd()` or a bare command
+  name — same defensive pattern `packages/db/src/env.ts` already uses for the database path.
+  **Found live**: `tsx`'s own `.bin/tsx` is a `/bin/sh` wrapper script that falls back to a PATH
+  lookup for `node` when no node binary sits next to it (confirmed by reading the wrapper script
+  directly) — under launchd's minimal PATH (no `~/.local/bin`, no version-manager shims) this
+  lookup fails, exactly as it would for a bare `node` command. Fixed by invoking
+  `process.execPath` (this process's own actual node binary — self-referential, correct under any
+  environment) directly against tsx's real `cli.mjs`, bypassing the wrapper for every subprocess
+  the orchestrator spawns, not just for how launchd invokes the orchestrator itself. **A second
+  real bug found the same way**: simulating launchd's exact restricted environment via `env -i`
+  with a minimal `PATH` reproduced a genuine failure — `bullpen polymarket discover ... exited 1` —
+  because `bullpen` (a separate CLI `@copybot/bullpen-client` shells out to, used by
+  `checkMarkets.ts`/`discoverMarkets.ts`) lives at `/Users/joeychan/.bullpen/bin`, a directory not
+  on any default/minimal PATH. Fixed by adding it to the `.plist`'s explicit `PATH`. **Both bugs
+  would have gone completely undetected without this restricted-environment test** — every
+  interactive-shell run this whole session inherited a full, correct PATH, masking both gaps.
+- **`packages/weather/launchd/com.copybot.weather.loop.plist`** — hourly (`StartInterval=3600`),
+  `RunAtLoad=true` (verifies the pipeline works immediately on load, not just after the first
+  hour), explicit `PATH`/`HOME` in `EnvironmentVariables` (launchd inherits neither from a login
+  shell), stdout/stderr redirected to `packages/weather/data/weather-loop*.log`. No `.env` file
+  exists in this repo as of 2026-07-20 — `packages/db/src/env.ts` already resolves the database
+  path independent of environment variables or cwd, so none was required for this to work; the
+  plist documents in a comment what to do if one is added later.
+
+**NOT YET ACTIVATED — a deliberate, explicit choice, not an oversight.** The `.plist` was written
+and fully tested (including under a simulated launchd environment), but `launchctl load` has NOT
+been run. This would be the first fully unattended, autonomous loop this bot has ever run — every
+prior `checkMarkets.ts`/`orderBuilder.ts`/`earlyExit.ts` invocation this entire project has been
+manually triggered and reviewed. Zero real settlement history exists yet to validate the blend
+weights, edge floor, or Kelly sizing (all already flagged elsewhere in this document as
+uncalibrated). Joey was asked directly (`AskUserQuestion`, 2026-07-20) whether to activate it now
+or review the exact `launchctl` commands and activate it herself when ready — she chose the latter.
+The exact commands are recorded in `docs/weather/WEATHER_ARCHITECTURE.md` §3.
+
+**System costs & trade-offs:** the cadence-tracking state file means a machine that's asleep or off
+across an entire interval simply runs that step whenever it next wakes and ticks — `launchd`'s
+`StartInterval` behaves this way by design (no missed-run backlog/catch-up burst), which is
+appropriate for this use case but worth knowing rather than assuming. The restricted-environment
+testing this rule documents found two real bugs — a strong argument that "it works when I run it
+interactively" is not sufficient evidence for anything meant to run under `launchd`, `cron`, or any
+other non-interactive scheduler, in this codebase or elsewhere.
+
+**Why it exists:** direct instruction (Joey, 2026-07-20) — "The Orchestrator" and "The Scheduler."
+The engineering note Joey specifically flagged in advance (absolute paths, launchd's restricted
+environment) turned out to be exactly right — both real bugs found during testing were precisely
+the class of failure that note anticipated.
+
+---
+
 ## Roadmap / explicitly not yet built
 
 - `detectAnomaly.ts`'s general bounds-check (physically-impossible-jump detection on raw
@@ -960,20 +1081,13 @@ when the odds-history table was first built.
   (0.25), `TEMP_BUFFER_F` (1.5), `STALE_CUTOFF_HOUR` (18:00) — all are explicitly-flagged starting
   values, not empirically derived. Needs real paper-trade settlement outcomes to validate against;
   the 3 real positions opened 2026-07-20 are the first data toward that.
-- **`weather_pnl_snapshot` rollup** — `earlyExit.ts` (Rule 16) now computes and writes
-  `realizedPnlUsd` per closed position, but nothing yet aggregates that into a portfolio-level
-  `weather_pnl_snapshot` row (realized + unrealized totals, open position count, win rate) the way
-  the Copy Bot's `paper:update-pnl` does. The per-position data now exists; the rollup script over
-  it does not.
-- **Scheduling for `earlyExit.ts`** — real gap named in Rule 16: exit evaluation is only as timely
-  as how often `checkMarkets.ts` is manually re-run. No `launchd` job exists yet for either script
-  (see Execution Cycle, `docs/weather/WEATHER_ARCHITECTURE.md` §3), so genuine "swing trading"
-  timeliness isn't there yet.
-- `WEATHER_PAPER_BANKROLL_USD` is currently a static mock constant (10,000), not a real,
-  accounted-for capital base — Rule 11's sizing math is correct, but nothing yet tracks capital
-  consumed by open positions against it (a second open position sized off the same static 10,000
-  rather than remaining capital), which the small open-position count right now doesn't yet expose
-  but a larger one would.
+- **Activating the scheduler** — the `.plist` (Rule 18) is written and tested but `launchctl load`
+  has deliberately not been run yet; this is Joey's call to make when she's ready, not a technical
+  gap. Once activated, `earlyExit.ts`'s timeliness (Rule 16's own named limitation) is resolved
+  automatically, since it runs every hourly tick alongside everything else.
+- `WEATHER_PAPER_BANKROLL_USD` is a static mock constant (10,000) — Rule 17's accounting math
+  against it is correct and now shared via `constants.ts` (Rule 17), but it's still a fixed
+  starting figure, not a real capital pool with any external funding/withdrawal mechanism.
 - The `weather_rule_set` table, if/when entry-threshold logic needs its own versioned audit trail.
 - `launchd` plist files (mechanism decided in `docs/weather/WEATHER_ARCHITECTURE.md`; concrete job
   definitions come with the scripts they invoke).

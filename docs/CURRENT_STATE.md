@@ -4,7 +4,7 @@
 "Last reviewed" date below before trusting a number in here over the live system (`bot.out.log`,
 `data/app.db`, `bullpen status`).
 
-**Last reviewed: 2026-07-20** (updated same-day: Weather Bot Early-Exit Engine — `earlyExit.ts` — built and live-verified; profit-target/stop-loss auto-close now closes the position lifecycle)
+**Last reviewed: 2026-07-20** (updated same-day: Weather Bot Orchestrator + Scheduler + Portfolio Rollup — `runWeatherLoop.ts`/`updatePnl.ts`/`launchd` `.plist` — built and live-tested including under a simulated launchd environment; scheduler NOT YET activated, Joey's call)
 
 ## Snapshot, right now
 
@@ -172,12 +172,44 @@
   correctly triggered `stop_loss_temp_buffer` instead — proving the priority order (danger signal
   beats a currently-strong edge) works as designed. All 3 real Seoul positions independently
   evaluated correctly as HOLD in both runs. 81 unit tests passing across the weather package.
-  **Real gap named, not hidden**: exit timeliness is bounded by how often `checkMarkets.ts` is
-  manually re-run — no scheduler exists yet for either script, so this isn't yet genuine real-time
-  swing trading. Still not built: `verifySettlement.ts` (the live Wunderground/Playwright fetch —
-  deliberately deferred as its own step), `detectAnomaly.ts`'s general bounds-check,
-  `weather_pnl_snapshot`'s portfolio-level rollup. Full design in
-  `docs/weather/WEATHER_ARCHITECTURE.md` / `docs/weather/WEATHER_RISK_MANAGEMENT.md`.
+  **Real gap named, not hidden at the time**: exit timeliness was bounded by how often
+  `checkMarkets.ts` was manually re-run — resolved by this same-day phase's Orchestrator.
+- **The Portfolio Rollup, the Orchestrator, and the Scheduler — all built and live-verified**
+  (2026-07-20; `constants.ts`, `updatePnl.ts`, `runWeatherLoop.ts`, 27th-29th scripts; migration
+  `0007_illegal_jane_foster.sql` extends `weather_pnl_snapshot`; new
+  `packages/weather/launchd/com.copybot.weather.loop.plist`). **`updatePnl.ts`** computes one
+  equity-curve snapshot per run: available cash (bankroll minus capital tied up in open positions,
+  plus cumulative realized PnL) plus mark-to-market value of open positions, summing to total
+  equity — verified against the 3 real Seoul positions with hand-checked arithmetic matching
+  exactly. `WEATHER_PAPER_BANKROLL_USD` moved to a new shared `constants.ts` (imported by both
+  `orderBuilder.ts` and `updatePnl.ts`) specifically because this ONE constant drifting between
+  the sizing script and the accounting script would silently corrupt the equity math itself — a
+  deliberate exception to this codebase's usual per-script-constant convention. **`runWeatherLoop.ts`**
+  runs the full pipeline (Ingest → Prune → Check Markets → Order Builder → Early Exit → PnL
+  Snapshot) as one script, internally cadence-aware via a small JSON state file — Joey's explicit
+  choice (via `AskUserQuestion`) over either a uniform hourly run-everything design (would waste
+  ~3-6x the Open-Meteo API calls and run a 43-station discovery/pruning sweep every hour instead
+  of daily) or reverting to N separate `launchd` jobs. **Two real bugs found and fixed by
+  deliberately testing under a simulated launchd environment (`env -i` with a minimal `PATH`),
+  not just an interactive shell** — both would have gone completely undetected otherwise, since
+  every prior interactive run inherited a full, correct `PATH`: (1) `tsx`'s own `.bin/tsx` wrapper
+  script falls back to a PATH lookup for `node` that fails under launchd's minimal PATH — fixed by
+  invoking `process.execPath` directly against tsx's real `cli.mjs`, bypassing the wrapper
+  entirely, for every subprocess the orchestrator spawns; (2) `bullpen` (the CLI `checkMarkets.ts`/
+  `discoverMarkets.ts` shell out to) lives at `/Users/joeychan/.bullpen/bin`, not on any default
+  PATH — fixed by adding it to the `.plist`'s explicit `PATH`. After both fixes, a full run under
+  the exact restricted environment launchd would use completed cleanly end-to-end, exit code 0.
+  **Deliberately NOT activated**: `launchctl load` has not been run — this would be the first
+  fully unattended, autonomous loop this bot has ever run, and zero real settlement history exists
+  yet to validate the blend weights/edge floor/Kelly sizing. Joey chose (via `AskUserQuestion`) to
+  review and activate it herself when ready rather than have it activated automatically; the exact
+  `launchctl load`/`unload` commands are recorded in `docs/weather/WEATHER_ARCHITECTURE.md` §3.
+  81 unit tests still passing (no new pure-function modules needing tests this phase — both new
+  scripts are DB/subprocess orchestrators, tested live instead, per this codebase's existing
+  pattern for that category of script). Still not built: `verifySettlement.ts` (the live
+  Wunderground/Playwright fetch — deliberately deferred as its own step), `detectAnomaly.ts`'s
+  general bounds-check. Full design in `docs/weather/WEATHER_ARCHITECTURE.md` /
+  `docs/weather/WEATHER_RISK_MANAGEMENT.md`.
 - **Database schema ownership:** TypeScript/Drizzle owns schema and migrations; Python
   (`db.py`) uses CRUD only — see `docs/copy-trading/SAFETY.md` §2.
 

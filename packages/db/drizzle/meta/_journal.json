@@ -50,6 +50,13 @@
       "when": 1784495356923,
       "tag": "0006_goofy_grey_gargoyle",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1784497879963,
+      "tag": "0007_illegal_jane_foster",
+      "breakpoints": true
     }
   ]
 }

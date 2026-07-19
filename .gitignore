@@ -25,4 +25,7 @@ data/*.db-journal
 
 # env
 .env
+
+# Orchestrator runtime state (machine-local cadence bookkeeping, not source)
+packages/weather/data/
 .env.local

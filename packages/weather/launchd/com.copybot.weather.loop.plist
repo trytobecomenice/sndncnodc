@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.copybot.weather.loop</string>
+
+    <!--
+      Every path below is absolute, deliberately (see runWeatherLoop.ts's module comment for the
+      full "crucial engineering note"): launchd runs with no login shell and a minimal PATH that
+      does NOT include this machine's actual node install. node is invoked directly against tsx's
+      real cli.mjs entry point, never through tsx's own .bin/tsx wrapper (which falls back to a
+      PATH lookup for node that would fail here).
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/joeychan/.local/bin/node</string>
+        <string>/Users/joeychan/polymarket-copybot/packages/weather/node_modules/tsx/dist/cli.mjs</string>
+        <string>/Users/joeychan/polymarket-copybot/packages/weather/src/runWeatherLoop.ts</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/joeychan/polymarket-copybot/packages/weather</string>
+
+    <!--
+      No .env file exists in this repo as of 2026-07-20 (packages/db/src/env.ts already resolves
+      the database path from an absolute, code-relative path regardless of cwd/env — see its own
+      comment). PATH/HOME are still set explicitly here since launchd's default PATH is minimal
+      and some tooling (npm/node internals) expects HOME to be set. If a real .env is added later,
+      it is NOT auto-loaded by launchd — either add its keys here explicitly, or have
+      runWeatherLoop.ts load it itself (e.g. via `node --env-file`) before this plist needs editing.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- /Users/joeychan/.bullpen/bin is REQUIRED, not optional: checkMarkets.ts/discoverMarkets.ts
+             both shell out to the `bullpen` CLI (via @copybot/bullpen-client), which lives there —
+             confirmed live that launchd's restricted PATH otherwise fails this exact step with
+             "bullpen ... exited 1" (verified via `env -i` simulating launchd's real environment
+             before this fix, not assumed). -->
+        <key>PATH</key>
+        <string>/Users/joeychan/.local/bin:/Users/joeychan/.bullpen/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/joeychan</string>
+    </dict>
+
+    <!-- Hourly, per Joey's stated "logical interval." runWeatherLoop.ts is itself cadence-aware
+         internally for the slower-moving steps (ensemble ingest ~4h, discovery/pruning ~daily) —
+         see its own module comment — so this outer interval only needs to be the FASTEST cadence
+         any step actually needs (checkMarkets.ts / Order Builder / Early Exit's documented 1-2h,
+         rounded to the simpler "hourly"). -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <!-- Runs once immediately on `launchctl load`, in addition to the hourly interval — useful to
+         verify the pipeline actually works end-to-end under launchd's restricted environment
+         right away, not just in an interactive shell. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/joeychan/polymarket-copybot/packages/weather/data/weather-loop.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/joeychan/polymarket-copybot/packages/weather/data/weather-loop.error.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

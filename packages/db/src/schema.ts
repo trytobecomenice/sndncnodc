@@ -497,4 +497,10 @@ export const weatherPnlSnapshot = sqliteTable("weather_pnl_snapshot", {
   unrealizedPnlUsd: real("unrealized_pnl_usd").notNull(),
   openPositionsCount: integer("open_positions_count").notNull(),
   winRate: real("win_rate"),
+  // Portfolio Rollup (Joey, 2026-07-20) — the two components of "total paper portfolio equity"
+  // (available cash + mark-to-market value of open positions), stored separately as well as
+  // summed so the equity curve can be plotted from totalEquityUsd directly without needing to
+  // re-derive it from the other columns each time.
+  availableCashUsd: real("available_cash_usd"),
+  totalEquityUsd: real("total_equity_usd"),
 });
