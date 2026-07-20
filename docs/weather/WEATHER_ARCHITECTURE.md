@@ -91,6 +91,9 @@ weather_position  (the Order Builder — orderBuilder.ts, Rule 15: Kelly-sized p
         │   fresher checkMarkets.ts estimates, closes on profit-target (alpha decay below the same
         │   Rule 7 floor) or stop-loss (model inversion / temp-buffer failure) — paper-only,
         │   auto-closing, live-verified 2026-07-20
+        ├── settlePositions.ts (Rule 19): for a position held to expiration, marks it to
+        │   Polymarket's own on-chain resolution (bullpen polymarket event, NOT Wunderground —
+        │   see Rule 19 for why this differs from Rule 5's scope) — live-verified 2026-07-20
         ▼
 weather_pnl_snapshot  (rollup not yet built — see Roadmap)
 ```
@@ -268,8 +271,10 @@ original concern (a second always-on Node process alongside `bot.py`) doesn't ap
 
 **Sequence, per run**: Ingest (`ingestMetar.ts` every tick; `discoverMarkets.ts` daily-gated;
 `ingestOpenMeteo.ts` 4h-gated) → Prune (`pruneForecasts.ts` only when ensemble ingest just ran;
-`pruneHistorical.ts` daily-gated) → Check Markets (`checkMarkets.ts`, every tick, **critical** —
-see Rule 18) → Order Builder (`orderBuilder.ts`) → Early Exit (`earlyExit.ts`) → PnL Snapshot
+`pruneHistorical.ts` daily-gated) → **Settle Positions** (`settlePositions.ts`, every tick,
+unconditional — Rule 19, marks expired positions to Polymarket's own resolution, runs regardless
+of Check Markets' outcome) → Check Markets (`checkMarkets.ts`, every tick, **critical** — see Rule
+18) → Order Builder (`orderBuilder.ts`) → Early Exit (`earlyExit.ts`) → PnL Snapshot
 (`updatePnl.ts`, always attempted last). Full failure-handling and cadence-gating detail:
 `docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 18.
 
@@ -320,7 +325,7 @@ rm ~/Library/LaunchAgents/com.copybot.weather.loop.plist
 ## 4. Proposed `packages/weather/` structure
 
 `packages/weather/` is now a real, wired-in pnpm workspace member — `package.json`/`tsconfig.json`
-exist, and twenty-nine scripts/modules are built, tested, and live-verified against `data/app.db` and
+exist, and thirty scripts/modules are built, tested, and live-verified against `data/app.db` and
 real Polymarket/Open-Meteo data (2026-07-19 through 2026-07-20). Structure mirrors
 `packages/copy-trading`'s conventions: plain
 `tsx`-executed scripts, an `isMainModule` guard so files stay test-importable, vitest for
@@ -367,6 +372,7 @@ packages/weather/
     earlyExit.ts                        # BUILT ✅ — Rule 16, the Early-Exit Engine: scans open positions, auto-closes on profit-target/stop-loss
     constants.ts                        # BUILT ✅ — Rule 17, shared WEATHER_PAPER_BANKROLL_USD (correctness-critical, not left as two independent copies)
     updatePnl.ts                        # BUILT ✅ — Rule 17, the Portfolio Rollup: equity curve, one weather_pnl_snapshot row per run
+    settlePositions.ts                  # BUILT ✅ — Rule 19, the Settlement Engine: marks expired positions to Polymarket's own resolution
     runWeatherLoop.ts                   # BUILT ✅ — Rule 18, the Orchestrator: cadence-aware, runs the full pipeline in sequence
   launchd/
     com.copybot.weather.loop.plist      # BUILT ✅ — Rule 18, hourly launchd job — written and tested, NOT YET ACTIVATED (Joey's call)
@@ -374,7 +380,8 @@ packages/weather/
 
 `packages/weather/package.json` scripts, built: `ingest:metar`, `prune:historical`,
 `discover:markets`, `backfill:historical`, `ingest:openmeteo`, `prune:forecasts`,
-`calculate:probability`, `check:markets`, `build:orders`, `check:exits`, `update:pnl`, `run:loop`.
+`calculate:probability`, `check:markets`, `build:orders`, `check:exits`, `settle:positions`,
+`update:pnl`, `run:loop`.
 `run:loop` (`runWeatherLoop.ts`) supersedes the original "one `launchd` job per script" plan — see
 §3 for the cadence-aware single-orchestrator design and why it doesn't reintroduce the always-on-
 process problem the original plan was written to avoid. `verifySettlement.ts` deliberately has

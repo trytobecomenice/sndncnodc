@@ -1,6 +1,13 @@
 // The Orchestrator (Joey, 2026-07-20) — runs the full weather pipeline in the correct sequence:
-// Ingest -> Prune -> Check Markets -> Order Builder -> Early Exit -> PnL Snapshot. This is the
-// single script the launchd .plist invokes on an hourly tick.
+// Ingest -> Prune -> Settle Positions -> Check Markets -> Order Builder -> Early Exit -> PnL
+// Snapshot. This is the single script the launchd .plist invokes on an hourly tick.
+//
+// SETTLE POSITIONS runs unconditionally, independent of Check Markets' critical-failure gating
+// below — settlement only needs Polymarket's own resolution status (bullpen polymarket event),
+// not this tick's fresh weather_probability_estimate, so there's no reason to skip it just
+// because Check Markets failed. Placed right after Prune, before Check Markets, so a position
+// that's just been settled is already closed before Order Builder's duplicate-exposure guard and
+// Early Exit's freshness gate even look at it this same tick.
 //
 // CADENCE-AWARE BY DESIGN (Joey's explicit call, 2026-07-20): a single hourly tick does not mean
 // every step runs every hour. The Execution Cycle table (docs/weather/WEATHER_ARCHITECTURE.md §3)
@@ -155,21 +162,25 @@ async function main() {
     console.log("--- Prune: Historical — skipped, not due yet (daily cadence) ---");
   }
 
-  // 3. CHECK MARKETS — critical: everything downstream (Order Builder, Early Exit) needs the
+  // 3. SETTLE POSITIONS — always runs, unconditional (see module comment). Realizes final PnL for
+  // any position whose underlying Polymarket market has resolved since the last tick.
+  runStep("Settle Positions", "settlePositions.ts");
+
+  // 4. CHECK MARKETS — critical: everything downstream (Order Builder, Early Exit) needs the
   // fresh weather_probability_estimate rows this step produces. A failure here means those two
   // steps would only have stale data to act on, so they're skipped rather than run anyway.
   const checkMarketsResult = runStep("Check Markets", "checkMarkets.ts");
 
   if (checkMarketsResult.ok) {
-    // 4. ORDER BUILDER
+    // 5. ORDER BUILDER
     runStep("Order Builder", "orderBuilder.ts");
-    // 5. EARLY EXIT
+    // 6. EARLY EXIT
     runStep("Early Exit", "earlyExit.ts");
   } else {
     console.error("--- Check Markets failed — skipping Order Builder and Early Exit this run (stale data risk) ---");
   }
 
-  // 6. PNL SNAPSHOT — always attempted, even if Check Markets failed above: it marks open
+  // 7. PNL SNAPSHOT — always attempted, even if Check Markets failed above: it marks open
   // positions to market using whatever odds data already exists and rolls up realized PnL from
   // closed positions, neither of which strictly depends on this tick's checkMarkets run.
   runStep("PnL Snapshot", "updatePnl.ts");

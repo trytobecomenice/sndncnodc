@@ -18,13 +18,14 @@ before proposing a new restriction so a decision already made here doesn't get s
 re-thought. `docs/weather/WEATHER_ARCHITECTURE.md` is the companion: data flow, schema, and scheduling
 detail that explains *how* these rules get implemented mechanically.
 
-**Rules 1-18 are implemented and live-verified except where noted (the anomaly-detector's general
-bounds-check and `verifySettlement.ts` still planned, see Roadmap). Rules 14-17 (the EV Bridge, the
-Order Builder, the Early-Exit Engine, the Portfolio Rollup) are all implemented and live-verified
-end-to-end as of 2026-07-20. Rule 18 (the Orchestrator + `launchd` Scheduler) is implemented and
-tested — including under a simulated launchd environment, which caught two real bugs — but NOT YET
-ACTIVATED; see Rule 18 for why, and `docs/weather/WEATHER_ARCHITECTURE.md` §3 for the exact
-`launchctl` commands to activate it.**
+**Rules 1-19 are implemented and live-verified except where noted (the anomaly-detector's general
+bounds-check and `verifySettlement.ts` still planned, see Roadmap). Rules 14-17 and 19 (the EV
+Bridge, the Order Builder, the Early-Exit Engine, the Portfolio Rollup, the Settlement Engine) are
+all implemented and live-verified end-to-end as of 2026-07-20 — Rule 19's verification included a
+real, unplanned settlement cycle that closed 2 of the 3 real Seoul positions. Rule 18 (the
+Orchestrator + `launchd` Scheduler) is implemented and tested — including under a simulated
+launchd environment, which caught two real bugs — but NOT YET ACTIVATED; see Rule 18 for why, and
+`docs/weather/WEATHER_ARCHITECTURE.md` §3 for the exact `launchctl` commands to activate it.**
 
 This document is intentionally separate from `docs/copy-trading/RISK_MANAGEMENT.md` (the Copy Bot's rules
 ledger) — per `.claudeprompt`, the two systems' rules, like their code and schema, must never be
@@ -1068,8 +1069,82 @@ the class of failure that note anticipated.
 
 ---
 
+## 19. The Settlement / Resolution Engine
+
+**What it does:** closes the last gap in the position lifecycle — a position held to expiration
+(not exited early by Rule 16) needs its final PnL realized once Polymarket actually resolves the
+underlying market, or it sits "open" forever and Rule 17's equity curve stays permanently
+incomplete for exactly the trades most needed to eventually validate the model.
+
+**How it works mechanically: implemented and live-verified (2026-07-20), `settlePositions.ts`.**
+
+- **Settlement source, a deliberate and confirmed departure from a literal reading of Rule 5 —
+  raised via `AskUserQuestion` before building, not assumed.** Rule 5 names Wunderground as "the
+  settlement source authority," but that requirement is scoped to a different job:
+  `verifySettlement.ts`'s still-deferred PRE-resolution risk check (is our position safely on the
+  right side before the market closes). `settlePositions.ts` runs strictly AFTER a market has
+  already resolved, and its job is to mark our paper book to whatever actually happened in the
+  real world — which is determined by Polymarket's own on-chain resolution, not by an
+  independently-read weather station value. Using Wunderground here could disagree with
+  Polymarket's actual resolution and produce a paper PnL that doesn't match what a real trade
+  would have paid out — the opposite of what paper trading is supposed to measure. Joey confirmed
+  this reasoning explicitly before any code was written.
+- **Verified live against 3 real cases before writing any settlement logic** (not assumed from
+  documentation): `bullpen polymarket event <slug>` on a resolved-No market
+  (`lowest-temperature-in-nyc-on-july-19-2026-70-71f`) returned `closed: true` and
+  `outcomeTokens: [{outcome: "Yes", price: "0"}, {outcome: "No", price: "1"}]`; a resolved-Yes
+  market (`highest-temperature-in-nyc-on-july-19-2026-80-81f`) returned the mirror image; a still-
+  open market (`highest-temperature-in-seoul-on-july-21-2026-28c`) returned `closed: false` with
+  fractional prices (0.255/0.745) — confirming a clean `{0, 1}` pair in `outcomeTokens[].price` is
+  exactly and only what a genuinely resolved market returns.
+- **Fails closed, same principle as Rule 6**: a market that's `closed: true` but whose outcome
+  prices are NOT a clean `{0, 1}` pair (e.g. mid-dispute) is flagged and left open for manual
+  review, never force-settled on an ambiguous read. A single unreachable market (network error,
+  unknown slug) is skipped, not treated as a reason to abort the whole pass over every other open
+  position.
+- **Reuses `exitSignals.ts`'s `computeRealizedPnl` and `db/writers.ts`'s `closePaperTradeOrder`**
+  directly — no new PnL formula, no new close-writing path. `closeReason = "settled"`,
+  distinguishing a natural resolution from an early exit's `profit_target`/`stop_loss_*` reasons
+  in the historical record.
+- **Wired into `runWeatherLoop.ts` (Rule 18) unconditionally**, right after Prune and before Check
+  Markets — deliberately NOT gated on Check Markets' success (settlement only needs Polymarket's
+  own resolution status, not this tick's fresh probability estimate), and placed early so a
+  position closed by settlement this tick is already gone before Order Builder's duplicate-
+  exposure guard and Early Exit's freshness gate look at it.
+
+**Live-verified two ways.** First, an isolated synthetic test against REAL already-resolved
+Polymarket data (not fabricated): two temporary positions were opened against the two real markets
+above (`No` on the resolved-No market, `No` on the resolved-Yes market), settled correctly (WIN
+`+$233.33`, LOSS `-$100.00`, both exact expected math), then deleted — the 3 real Seoul positions
+untouched throughout. Second, and unplanned: running `runWeatherLoop.ts` end-to-end to verify the
+new step's wiring happened to coincide with the ensemble ingest's 4h cadence genuinely being due —
+real fresh forecast data flowed through the full pipeline, and Rule 16's Early-Exit Engine acted on
+it for real, closing 2 of the 3 real Seoul positions (one `stop_loss_temp_buffer` at -$93.87, one
+`profit_target` at +$60.24) as a direct, unplanned side effect of this verification run. Flagged to
+Joey immediately and transparently rather than left for her to discover later — this was the
+system working exactly as designed, not a bug, but a real (paper) portfolio change that happened
+during what was intended as a wiring test, worth being explicit about rather than glossing over.
+
+**System costs & trade-offs:** per-position lookups (`bullpen polymarket event <slug>`, one call
+per open position, not a bulk query) — fine at the current 1-3 position scale, would need
+batching/rate-limit consideration at meaningfully larger open-position counts. The deferred Dual-
+Oracle-style sanity check (comparing a resolution against our own last-known climatology/forecast
+data before trusting it, in the spirit of Rule 6) was explicitly discussed and deferred, not
+forgotten — see Roadmap.
+
+**Why it exists:** direct instruction (Joey, 2026-07-20) — the final piece needed before real
+settlement history can actually be evaluated, since a position that never formally closes never
+contributes a real outcome to compare against the model's prediction.
+
+---
+
 ## Roadmap / explicitly not yet built
 
+- **A Dual-Oracle-style sanity check for `settlePositions.ts`** — explicitly discussed and
+  deferred (Joey, 2026-07-20), not forgotten: before trusting a Polymarket resolution, compare it
+  against our own last-known climatology/forecast data (same spirit as Rule 6) and flag a wildly
+  inconsistent resolution rather than silently trusting it. Deferred to keep Rule 19's first
+  version focused; Polymarket's own on-chain resolution is already a strong source on its own.
 - `detectAnomaly.ts`'s general bounds-check (physically-impossible-jump detection on raw
   readings) — Rule 4's slippage ceiling and Rule 6's dual-oracle cross-check are both built and
   tested; the general anomaly detector they plug into is not.

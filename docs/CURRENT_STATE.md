@@ -4,7 +4,7 @@
 "Last reviewed" date below before trusting a number in here over the live system (`bot.out.log`,
 `data/app.db`, `bullpen status`).
 
-**Last reviewed: 2026-07-20** (updated same-day: Weather Bot Orchestrator + Scheduler + Portfolio Rollup — `runWeatherLoop.ts`/`updatePnl.ts`/`launchd` `.plist` — built and live-tested including under a simulated launchd environment; scheduler NOT YET activated, Joey's call)
+**Last reviewed: 2026-07-20** (updated same-day: Weather Bot Settlement Engine — `settlePositions.ts` — built, live-verified against real resolved Polymarket data, and wired into the orchestrator; a real end-to-end test run closed 2 of 3 real Seoul positions for real)
 
 ## Snapshot, right now
 
@@ -206,7 +206,31 @@
   `launchctl load`/`unload` commands are recorded in `docs/weather/WEATHER_ARCHITECTURE.md` §3.
   81 unit tests still passing (no new pure-function modules needing tests this phase — both new
   scripts are DB/subprocess orchestrators, tested live instead, per this codebase's existing
-  pattern for that category of script). Still not built: `verifySettlement.ts` (the live
+  pattern for that category of script).
+- **The Settlement / Resolution Engine — built and live-verified** (2026-07-20;
+  `settlePositions.ts`, 30th script; no schema change — reuses `weather_position` and the existing
+  `closePaperTradeOrder` writer). Closes the last gap in the position lifecycle: a position held
+  to expiration now gets its final PnL realized once Polymarket actually resolves the market,
+  instead of sitting "open" forever. **Settlement source was a deliberate, confirmed departure
+  from a literal reading of Rule 5** (raised via `AskUserQuestion` before writing any code, not
+  assumed): Rule 5's Wunderground-authority requirement is scoped to the still-deferred
+  `verifySettlement.ts`'s pre-resolution risk check, not this post-resolution book-marking job —
+  our paper book needs to match whatever Polymarket actually resolved to (verified live:
+  `bullpen polymarket event <slug>` returns `closed: true` plus a clean `{0,1}` price pair per
+  outcome for a genuinely resolved market — confirmed against a real resolved-No case, a real
+  resolved-Yes case, and a real still-open case before writing any settlement logic). Fails closed
+  like Rule 6: an ambiguous (closed but not cleanly `{0,1}`) resolution is flagged, never
+  force-settled on a guess. **Live-verified two ways**: an isolated synthetic test against the two
+  real resolved markets above (WIN `+$233.33`, LOSS `-$100.00`, both exact expected math, cleaned
+  up after); and an unplanned real settlement cycle — running the full orchestrator to verify the
+  new step's wiring coincided with the ensemble ingest's 4h cadence genuinely being due, so real
+  fresh forecast data flowed through the pipeline and Rule 16's Early-Exit Engine closed 2 of the
+  3 real Seoul positions for real (`stop_loss_temp_buffer` at -$93.87, `profit_target` at
+  +$60.24) as a direct side effect of the verification run — flagged to Joey immediately and
+  transparently, since a real (paper) portfolio change happening during a wiring test is worth
+  being explicit about, not glossed over. A Dual-Oracle-style sanity check on resolutions (compare
+  against our own last-known forecast before trusting, Rule 6's spirit) was discussed and
+  explicitly deferred, not forgotten. Still not built: `verifySettlement.ts` (the live
   Wunderground/Playwright fetch — deliberately deferred as its own step), `detectAnomaly.ts`'s
   general bounds-check. Full design in `docs/weather/WEATHER_ARCHITECTURE.md` /
   `docs/weather/WEATHER_RISK_MANAGEMENT.md`.

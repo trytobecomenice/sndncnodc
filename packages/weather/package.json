@@ -14,6 +14,7 @@
     "check:markets": "tsx src/checkMarkets.ts",
     "build:orders": "tsx src/orderBuilder.ts",
     "check:exits": "tsx src/earlyExit.ts",
+    "settle:positions": "tsx src/settlePositions.ts",
     "update:pnl": "tsx src/updatePnl.ts",
     "run:loop": "tsx src/runWeatherLoop.ts",
     "test": "vitest run"
