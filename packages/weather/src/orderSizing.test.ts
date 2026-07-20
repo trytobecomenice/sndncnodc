@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { checkEdgeFloor, checkTempBuffer, computeKellyFraction, computePositionSize } from "./orderSizing";
+import { applyPortfolioExposureCap, checkEdgeFloor, checkTempBuffer, computeKellyFraction, computePositionSize } from "./orderSizing";
 
 describe("computeKellyFraction", () => {
   it("computes the Yes-side Kelly fraction when our estimate exceeds the market price", () => {
@@ -94,5 +94,29 @@ describe("computePositionSize", () => {
   it("produces zero size for zero Kelly fraction", () => {
     const result = computePositionSize(0, 0.25, 0.05, 10000);
     expect(result.sizeUsd).toBe(0);
+  });
+});
+
+describe("applyPortfolioExposureCap", () => {
+  it("passes through the proposed size when well under the portfolio cap", () => {
+    // 25% cap on $10,000 = $2,500 headroom; $1,000 already open; proposing $500 -> fits easily
+    const result = applyPortfolioExposureCap(500, 1000, 0.25, 10000);
+    expect(result).toBeCloseTo(500, 5);
+  });
+
+  it("clamps the proposed size down to whatever headroom remains", () => {
+    // 25% cap = $2,500; $2,200 already open -> only $300 headroom left, less than the $500 proposed
+    const result = applyPortfolioExposureCap(500, 2200, 0.25, 10000);
+    expect(result).toBeCloseTo(300, 5);
+  });
+
+  it("returns zero once the portfolio is already at the cap", () => {
+    const result = applyPortfolioExposureCap(500, 2500, 0.25, 10000);
+    expect(result).toBe(0);
+  });
+
+  it("never returns a negative size even if somehow already over the cap", () => {
+    const result = applyPortfolioExposureCap(500, 3000, 0.25, 10000);
+    expect(result).toBe(0);
   });
 });

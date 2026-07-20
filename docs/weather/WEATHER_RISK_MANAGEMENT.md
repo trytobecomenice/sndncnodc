@@ -18,14 +18,17 @@ before proposing a new restriction so a decision already made here doesn't get s
 re-thought. `docs/weather/WEATHER_ARCHITECTURE.md` is the companion: data flow, schema, and scheduling
 detail that explains *how* these rules get implemented mechanically.
 
-**Rules 1-19 are implemented and live-verified except where noted (the anomaly-detector's general
+**Rules 1-20 are implemented and live-verified except where noted (the anomaly-detector's general
 bounds-check and `verifySettlement.ts` still planned, see Roadmap). Rules 14-17 and 19 (the EV
 Bridge, the Order Builder, the Early-Exit Engine, the Portfolio Rollup, the Settlement Engine) are
 all implemented and live-verified end-to-end as of 2026-07-20 — Rule 19's verification included a
-real, unplanned settlement cycle that closed 2 of the 3 real Seoul positions. Rule 18 (the
-Orchestrator + `launchd` Scheduler) is implemented and tested — including under a simulated
-launchd environment, which caught two real bugs — but NOT YET ACTIVATED; see Rule 18 for why, and
-`docs/weather/WEATHER_ARCHITECTURE.md` §3 for the exact `launchctl` commands to activate it.**
+real, unplanned settlement cycle that closed 2 of the 3 real Seoul positions. Rule 11 gained a
+portfolio-level exposure cap the same day, added deliberately before the scheduler was activated.
+Rule 18 (the Orchestrator + `launchd` Scheduler) is implemented, tested under a simulated launchd
+environment (caught two real bugs), and — as of 2026-07-20 — ACTIVATED by Joey on her own machine.
+Rule 20 (the Daily Telemetry Protocol) is the read-only monitoring tool for this phase. See the
+"FORWARD TESTING PHASE" status block below Rule 20 for the current operating mode: code freeze,
+critical-bug-fixes-only, in effect.**
 
 This document is intentionally separate from `docs/copy-trading/RISK_MANAGEMENT.md` (the Copy Bot's rules
 ledger) — per `.claudeprompt`, the two systems' rules, like their code and schema, must never be
@@ -553,6 +556,29 @@ of information. Mirrors the Copy Bot's per-event exposure cap (`docs/copy-tradin
 Rule 6) in spirit — a portfolio-concentration guard — but expressed as a percentage of total
 capital rather than a fixed dollar amount, appropriate for a system whose capital base isn't fixed
 yet the way the Copy Bot's `PAPER_BANKROLL_USD` is.
+
+**Portfolio-level exposure cap added 2026-07-20, ahead of the forward-test freeze — implemented
+and live-verified.** The per-trade 5% cap above bounds any ONE position, but nothing previously
+bounded how many positions could be open AT ONCE — all exposed to the same underlying model-
+calibration risk (a systematic mispricing hits every open position together, not independently,
+unlike genuinely uncorrelated single-event risk). Raised proactively via `AskUserQuestion` before
+Joey's stated code freeze locked in, specifically because this class of gap becomes much harder to
+close once "critical bug fixes only" is in effect. `applyPortfolioExposureCap()` in `orderSizing.ts`
+(4 unit tests) clamps a proposed trade down to whatever headroom remains under
+`MAX_PORTFOLIO_EXPOSURE = 25%` of `WEATHER_PAPER_BANKROLL_USD`, tracked as a RUNNING total across
+each `orderBuilder.ts` run (not just the pre-run DB figure) so multiple candidates approved in the
+same pass can't collectively exceed the cap — mirrors the Copy Bot's own `$250` total exposure
+ceiling, translated to this bot's percentage-based capital framing. Live-verified the wiring
+against real data (correctly reported `$500.00 / 5.0% of capital` total exposure matching the one
+real open position); the exact clamping arithmetic itself is unit-tested directly, not forced live,
+since no live candidate happened to be both otherwise-approved and large enough to actually trigger
+a clamp during this test run — this is a real, disclosed distinction, not glossed over as "fully
+live-verified."
+
+**Why the 25% figure**: room for 5 concurrent 5%-sized positions — the same order of magnitude as
+the per-trade cap, not independently derived or calibrated against real correlated-loss data (none
+exists yet). Revisit once real forward-test history shows how correlated actual outcomes across
+simultaneously-open positions turn out to be.
 
 ---
 
@@ -1135,6 +1161,64 @@ forgotten — see Roadmap.
 **Why it exists:** direct instruction (Joey, 2026-07-20) — the final piece needed before real
 settlement history can actually be evaluated, since a position that never formally closes never
 contributes a real outcome to compare against the model's prediction.
+
+---
+
+## 20. Daily Telemetry Protocol — forward-test monitoring
+
+**What it does:** a strictly read-only dashboard (`dailyMonitor.ts`) for observing the bot while it
+runs unattended during the Forward Testing Phase (see status banner above) — scheduler health,
+portfolio equity, and open-position status, all in one glance, without touching the live loop.
+
+**How it works mechanically: implemented and live-verified (2026-07-20).** Zero writes, zero
+`bullpen` calls anywhere in the file — every field comes from a `SELECT` against tables the
+orchestrator already populates on its own schedule, so it's safe to run at any moment, including
+mid-loop-execution (the shared SQLite connection runs in WAL mode, so a concurrent read never
+blocks or is blocked by the orchestrator's writes). Scheduler health uses THREE independent
+signals, deliberately, not one: (1) the latest `weather_pnl_snapshot.captured_at` — `updatePnl.ts`
+runs LAST and ALWAYS, even if Check Markets failed, so this alone only proves the orchestrator
+process is alive, not that every step is succeeding; (2) the latest
+`weather_probability_estimate.estimated_at` — proxies Check Markets' own success specifically,
+since it's the pipeline's critical step (Rule 18); a meaningful gap between signals (1) and (2)
+means the orchestrator keeps "completing" runs while Check Markets has been silently failing every
+tick, something signal (1) alone would never reveal; (3) the orchestrator log file's filesystem
+mtime — the crudest, cheapest signal, no log parsing at all, just confirms launchd itself is
+ticking. An `ALERT` banner prints automatically if the PnL Snapshot signal is more than
+`STALE_ALERT_MINUTES = 90` old (1.5× the hourly cadence). Open positions show each one's CURRENT
+edge (the freshest `weather_probability_estimate`, re-signed to the position's own held side —
+same re-signing formula `exitSignals.ts`'s `evaluateExit` already uses), not just its entry edge,
+so a position whose edge has since decayed or inverted is visible without needing to guess.
+**Live-verified**: output matched known real state exactly (1 open position, -$33.63 all-time
+realized, +$35.97 unrealized, $10,002.34 equity, 50% win rate — same figures independently
+confirmed via direct `sqlite3` queries during Rule 19's verification).
+
+**System costs & trade-offs:** the log-file-mtime signal only proves launchd is invoking the
+process at all — it says nothing about whether that invocation succeeded, which is exactly why it
+exists alongside, not instead of, the two DB-derived signals. "Today's" realized PnL is
+deliberately computed as "last 24 hours," not "since local midnight in some station's timezone" —
+sidesteps a real ambiguity (a multi-station portfolio has no single "today") at the cost of not
+lining up exactly with a calendar day.
+
+**Why it exists:** direct instruction (Joey, 2026-07-20) — a safe way to monitor the bot during
+unattended forward testing without disrupting the loop itself, and specifically to catch a dead or
+silently-failing scheduler before too much time passes unnoticed.
+
+---
+
+## FORWARD TESTING PHASE — status (2026-07-20)
+
+**The bot has moved from Development into Forward Testing (Out-of-Sample) Phase, Joey's explicit
+call.** A code freeze is in effect: no new features, only critical bug fixes, for the duration of
+this phase — the whole point is to observe whether the theoretical edge, Kelly sizing, and the
+1.5°F safety buffer actually produce alpha under live, unattended conditions, which requires
+holding the system still long enough to get a real read, not continuously re-tuning it against the
+same data meant to validate it. The `launchd` scheduler (Rule 18) was activated by Joey herself
+(`launchctl load`, run on her own machine, not by an agent) immediately after the portfolio
+exposure cap above was added — the cap was deliberately closed BEFORE activation, not after,
+specifically because it becomes much harder to add once "critical bug fixes only" is in effect.
+`dailyMonitor.ts` (Rule 20) is the intended daily check-in tool for this phase. No target end date
+or evaluation criteria for the forward test have been set yet — a reasonable next conversation once
+enough real settlement history accumulates to say something meaningful.
 
 ---
 

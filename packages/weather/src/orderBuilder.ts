@@ -15,6 +15,13 @@
 //           MAX_CAPITAL_PER_TRADE against a mock WEATHER_PAPER_BANKROLL_USD capital base. This is
 //           the first concrete value for the capital-base constant Rule 11 was blocked on.
 //
+// PORTFOLIO EXPOSURE CAP (added 2026-07-20, ahead of the forward-test freeze): Rule 11's 5% cap
+// bounds any ONE trade, but nothing previously bounded how many positions could be open AT ONCE —
+// all exposed to the same underlying model-calibration risk (a systematic mispricing hits every
+// open position together, not independently). MAX_PORTFOLIO_EXPOSURE = 25% of total capital,
+// tracked as a running total across this run (not just the pre-run DB total) so multiple
+// candidates approved in the SAME run can't collectively blow through the cap.
+//
 // SCOPE: paper trading only (Rule 1) — this writes a weather_position row, it never touches a
 // real order or a private key. Re-running is safe: a market that already has an open position is
 // skipped (duplicate-exposure guard), matching bot.py's own equivalent guard for the Copy Bot.
@@ -28,8 +35,14 @@ import { and, desc, eq } from "drizzle-orm";
 import { db, weatherMarketMapping, weatherProbabilityEstimate, weatherStation } from "@copybot/db";
 import { type ThresholdRange } from "./calculateProbability";
 import { WEATHER_PAPER_BANKROLL_USD } from "./constants";
-import { hasOpenPosition, insertPaperTradeOrder } from "./db/writers";
-import { checkEdgeFloor, checkTempBuffer, computeKellyFraction, computePositionSize } from "./orderSizing";
+import { fetchTotalOpenExposureUsd, hasOpenPosition, insertPaperTradeOrder } from "./db/writers";
+import {
+  applyPortfolioExposureCap,
+  checkEdgeFloor,
+  checkTempBuffer,
+  computeKellyFraction,
+  computePositionSize,
+} from "./orderSizing";
 import { checkStaleness } from "./staleness";
 
 const MIN_EDGE_FLOOR = 0.05; // Rule 7 — 5 percentage points, same order of magnitude as the
@@ -38,6 +51,8 @@ const MIN_EDGE_FLOOR = 0.05; // Rule 7 — 5 percentage points, same order of ma
 const TEMP_BUFFER_F = 1.5; // Rule 12, Joey's stated default.
 const KELLY_MULTIPLIER = 0.25; // Quarter-Kelly, Joey's call 2026-07-20.
 const MAX_CAPITAL_PER_TRADE = 0.05; // Rule 11, Joey's stated default.
+const MAX_PORTFOLIO_EXPOSURE = 0.25; // Portfolio-level cap, Joey's call 2026-07-20, ahead of the
+// forward-test freeze — see module comment.
 
 interface ActiveMapping {
   marketSlug: string;
@@ -113,6 +128,11 @@ async function main() {
   let skippedEdgeFloor = 0;
   let skippedTempBuffer = 0;
   let skippedZeroSize = 0;
+  let skippedPortfolioCap = 0;
+
+  // Running total, not just the pre-run DB figure — updated after every order placed THIS run so
+  // multiple candidates approved in the same pass can't collectively exceed the portfolio cap.
+  let runningExposureUsd = await fetchTotalOpenExposureUsd();
 
   for (const mapping of mappings) {
     const estimate = await fetchLatestEstimate(mapping.marketSlug);
@@ -163,6 +183,18 @@ async function main() {
       continue;
     }
 
+    const cappedSizeUsd = applyPortfolioExposureCap(size.sizeUsd, runningExposureUsd, MAX_PORTFOLIO_EXPOSURE, WEATHER_PAPER_BANKROLL_USD);
+    if (cappedSizeUsd <= 0) {
+      console.log(
+        `SKIP ${mapping.marketSlug}: portfolio exposure cap reached (${(MAX_PORTFOLIO_EXPOSURE * 100).toFixed(0)}% of capital already ` +
+          `committed to open positions) — no headroom for a new trade this run.`
+      );
+      skippedPortfolioCap++;
+      continue;
+    }
+    const wasClamped = cappedSizeUsd < size.sizeUsd;
+    const appliedFraction = cappedSizeUsd / WEATHER_PAPER_BANKROLL_USD;
+
     const isYes = kelly.side === "Yes";
     const entryProb = isYes ? estimate.blendedProb : 1 - estimate.blendedProb;
     const entryPrice = isYes ? estimate.marketImpliedProb : 1 - estimate.marketImpliedProb;
@@ -172,7 +204,7 @@ async function main() {
       outcome: kelly.side,
       entryProb,
       entryPrice,
-      sizeUsd: size.sizeUsd,
+      sizeUsd: cappedSizeUsd,
       ensembleProb: estimate.blendedProb,
       polymarketProb: estimate.marketImpliedProb,
       probabilityDifference: estimate.edge,
@@ -180,15 +212,16 @@ async function main() {
       stationLocalTime: staleness.stationLocalTime,
       tempBufferF: tempBuffer.distanceF,
       fullKellyFraction: kelly.fullKellyFraction,
-      appliedFraction: size.appliedFraction,
+      appliedFraction,
     });
 
+    runningExposureUsd += cappedSizeUsd;
     ordersPlaced++;
     console.log(
-      `ORDER ${mapping.marketSlug}: BUY ${kelly.side.toUpperCase()} $${size.sizeUsd.toFixed(2)} ` +
-        `(${(size.appliedFraction * 100).toFixed(2)}% of capital) — edge=${(estimate.edge * 100).toFixed(1)}pp, ` +
-        `fullKelly=${(kelly.fullKellyFraction * 100).toFixed(1)}%, tempBuffer=${tempBuffer.distanceF.toFixed(1)}F, ` +
-        `${staleness.isSameDay ? "same-day" : "future-day"}.`
+      `ORDER ${mapping.marketSlug}: BUY ${kelly.side.toUpperCase()} $${cappedSizeUsd.toFixed(2)} ` +
+        `(${(appliedFraction * 100).toFixed(2)}% of capital${wasClamped ? ", clamped by portfolio cap" : ""}) — ` +
+        `edge=${(estimate.edge * 100).toFixed(1)}pp, fullKelly=${(kelly.fullKellyFraction * 100).toFixed(1)}%, ` +
+        `tempBuffer=${tempBuffer.distanceF.toFixed(1)}F, ${staleness.isSameDay ? "same-day" : "future-day"}.`
     );
   }
 
@@ -201,6 +234,8 @@ async function main() {
   console.log(`Rejected (Rule 7 edge floor): ${skippedEdgeFloor}`);
   console.log(`Rejected (Rule 12 temp buffer): ${skippedTempBuffer}`);
   console.log(`Skipped (zero size):          ${skippedZeroSize}`);
+  console.log(`Skipped (portfolio cap):      ${skippedPortfolioCap}`);
+  console.log(`Total exposure after this run: $${runningExposureUsd.toFixed(2)} (${((runningExposureUsd / WEATHER_PAPER_BANKROLL_USD) * 100).toFixed(1)}% of capital)`);
 }
 
 const isMainModule = import.meta.url === `file://${process.argv[1]}`;

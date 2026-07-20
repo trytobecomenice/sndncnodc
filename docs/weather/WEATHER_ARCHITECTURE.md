@@ -294,13 +294,15 @@ of Check Markets' outcome) → Check Markets (`checkMarkets.ts`, every tick, **c
 This mirrors, at the scheduling level, the same cheap/frequent-vs-expensive/slower instinct the
 Copy Bot's `scoreWallets.ts` already uses within a single run (its pass-1/pass-2 design).
 
-**Activation — deliberately not done yet.** The `.plist`
+**Activation — ACTIVATED 2026-07-20.** The `.plist`
 (`packages/weather/launchd/com.copybot.weather.loop.plist`) was written and live-tested, including
 under a simulated launchd environment (`env -i` with a minimal `PATH`, no inherited shell state) —
-this test caught two real bugs before activation, not after (see Rule 18 for both). `launchctl
-load` has NOT been run; Joey chose to review and activate it herself when ready
-(`AskUserQuestion`, 2026-07-20) rather than have it activated automatically. Exact commands, for
-whenever that is:
+this test caught two real bugs before activation, not after (see Rule 18 for both). Joey chose to
+review and activate it herself when ready (`AskUserQuestion`, 2026-07-20) rather than have it
+activated automatically — and ran `launchctl load` on her own machine the same day, immediately
+after the portfolio exposure cap (Rule 11) was added, marking the start of the Forward Testing
+Phase (`docs/weather/WEATHER_RISK_MANAGEMENT.md`, status block after Rule 20). Exact commands, kept
+here for reference (uninstall, reinstall after a machine restart, etc.):
 
 ```bash
 # Install (copies the plist into the per-user LaunchAgents directory, then loads it)
@@ -325,7 +327,7 @@ rm ~/Library/LaunchAgents/com.copybot.weather.loop.plist
 ## 4. Proposed `packages/weather/` structure
 
 `packages/weather/` is now a real, wired-in pnpm workspace member — `package.json`/`tsconfig.json`
-exist, and thirty scripts/modules are built, tested, and live-verified against `data/app.db` and
+exist, and thirty-two scripts/modules are built, tested, and live-verified against `data/app.db` and
 real Polymarket/Open-Meteo data (2026-07-19 through 2026-07-20). Structure mirrors
 `packages/copy-trading`'s conventions: plain
 `tsx`-executed scripts, an `isMainModule` guard so files stay test-importable, vitest for
@@ -373,15 +375,16 @@ packages/weather/
     constants.ts                        # BUILT ✅ — Rule 17, shared WEATHER_PAPER_BANKROLL_USD (correctness-critical, not left as two independent copies)
     updatePnl.ts                        # BUILT ✅ — Rule 17, the Portfolio Rollup: equity curve, one weather_pnl_snapshot row per run
     settlePositions.ts                  # BUILT ✅ — Rule 19, the Settlement Engine: marks expired positions to Polymarket's own resolution
+    dailyMonitor.ts                     # BUILT ✅ — Rule 20, read-only forward-test dashboard: scheduler health, equity, open positions
     runWeatherLoop.ts                   # BUILT ✅ — Rule 18, the Orchestrator: cadence-aware, runs the full pipeline in sequence
   launchd/
-    com.copybot.weather.loop.plist      # BUILT ✅ — Rule 18, hourly launchd job — written and tested, NOT YET ACTIVATED (Joey's call)
+    com.copybot.weather.loop.plist      # BUILT ✅ — Rule 18, hourly launchd job — written, tested, and ACTIVATED (2026-07-20, Joey's own machine)
 ```
 
 `packages/weather/package.json` scripts, built: `ingest:metar`, `prune:historical`,
 `discover:markets`, `backfill:historical`, `ingest:openmeteo`, `prune:forecasts`,
 `calculate:probability`, `check:markets`, `build:orders`, `check:exits`, `settle:positions`,
-`update:pnl`, `run:loop`.
+`update:pnl`, `run:loop`, `monitor:daily`.
 `run:loop` (`runWeatherLoop.ts`) supersedes the original "one `launchd` job per script" plan — see
 §3 for the cadence-aware single-orchestrator design and why it doesn't reintroduce the always-on-
 process problem the original plan was written to avoid. `verifySettlement.ts` deliberately has

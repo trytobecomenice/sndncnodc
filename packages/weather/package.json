@@ -16,6 +16,7 @@
     "check:exits": "tsx src/earlyExit.ts",
     "settle:positions": "tsx src/settlePositions.ts",
     "update:pnl": "tsx src/updatePnl.ts",
+    "monitor:daily": "tsx src/dailyMonitor.ts",
     "run:loop": "tsx src/runWeatherLoop.ts",
     "test": "vitest run"
   },

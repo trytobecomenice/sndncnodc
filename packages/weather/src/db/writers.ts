@@ -180,6 +180,17 @@ export async function hasOpenPosition(marketSlug: string): Promise<boolean> {
   return rows.length > 0;
 }
 
+/** Sum of ourSizeUsd across every currently-open position — the portfolio-level exposure cap
+ * (orderSizing.ts's applyPortfolioExposureCap, added 2026-07-20 ahead of the forward-test freeze)
+ * needs this to know how much headroom remains under the cap before sizing a new trade. */
+export async function fetchTotalOpenExposureUsd(): Promise<number> {
+  const rows = await db
+    .select({ ourSizeUsd: weatherPosition.ourSizeUsd })
+    .from(weatherPosition)
+    .where(eq(weatherPosition.status, "open"));
+  return rows.reduce((sum, r) => sum + r.ourSizeUsd, 0);
+}
+
 export interface OpenPositionRow {
   id: string;
   marketSlug: string;

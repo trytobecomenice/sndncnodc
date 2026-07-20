@@ -85,3 +85,19 @@ export function computePositionSize(
   const appliedFraction = Math.min(scaled, capFraction);
   return { appliedFraction, sizeUsd: appliedFraction * totalCapitalUsd };
 }
+
+/** Portfolio-level exposure cap (added 2026-07-20, ahead of the forward-test freeze) — Rule 11's
+ * per-trade 5% cap bounds any ONE position, but nothing previously bounded how many positions
+ * could be open AT ONCE, all exposed to the same underlying model-calibration risk. Clamps a
+ * proposed trade size down to whatever headroom remains under `portfolioCapFraction` of total
+ * capital, given `currentOpenExposureUsd` already committed to other open positions — returns 0
+ * once the portfolio is already at or past the cap, never a negative size. */
+export function applyPortfolioExposureCap(
+  proposedSizeUsd: number,
+  currentOpenExposureUsd: number,
+  portfolioCapFraction: number,
+  totalCapitalUsd: number
+): number {
+  const headroomUsd = Math.max(0, portfolioCapFraction * totalCapitalUsd - currentOpenExposureUsd);
+  return Math.min(proposedSizeUsd, headroomUsd);
+}

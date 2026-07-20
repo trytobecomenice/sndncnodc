@@ -4,7 +4,7 @@
 "Last reviewed" date below before trusting a number in here over the live system (`bot.out.log`,
 `data/app.db`, `bullpen status`).
 
-**Last reviewed: 2026-07-20** (updated same-day: Weather Bot Settlement Engine — `settlePositions.ts` — built, live-verified against real resolved Polymarket data, and wired into the orchestrator; a real end-to-end test run closed 2 of 3 real Seoul positions for real)
+**Last reviewed: 2026-07-20** (updated same-day: Weather Bot has moved into the FORWARD TESTING PHASE — code freeze in effect, `launchd` scheduler ACTIVATED by Joey on her own machine, `dailyMonitor.ts` built for read-only monitoring, a portfolio-level exposure cap added to Rule 11 immediately before activation)
 
 ## Snapshot, right now
 
@@ -230,10 +230,31 @@
   transparently, since a real (paper) portfolio change happening during a wiring test is worth
   being explicit about, not glossed over. A Dual-Oracle-style sanity check on resolutions (compare
   against our own last-known forecast before trusting, Rule 6's spirit) was discussed and
-  explicitly deferred, not forgotten. Still not built: `verifySettlement.ts` (the live
-  Wunderground/Playwright fetch — deliberately deferred as its own step), `detectAnomaly.ts`'s
-  general bounds-check. Full design in `docs/weather/WEATHER_ARCHITECTURE.md` /
-  `docs/weather/WEATHER_RISK_MANAGEMENT.md`.
+  explicitly deferred, not forgotten.
+- **FORWARD TESTING PHASE — Joey's call, 2026-07-20.** The bot has moved from Development into
+  Forward Testing (Out-of-Sample) Phase: a code freeze is in effect (no new features, critical bug
+  fixes only) so the theoretical edge, Kelly sizing, and 1.5°F buffer can actually be evaluated
+  against live, unattended conditions without the target moving underneath the evaluation. Two
+  things happened before the freeze locked in, deliberately in this order: (1) a **portfolio-level
+  exposure cap** was added to Rule 11 — `applyPortfolioExposureCap()` in `orderSizing.ts` (4 unit
+  tests), capping total simultaneous open exposure at 25% of capital (mirrors the Copy Bot's own
+  `$250` total ceiling), tracked as a running total within each `orderBuilder.ts` run so multiple
+  approvals in one pass can't collectively exceed it — raised proactively via `AskUserQuestion`
+  specifically because Rule 11 previously only capped each individual trade, not the portfolio as
+  a whole, and this class of gap becomes much harder to close once the freeze is in effect; (2)
+  **`dailyMonitor.ts`** (31st script) — a strictly read-only dashboard (zero writes, zero
+  `bullpen` calls, safe to run at any moment) showing scheduler health via three independent
+  signals (last PnL Snapshot proves the orchestrator is alive; last Probability Estimate proxies
+  Check Markets' own success specifically, catching a silent Check-Markets-only failure the PnL
+  signal alone would miss; the log file's mtime is the cheapest, crudest confirmation launchd is
+  ticking at all), current portfolio equity, and every open position's CURRENT edge (re-signed to
+  its own held side, not just its entry edge). Live-verified against real state, output matching
+  independently-confirmed `sqlite3` figures exactly. **The `launchd` scheduler was then activated**
+  — Joey ran `launchctl load` herself, on her own machine, marking the actual start of the forward
+  test. No target end date or evaluation criteria set yet. Still not built: `verifySettlement.ts`
+  (the live Wunderground/Playwright fetch — deliberately deferred as its own step),
+  `detectAnomaly.ts`'s general bounds-check. Full design in `docs/weather/WEATHER_ARCHITECTURE.md`
+  / `docs/weather/WEATHER_RISK_MANAGEMENT.md`.
 - **Database schema ownership:** TypeScript/Drizzle owns schema and migrations; Python
   (`db.py`) uses CRUD only — see `docs/copy-trading/SAFETY.md` §2.
 
