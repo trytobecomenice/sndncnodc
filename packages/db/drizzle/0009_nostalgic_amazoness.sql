@@ -1,0 +1,1 @@
+ALTER TABLE `bot_market_event` ADD `holding_rewards_enabled` integer;

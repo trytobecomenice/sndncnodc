@@ -13,6 +13,8 @@
     "seed": "pnpm --filter @copybot/db seed",
     "scan:leaderboard": "pnpm --filter @copybot/copy-trading scan:leaderboard",
     "scan:wallets": "pnpm --filter @copybot/copy-trading scan:wallets",
+    "score:wallet-categories": "pnpm --filter @copybot/copy-trading score:wallet-categories",
+    "discover:category-specialists": "pnpm --filter @copybot/copy-trading discover:category-specialists",
     "monitor:trades": "pnpm --filter @copybot/copy-trading monitor:trades",
     "score:trades": "pnpm --filter @copybot/copy-trading score:trades",
     "paper:update-pnl": "pnpm --filter @copybot/copy-trading paper:update-pnl",

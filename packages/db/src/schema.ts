@@ -83,6 +83,14 @@ export const walletProfile = sqliteTable(
     oneHitWonderPenalty: real("one_hit_wonder_penalty"),
     compositeScore: real("composite_score"),
     scoreBreakdownJson: text("score_breakdown_json"),
+    // Per-category breakdown (added for category-specific wallet scoring, 2026-07):
+    // {"politics": {"score": 0.72, "trade_count": 34, "win_rate": 0.65, "avg_pnl_usd": 12.4}, ...}
+    // — same "extra scoring detail lives in a JSON blob" pattern as scoreBreakdownJson above,
+    // not a new table, since the category set is small and fixed (config.CATEGORY_TAG_SLUGS).
+    // Written by scoreWalletCategories.ts; read by bot.py's compute_trade_size_usd() via
+    // db.get_wallet_composite_scores(). NULL until that job's first run for a given wallet —
+    // callers must treat absence as "no category signal yet," not an error.
+    categoryScoresJson: text("category_scores_json"),
     lastScoredAt: integer("last_scored_at", { mode: "timestamp" }),
     firstSeenAt: timestampCol("first_seen_at"),
     notes: text("notes"),
@@ -188,6 +196,16 @@ export const paperTrade = sqliteTable(
     closeReason: text("close_reason"),
     realizedPnlUsd: real("realized_pnl_usd"),
     peakProfitPct: real("peak_profit_pct").notNull().default(0),
+    // Unix seconds of this position's last SUCCESSFUL price read (bot.py's
+    // check_trailing_take_profit, on every sweep it manages to price this
+    // key) — NULL until the first successful read. Drives the "zombie
+    // position" dump-exit fallback (2026-07-27): a position with no
+    // successful read in config.ZOMBIE_POSITION_THRESHOLD_SECONDS (24h)
+    // becomes eligible for a forced, staleness-bypassing exit rather than
+    // leaving capital trapped in a permanently-illiquid/delisted market
+    // indefinitely. Persisted (not in-memory only) because the bot restarts
+    // often enough that an in-memory 24h clock would rarely, if ever, fire.
+    lastPricedAt: integer("last_priced_at", { mode: "timestamp" }),
     decisionJournalId: text("decision_journal_id"),
     isDemoData: integer("is_demo_data", { mode: "boolean" }).notNull().default(false),
   },
@@ -282,7 +300,184 @@ export const botSeenTrade = sqliteTable("bot_seen_trade", {
 export const botSourcePosition = sqliteTable("bot_source_position", {
   key: text("key").primaryKey(), // trader|market_slug|outcome
   shares: real("shares").notNull(),
+  // Weighted-average cost basis of the SOURCE trader's currently-held shares
+  // at this key (added 2026-07-24 for the pending_execution VWAP anchor —
+  // see that table's comment). Same weighted-average-on-buy /
+  // proportional-reduce-on-sell model bot.py already uses for our own
+  // positions[key]["cost_basis_usd"], just mirrored onto the whale's side.
+  // Default 0 for rows written before this column existed (source_positions
+  // predates this — those wallets simply have no VWAP history until their
+  // next observed buy).
+  costBasisUsd: real("cost_basis_usd").notNull().default(0),
 });
+
+// A resting "wait for confirmation" paper order against ONE tracked wallet's
+// own cost basis, added 2026-07-24 (RISK_MANAGEMENT.md Rule 29) to address
+// the naive "buy the moment price touches the whale's price" design's
+// adverse-selection problem: a prediction-market price dip is often real
+// news moving against the position, not noise, so this waits for BOTH a dip
+// below the whale's own average cost (anchorPrice, a VWAP of their observed
+// fills, ratcheting down only — see compute_anchor_price()) AND a confirmed
+// rebound off the resulting local minimum (see compute_rebound_threshold())
+// before ever calling _execute_buy() — and re-verifies the whale hasn't
+// exited their position in the meantime (whaleSharesAtCreation, see
+// whale_still_holding()) before firing. Owned exclusively by bot.py's
+// sweep_pending_executions(), like the other bot_* plumbing tables above:
+// TS owns the DDL, only bot.py reads/writes rows.
+//
+// Deliberately a table, not a field folded into bot_source_position/
+// paper_trade: it has its own lifecycle (pending -> filled/expired/
+// invalidated) independent of both, and needs to be cheaply queryable by
+// status+expiry for the TTL sweep. Column shape is also intentionally
+// event-shaped (one row per tracked signal, timestamped, with a terminal
+// status and reason) rather than a single mutable slot, so that a future
+// swap of the polling sweep for a real-time Polygon RPC websocket feed (see
+// Rule 29's roadmap note) only has to change WHERE rows get created/updated
+// FROM, not what the table records.
+export const pendingExecution = sqliteTable(
+  "pending_execution",
+  {
+    id: id(),
+    walletAddress: text("wallet_address").notNull(),
+    marketSlug: text("market_slug").notNull(),
+    outcome: text("outcome").notNull(),
+    sourceTradeId: text("source_trade_id"),
+    category: text("category"),
+    // Whale's VWAP cost basis at creation (or last ratchet-down update) —
+    // the hard "never chase above this" ceiling, per the no-high-chasing
+    // rule from the original request.
+    anchorPrice: real("anchor_price").notNull(),
+    // Local minimum observed price since the market first dipped below
+    // anchorPrice. NULL until the first such dip — the rebound trigger
+    // cannot fire before this is set (see has_rebounded()).
+    lowestSeenPrice: real("lowest_seen_price"),
+    // source_positions[key] snapshot at creation — the baseline
+    // whale_still_holding() compares against on every sweep pass.
+    whaleSharesAtCreation: real("whale_shares_at_creation"),
+    // Frozen at creation time using the sizing formula active then, same
+    // reasoning as paper_trade rows never retroactively resizing on a later
+    // rescore.
+    targetUsd: real("target_usd").notNull(),
+    status: text("status").notNull().default("pending"), // pending | filled | expired | invalidated
+    createdAt: timestampCol("created_at"),
+    expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+    filledAt: integer("filled_at", { mode: "timestamp" }),
+    invalidatedReason: text("invalidated_reason"),
+  },
+  (t) => [index("pending_execution_status_idx").on(t.status, t.walletAddress, t.marketSlug, t.outcome)]
+);
+
+// Real-time on-chain trade detection, added 2026-07-24 as the Producer side
+// of a Producer-Consumer hand-off: wss_listener.py (a SEPARATE standalone
+// process, not bot.py) subscribes to Polygon WebSocket logs for a tracked
+// wallet's CTF (ERC1155) TransferSingle events and INSERTs one row per
+// detected transfer here. bot.py's normal synchronous sweep loop is meant
+// to be the sole CONSUMER (poll `WHERE consumed_at IS NULL`, process, stamp
+// consumed_at) — that consumer sweep is not built yet, see wss_listener.py's
+// own module docstring for the real integration gap (token_id has no
+// market_slug/outcome without a further lookup). Two separate OS processes
+// writing/reading the same SQLite file is safe here specifically because
+// this DB already runs in WAL mode with a busy_timeout (see migrate.ts) —
+// this table's design (one INSERT per producer, one UPDATE per consumer,
+// idempotent on (tx_hash, log_index)) does not depend on any additional
+// locking beyond that.
+export const liveWhaleEvent = sqliteTable(
+  "live_whale_event",
+  {
+    id: id(),
+    walletAddress: text("wallet_address").notNull(),
+    contractAddress: text("contract_address").notNull(),
+    eventType: text("event_type").notNull(), // "TransferSingle" (the only type wss_listener.py emits today)
+    // "buy" (wallet is the ERC1155 `to`) | "sell" (wallet is the `from`) —
+    // derived from which of the two subscriptions matched, not re-derived
+    // from the raw log by the consumer.
+    direction: text("direction").notNull(),
+    // uint256 values stored as decimal STRINGS, not JS/SQLite numbers —
+    // both tokenId and shareAmount can exceed Number.MAX_SAFE_INTEGER.
+    tokenId: text("token_id").notNull(),
+    shareAmount: text("share_amount").notNull(),
+    // Best-effort price derivation: wss_listener.py looks for a paired
+    // ERC20 Transfer in the SAME transaction (the collateral leg of the
+    // trade) and computes usdcAmount/price from it when found. Both stay
+    // NULL when no such transfer was found in the tx — never fabricated.
+    usdcAmount: real("usdc_amount"),
+    price: real("price"),
+    txHash: text("tx_hash").notNull(),
+    logIndex: integer("log_index").notNull(),
+    blockNumber: integer("block_number").notNull(),
+    detectedAt: timestampCol("detected_at"),
+    // NULL until a consumer has processed this row — the sweep's
+    // "WHERE consumed_at IS NULL" cursor.
+    consumedAt: integer("consumed_at", { mode: "timestamp" }),
+  },
+  (t) => [
+    // Idempotency: the producer's own reconnect-and-resubscribe logic can
+    // re-deliver a log it already saw right before a drop — this makes a
+    // re-insert of the identical (tx_hash, log_index) a silent no-op
+    // (INSERT OR IGNORE) rather than a duplicate row.
+    uniqueIndex("live_whale_event_tx_log_idx").on(t.txHash, t.logIndex),
+    index("live_whale_event_consumed_idx").on(t.consumedAt),
+  ]
+);
+
+// Local cache mapping a raw on-chain CTF position id (token_id, as seen in
+// live_whale_event/wss_listener.py) to the Polymarket market_slug/outcome a
+// consumer actually needs — added 2026-07-24 to close exactly the gap
+// flagged in live_whale_event's own comment above ("token_id has no
+// market_slug/outcome without a further lookup"). Populated by
+// token_sync_worker.py (a separate script, same Producer-role precedent as
+// wss_listener.py) polling Polymarket's Gamma API. Owned exclusively by
+// that worker — same TS-owns-DDL/Python-owns-rows split as every other
+// bot_*/live_* table.
+export const tokenRegistry = sqliteTable("token_registry", {
+  // STRING, not a numeric type — a CTF token_id is a uint256 (up to 78
+  // decimal digits) and would silently lose precision in a JS/SQLite
+  // number column. Primary key: one row per token_id, upserted in place on
+  // every sync rather than accumulating history.
+  tokenId: text("token_id").primaryKey(),
+  marketSlug: text("market_slug").notNull(),
+  outcome: text("outcome").notNull(),
+  updatedAt: timestampCol("updated_at"),
+});
+
+// Bifurcated dynamic order pegging for SELL/exit execution (2026-07-26,
+// "Priority 3") — a patient maker-sell order that walks its price down
+// toward a floor over time instead of taking an immediate market fill.
+// Deliberately OPT-IN (config.ENABLE_PATIENT_EXIT_PEGGING, default False)
+// and bounded: this table's own status lifecycle always terminates in
+// either a real fill or a guaranteed market-sell fallback
+// ("fallback_market_sell") — it is never allowed to just cancel and leave
+// the position open indefinitely. That bound exists specifically because
+// this project treats "never delay an exit" as a load-bearing safety
+// principle (see RISK_MANAGEMENT.md Rule 6/11) — a resting sell that could
+// silently never fill would be exactly the failure mode those rules exist
+// to prevent. See bot.sweep_pending_exit_orders() for the full design.
+export const pendingExitOrder = sqliteTable(
+  "pending_exit_order",
+  {
+    id: id(),
+    walletAddress: text("wallet_address").notNull(),
+    marketSlug: text("market_slug").notNull(),
+    outcome: text("outcome").notNull(),
+    positionKey: text("position_key").notNull(), // trader|market_slug|outcome, matches bot.py's position_key()
+    shares: real("shares").notNull(),
+    // P_init/P_floor computed ONCE at creation (P_floor from the live
+    // measured edge at that moment, see db.compute_live_edge_pct) —
+    // currentPrice is what actually gets updated on each reprice.
+    initPrice: real("init_price").notNull(),
+    floorPrice: real("floor_price").notNull(),
+    currentPrice: real("current_price").notNull(),
+    bullpenOrderId: text("bullpen_order_id"),
+    // whale_sell | trailing_tp -- what triggered this exit, for audit.
+    closeReason: text("close_reason").notNull(),
+    // pending | filled | fallback_market_sell | canceled
+    status: text("status").notNull().default("pending"),
+    createdAt: timestampCol("created_at"),
+    lastRepricedAt: integer("last_repriced_at", { mode: "timestamp" }),
+    filledAt: integer("filled_at", { mode: "timestamp" }),
+  },
+  (t) => [index("pending_exit_order_status_idx").on(t.status)]
+);
 
 // Portfolio-level risk state, owned exclusively by bot.py's risk layer
 // (risk_manager.py, via db.py) — same ownership rule as the other bot_*
@@ -303,6 +498,34 @@ export const botRiskState = sqliteTable("bot_risk_state", {
 export const botMarketEvent = sqliteTable("bot_market_event", {
   marketSlug: text("market_slug").primaryKey(),
   eventSlug: text("event_slug").notNull(),
+  // Bucketed category (added for category-specific wallet scoring, 2026-07) — resolved
+  // alongside eventSlug via the event's own `tags` array (config.CATEGORY_TAG_SLUGS,
+  // first-match-wins, else "other"), cached here rather than a second lookup table since a
+  // market's event (and therefore its category) never changes once resolved. NULL for rows
+  // resolved before this column existed, or for a market whose event lookup didn't include
+  // category resolution — callers must not assume it's always populated.
+  category: text("category"),
+  // Whether this market pays Polymarket's holding rewards (added for TCA/scoring provenance,
+  // 2026-07) — a real 3.25% APR paid for merely HOLDING a position on eligible markets,
+  // independent of trading skill. Captured purely for documentation/audit purposes: this bot's
+  // category_scores_json (RISK_MANAGEMENT.md Rule 18/21) is reconstructed entirely from raw
+  // BUY/SELL trade events (packages/copy-trading/src/scoreWalletCategories.ts), and a holding
+  // reward payout is not a trade event, so it structurally cannot enter that reconstruction —
+  // this column does not feed any scoring formula, it exists so that claim is independently
+  // auditable per-market rather than asserted only in prose. Sourced from the same Gamma
+  // `/markets?slug=` response category resolution already fetches (`holdingRewardsEnabled`
+  // field) — zero extra API calls. NULL for rows resolved before this column existed.
+  holdingRewardsEnabled: integer("holding_rewards_enabled", { mode: "boolean" }),
+  // Market resolution date (YYYY-MM-DD), added 2026-07-26 for "Priority
+  // 4"'s theta-decay TTP activation threshold (config.
+  // ENABLE_THETA_DECAY_TP_ACTIVATION) — needs days-remaining-to-resolution
+  // per open position. Resolved via bot.resolve_market_end_date(), its own
+  // `bullpen polymarket market` call (a genuinely separate concern from
+  // event/category resolution above — see that function's own comment for
+  // why it isn't folded into resolve_market_event() despite hitting the
+  // same endpoint). NULL for rows resolved before this column existed, or
+  // when Theta-decay TP is disabled and this was never looked up.
+  endDateIso: text("end_date_iso"),
   resolvedAt: timestampCol("resolved_at"),
 });
 

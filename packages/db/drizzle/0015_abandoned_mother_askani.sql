@@ -1,0 +1,1 @@
+ALTER TABLE `paper_trade` ADD `last_priced_at` integer;

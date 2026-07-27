@@ -1,0 +1,1 @@
+ALTER TABLE `bot_market_event` ADD `end_date_iso` text;

@@ -1,9 +1,16 @@
 // npm run scan:leaderboard — populates LeaderboardScan.
 //
-// IMPORTANT, empirically verified (2026-07-17, see conversation/plan notes):
+// IMPORTANT, empirically verified (2026-07-17, see conversation/plan notes;
+// re-verified 2026-07-27 -- the API's behavior changed from a silent cap to
+// a hard rejection, see below):
 // there is NO single bullpen call that returns a 500-row leaderboard.
-// `bullpen polymarket discover traders --limit 500` caps at exactly 50 rows
-// no matter what --limit is passed, AND its --category filter is a
+// `bullpen polymarket discover traders --limit 500` used to silently cap at
+// 50 rows regardless of --limit; as of 2026-07-27 it instead hard-errors
+// (`exited 3: Invalid request: max limit of 50 exceeded`) if --limit exceeds
+// 50 -- confirmed live, this crashed a real scan run rather than silently
+// truncating. Fixed by requesting exactly 50 (DISCOVER_TRADERS_MAX_LIMIT
+// below), matching the real, currently-enforced ceiling instead of an
+// arbitrary larger number the API no longer tolerates. --category filter is a
 // documented-but-inert no-op (--category politics and --category crypto
 // return byte-identical wallet sets) — looping this call over categories
 // would just waste API calls for zero additional coverage. `bullpen tracker
@@ -100,6 +107,12 @@ const HOLDERS_PER_MARKET = 15;
 const READ_RETRIES = 3;
 const READ_RETRY_DELAY_MS = 500;
 const DATA_LEADERBOARD_LIMIT = 100; // unverified cap — discover traders capped at 50 despite a larger --limit; watch the real row count on first run
+// `bullpen polymarket discover traders`'s real, currently-enforced ceiling
+// (2026-07-27, confirmed live via the exact error message: "max limit of 50
+// exceeded") — passing anything above this hard-errors the whole scan run
+// instead of silently truncating, unlike the data-leaderboard/smart-money
+// calls above.
+const DISCOVER_TRADERS_MAX_LIMIT = 50;
 const SMART_MONEY_LIMIT = 100;
 // Categories smart-money's own --category flag documents (--help). "overall"
 // covers the general case; "sports" is the currently-verified-active niche
@@ -157,10 +170,10 @@ function parseDiscoverTradersTitle(title: string): { rank: number | null; pnl: n
 }
 
 async function scanDiscoverTradersOverall(): Promise<LeaderboardRow[]> {
-  const data = await runBullpenJson(["polymarket", "discover", "traders", "--limit", "500"], {
-    retries: READ_RETRIES,
-    retryDelayMs: READ_RETRY_DELAY_MS,
-  });
+  const data = await runBullpenJson(
+    ["polymarket", "discover", "traders", "--limit", String(DISCOVER_TRADERS_MAX_LIMIT)],
+    { retries: READ_RETRIES, retryDelayMs: READ_RETRY_DELAY_MS },
+  );
   const rows: any[] = data?.events ?? [];
   return rows.map((row) => {
     const { rank, pnl } = parseDiscoverTradersTitle(String(row.title ?? ""));

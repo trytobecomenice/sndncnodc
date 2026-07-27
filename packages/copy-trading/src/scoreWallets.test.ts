@@ -19,12 +19,14 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_RULES,
   analyzePnlSeries,
+  checkLiquidityFarmingGate,
   checkRecencyGate,
   checkToxicFlowGate,
   clamp,
   computeCompositeScore,
   computeCopyabilityScore,
   computeDemotedAddresses,
+  computeLiquidityFarmingSignal,
   computeRoiScore,
   computeSampleConfidence,
   computeWinRateScore,
@@ -149,6 +151,7 @@ function basePass2Result(overrides: Partial<Pass2Result> = {}): Pass2Result {
     compositeScore: 0.9,
     daysSinceLastTrade: 1,
     insufficientConsistencyData: false,
+    liquidityFarmingSignal: null,
     scoreBreakdown: {},
     ...overrides,
   };
@@ -511,6 +514,110 @@ describe("checkRecencyGate", () => {
     const gate = checkRecencyGate(r, rules);
     expect(gate?.status).toBe("ignore");
     expect(gate?.reason).toContain("ignored regardless of score");
+  });
+});
+
+// =============================================================================
+// computeLiquidityFarmingSignal
+// =============================================================================
+
+describe("computeLiquidityFarmingSignal", () => {
+  it("returns null for an empty sample (no trade history / fetch failed)", () => {
+    expect(computeLiquidityFarmingSignal([])).toBeNull();
+  });
+
+  it("reproduces the live gloriafoster-shaped signature: same quote repeated many times at an extreme price", () => {
+    const trades = Array.from({ length: 30 }, () => ({ type: "TRADE", price: 0.007, side: "SELL", slug: "market-a" }));
+    const signal = computeLiquidityFarmingSignal(trades);
+    expect(signal).not.toBeNull();
+    expect(signal?.sampleSize).toBe(30);
+    expect(signal?.extremePricePct).toBe(1);
+    expect(signal?.topRepeatedQuoteCount).toBe(30);
+  });
+
+  it("does not flag a diversified sample of different longshots in different markets", () => {
+    const trades = Array.from({ length: 30 }, (_, i) => ({ type: "TRADE", price: 0.02 + i * 0.001, side: "BUY", slug: `market-${i}` }));
+    const signal = computeLiquidityFarmingSignal(trades);
+    expect(signal?.topRepeatedQuoteCount).toBe(1);
+  });
+
+  it("ignores unpriced trades when computing extremePricePct but still counts them in sampleSize", () => {
+    const trades = [
+      { type: "TRADE", price: 0.5, side: "BUY", slug: "m" },
+      { type: "TRADE", side: "BUY", slug: "m" }, // no price field
+    ];
+    const signal = computeLiquidityFarmingSignal(trades);
+    expect(signal?.sampleSize).toBe(2);
+    expect(signal?.extremePricePct).toBe(0);
+  });
+});
+
+// =============================================================================
+// checkLiquidityFarmingGate (v4) — the pre-filter added this session in
+// response to the "being a bot isn't inherently the problem, unreplicable
+// edge is" correction. Mirrors checkToxicFlowGate's test shape.
+// =============================================================================
+
+describe("checkLiquidityFarmingGate", () => {
+  it("gates a wallet matching the confirmed live pattern, regardless of compositeScore", () => {
+    const r = basePass2Result({
+      compositeScore: 0.9,
+      liquidityFarmingSignal: { sampleSize: 30, extremePricePct: 1, topRepeatedQuoteCount: 30 },
+    });
+    const gate = checkLiquidityFarmingGate(r, rules);
+    expect(gate).not.toBeNull();
+    expect(gate?.status).toBe("ignore");
+    expect(gate?.reason).toContain("liquidity farming");
+    expect(gate?.reason).toContain("ignored regardless of score");
+  });
+
+  it("does NOT gate when liquidityFarmingSignal is null (fetch failed / no history) — fails open", () => {
+    const r = basePass2Result({ liquidityFarmingSignal: null });
+    expect(checkLiquidityFarmingGate(r, rules)).toBeNull();
+  });
+
+  it("does NOT gate a sample below minSampleSize even if both other conditions are met", () => {
+    const r = basePass2Result({
+      liquidityFarmingSignal: {
+        sampleSize: rules.liquidityFarming.minSampleSize - 1,
+        extremePricePct: 1,
+        topRepeatedQuoteCount: 999,
+      },
+    });
+    expect(checkLiquidityFarmingGate(r, rules)).toBeNull();
+  });
+
+  it("does NOT gate on extreme price alone (repeated-quote count below threshold)", () => {
+    const r = basePass2Result({
+      liquidityFarmingSignal: {
+        sampleSize: rules.liquidityFarming.minSampleSize,
+        extremePricePct: 1,
+        topRepeatedQuoteCount: rules.liquidityFarming.minRepeatedQuoteCount - 1,
+      },
+    });
+    expect(checkLiquidityFarmingGate(r, rules)).toBeNull();
+  });
+
+  it("does NOT gate on repeated-quote count alone (extreme price below threshold)", () => {
+    const r = basePass2Result({
+      liquidityFarmingSignal: {
+        sampleSize: rules.liquidityFarming.minSampleSize,
+        extremePricePct: rules.liquidityFarming.maxExtremePricePct - 0.01,
+        topRepeatedQuoteCount: 999,
+      },
+    });
+    expect(checkLiquidityFarmingGate(r, rules)).toBeNull();
+  });
+
+  it("gates exactly at both thresholds (>=, not strictly >)", () => {
+    const r = basePass2Result({
+      liquidityFarmingSignal: {
+        sampleSize: rules.liquidityFarming.minSampleSize,
+        extremePricePct: rules.liquidityFarming.maxExtremePricePct,
+        topRepeatedQuoteCount: rules.liquidityFarming.minRepeatedQuoteCount,
+      },
+    });
+    expect(checkLiquidityFarmingGate(r, rules)?.status).toBe("ignore");
   });
 });
 

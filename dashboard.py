@@ -14,6 +14,7 @@ unchanged from the JSON-file version.
 """
 
 import json
+import logging
 import os
 import signal
 import sqlite3
@@ -21,13 +22,26 @@ import subprocess
 import sys
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 
 import config
 from db import get_tracked_traders
 
 PORT = 8787
 PID_PATH = os.path.join(config.BASE_DIR, "bot.pid")
-BOT_LOG_PATH = os.path.join(config.BASE_DIR, "bot.out.log")
+BOT_LOG_PATH = config.BOT_LOG_PATH
+
+# Own rotating log (2026-07-22, disk-exhaustion hardening) — same reasoning
+# as bot.py's logger (see its module-level comment): a plain text file for
+# this process's own 2 status prints, capped instead of growing forever.
+logger = logging.getLogger("dashboard")
+logger.setLevel(logging.INFO)
+_file_handler = RotatingFileHandler(
+    config.DASHBOARD_LOG_PATH, maxBytes=config.LOG_MAX_BYTES, backupCount=config.LOG_BACKUP_COUNT,
+)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(_file_handler)
+logger.addHandler(logging.StreamHandler())
 INDEX_PATH = os.path.join(config.BASE_DIR, "static", "index.html")
 
 
@@ -77,16 +91,21 @@ def bot_pid():
 def start_bot():
     if bot_pid():
         return
-    log_f = open(BOT_LOG_PATH, "a")
-    # -u matches how the bot is started manually: unbuffered stdout, so
-    # bot.out.log updates line-by-line instead of in block-buffered bursts
-    # (buffered output caused a false "bot is silent/frozen" reading on
-    # 2026-07-18 — keep these two launch paths identical).
+    # 2026-07-22: no longer redirects the child's stdout to BOT_LOG_PATH via
+    # a file handle opened HERE. bot.py now owns that file itself through
+    # its own RotatingFileHandler (see bot.py's module-level logger setup) —
+    # keeping this Popen-level redirect too would (a) double-write every
+    # line bot.py's StreamHandler also mirrors to stdout, and worse, (b) go
+    # rotation-blind: this file handle would keep writing to bot.out.log's
+    # OLD inode after bot.py's handler rotates it away, so nothing from this
+    # side would ever appear in the current bot.out.log again after the
+    # first rotation. bot.py's own logger is the sole writer of that file
+    # now; this subprocess's stdout/stderr are simply discarded.
     proc = subprocess.Popen(
         [sys.executable, "-u", "bot.py"],
         cwd=config.BASE_DIR,
-        stdout=log_f,
-        stderr=subprocess.STDOUT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     with open(PID_PATH, "w") as f:
         f.write(str(proc.pid))
@@ -200,7 +219,9 @@ def build_status():
             "bot_running": bot_pid() is not None,
             "mode": "live" if config.LIVE_MODE else "paper",
             "tracked_traders": tracked_traders,
-            "fixed_trade_usd": config.FIXED_TRADE_USD,
+            "trade_size_usd": {
+                "min": config.MIN_TRADE_USD, "max": config.MAX_TRADE_USD, "base_if_unscored": config.BASE_TRADE_USD,
+            },
             "stats": {
                 "realized_pnl_usd": round(realized_pnl, 4),
                 "win_rate": round(win_rate, 1) if win_rate is not None else None,
@@ -267,7 +288,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     url = f"http://127.0.0.1:{PORT}"
-    print(f"Copybot dashboard running at {url}")
+    logger.info(f"Copybot dashboard running at {url}")
     try:
         webbrowser.open(url)
     except Exception:
@@ -275,7 +296,7 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nDashboard stopped.")
+        logger.info("Dashboard stopped.")
 
 
 if __name__ == "__main__":

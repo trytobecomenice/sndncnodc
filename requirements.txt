@@ -1,10 +1,16 @@
-# No third-party Python packages required — bot.py and dashboard.py use only
-# the Python standard library (json, subprocess, http.server, etc.).
+# bot.py and dashboard.py use only the Python standard library.
 #
-# The one external dependency is the Bullpen CLI, which must be installed and
-# authenticated separately (not a pip package):
+# wss_listener.py (2026-07-24, real-time on-chain trade detection — see
+# RISK_MANAGEMENT.md Rule 29's roadmap note) is the one script with a real
+# third-party dependency:
+web3==7.16.0
+python-dotenv==1.0.1
+
+# token_sync_worker.py (2026-07-24, populates token_registry from
+# Polymarket's Gamma API):
+aiohttp==3.14.3
+
+# The other external dependency is the Bullpen CLI, which must be installed
+# and authenticated separately (not a pip package):
 #   curl -fsSL https://cli.bullpen.fi/install.sh | bash
 #   bullpen login
-#
-# This file is kept for VS Code / tooling that expects a requirements.txt to
-# exist at the project root.

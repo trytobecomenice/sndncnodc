@@ -6,6 +6,8 @@
   "scripts": {
     "scan:leaderboard": "tsx src/scanLeaderboard.ts",
     "scan:wallets": "tsx src/scoreWallets.ts",
+    "score:wallet-categories": "tsx src/scoreWalletCategories.ts",
+    "discover:category-specialists": "tsx src/discoverCategorySpecialists.ts",
     "monitor:trades": "tsx src/monitorTrades.ts",
     "score:trades": "tsx src/scoreTrades.ts",
     "paper:update-pnl": "tsx src/paperUpdatePnl.ts",

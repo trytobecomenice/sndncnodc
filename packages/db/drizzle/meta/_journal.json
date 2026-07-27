@@ -57,6 +57,62 @@
       "when": 1784497879963,
       "tag": "0007_illegal_jane_foster",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1784734946447,
+      "tag": "0008_long_master_chief",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1784752558802,
+      "tag": "0009_nostalgic_amazoness",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1784838182686,
+      "tag": "0010_omniscient_lord_hawal",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1784880901121,
+      "tag": "0011_rich_morlocks",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1784881988639,
+      "tag": "0012_wealthy_terrax",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1784995958321,
+      "tag": "0013_sharp_susan_delgado",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1784996764688,
+      "tag": "0014_tearful_roxanne_simpson",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "6",
+      "when": 1785156759491,
+      "tag": "0015_abandoned_mother_askani",
+      "breakpoints": true
     }
   ]
 }

@@ -165,6 +165,7 @@ const READ_RETRIES = 3;
 const READ_RETRY_DELAY_MS = 500;
 const PASS1_CONCURRENCY = 5; // how many wallets' cheap calls run at once
 const PASS2_CONCURRENCY = 5; // how many wallets' expensive calls run at once
+const RECENT_TRADES_SAMPLE_SIZE = 50; // matches propose_pool_refill.py's POOL_REFILL_ACTIVITY_SAMPLE_SIZE
 
 // Ethereum addresses are case-INsensitive, but different bullpen commands
 // return them in different casing (checksummed mixed-case vs. lowercase).
@@ -293,10 +294,54 @@ export interface ScoringRules {
   // flow, it's just unknown, and is handled by the normal composite-score
   // path instead.
   minConsistencyScore: number;
+
+  // --- Liquidity-farming hard gate (v4) ---------------------------------------
+  //
+  // Motivated directly by a live finding (2026-07-27): 6 of 6 top-composite-
+  // score candidates checked by hand across two separate discovery scans
+  // showed the same disqualifying pattern -- NOT "being algorithmic" (an
+  // algo trader with genuine directional edge is fine to copy), but profit
+  // structurally unreplicable via a copy with lag and taker fees: repeated
+  // SELLs/BUYs at the identical near-zero-or-near-one price in the SAME
+  // market, minutes apart, sizes varying wildly (e.g. 0.06/78.0/0.08 shares
+  // at the exact same $0.007 quote) -- liquidity-rewards farming, not
+  // conviction. A separate candidate showed the SAME-second opposite-side
+  // pattern across overlapping markets (cross-market arbitrage). Neither
+  // toxic-flow (consistencyScore) nor recency catches this: these wallets
+  // often show HIGH consistency and recent activity precisely because
+  // selling long-shot NO tokens at scale looks smooth and profitable on
+  // paper. This is a genuinely different failure mode from toxic flow, not
+  // a duplicate of it.
+  //
+  // A sample of this wallet's real recent trades (fetchRecentTrades, a NEW
+  // pass-2 call -- `bullpen polymarket activity`, distinct from the
+  // existing `wallet-stats --section activity` which only returns
+  // first/last timestamps, not per-trade price/side/slug) is checked for:
+  //   - what fraction sit at an extreme price (<0.05 or >0.95) -- betting
+  //     near-certain/near-impossible outcomes at scale, consistent with
+  //     farming Polymarket's liquidity-rewards program near the edges of
+  //     the price range, not genuine directional conviction.
+  //   - how many times the single most-repeated (market, price) pair
+  //     recurs -- hitting the exact same quote repeatedly is a
+  //     liquidity-provision signature; a real conviction bet doesn't need
+  //     the same fill 10+ times in one market.
+  // Gated on BOTH conditions together (not either alone): a wallet that's
+  // heavily concentrated at extreme prices AND repeatedly hits the same
+  // quote is the confirmed live pattern; either signal alone is weaker
+  // (e.g. a wallet could legitimately buy several DIFFERENT longshots
+  // without farming any single one).
+  liquidityFarming: {
+    // Minimum trades in the sample before this gate is even evaluated --
+    // below this, the sample is too thin to trust either stat (mirrors
+    // hardMinTrades' same "don't gate on too little data" reasoning).
+    minSampleSize: number;
+    maxExtremePricePct: number; // fraction (0..1) of sampled trades at price <0.05 or >0.95
+    minRepeatedQuoteCount: number; // times the single most-common (market, price) pair recurs
+  };
 }
 
 export const DEFAULT_RULES: ScoringRules = {
-  version: 3,
+  version: 4,
   weights: { roi: 0.3, consistency: 0.2, winRate: 0.3, copyability: 0.2 },
   roiSaturation: 0.5,
   sharpeSaturation: 0.15,
@@ -313,6 +358,7 @@ export const DEFAULT_RULES: ScoringRules = {
   topNPoolExpansion: 5,
   minMonthlyTradesForFullPool: 10,
   minConsistencyScore: 0.2,
+  liquidityFarming: { minSampleSize: 20, maxExtremePricePct: 0.5, minRepeatedQuoteCount: 5 },
 };
 
 /**
@@ -336,8 +382,8 @@ async function getActiveRuleSet(): Promise<ScoringRules> {
     }
     console.log(
       `Active rule_set is v${active.version}, but this script now defines v${DEFAULT_RULES.version} ` +
-        `(rolling-window scoring + win rate + top-N pool + toxic-flow consistency gate) — deactivating ` +
-        `v${active.version} and activating v${DEFAULT_RULES.version}.`
+        `(rolling-window scoring + win rate + top-N pool + toxic-flow consistency gate + liquidity-farming ` +
+        `gate) — deactivating v${active.version} and activating v${DEFAULT_RULES.version}.`
     );
     await db.update(ruleSet).set({ isActive: false }).where(eq(ruleSet.id, rows[0].id));
   } else {
@@ -355,10 +401,15 @@ async function getActiveRuleSet(): Promise<ScoringRules> {
       "with no trade in the last 30 days is force-ignored regardless of score. A wallet whose rolling-window " +
       "consistencyScore is below 0.20 is force-ignored as 'toxic flow - volume farmer', regardless of ROI or " +
       "win rate, unless it has too little windowed data to assess (exempted from that gate, not the same as " +
-      "passing it). Only the top 15 (or 20 if recent bot trade volume is thin) qualifying wallets become " +
-      "'track'; the rest are demoted to 'watch'. Supersedes v1's lifetime-history scoring (under-rated " +
-      "dormant-then-hot wallets) and v2 (had no defense against high-win-rate/low-consistency volume-farmer " +
-      "flow). Seeded by scoreWallets.ts.",
+      "passing it). A wallet whose sampled recent trades are >=50% extreme-price (<0.05 or >0.95) AND whose " +
+      "single most-repeated (market, price) pair recurs >=5 times is force-ignored as 'liquidity farming / " +
+      "unreplicable edge', regardless of composite score — being algorithmic isn't itself disqualifying, " +
+      "profit structurally unreplicable via a copy with lag/fees is. Only the top 15 (or 20 if recent bot " +
+      "trade volume is thin) qualifying wallets become 'track'; the rest are demoted to 'watch'. Supersedes " +
+      "v1's lifetime-history scoring (under-rated dormant-then-hot wallets), v2 (no defense against " +
+      "high-win-rate/low-consistency volume-farmer flow), and v3 (no defense against liquidity-rewards " +
+      "farming / micro-arbitrage, which can show HIGH consistency and recent activity). Seeded by " +
+      "scoreWallets.ts.",
   });
   return DEFAULT_RULES;
 }
@@ -555,6 +606,74 @@ async function fetchActivityBounds(address: string): Promise<ActivityBoundsData 
     console.warn(`  wallet-stats activity failed for ${address}: ${(err as Error).message}`);
     return null;
   }
+}
+
+/** One real trade record from `bullpen polymarket activity`. */
+interface RecentTradeRecord {
+  type: string;
+  price?: number;
+  side?: string;
+  slug?: string;
+  size?: number;
+}
+
+/**
+ * Fetches a sample of this wallet's actual recent trades (price/side/slug
+ * per trade) — the liquidity-farming gate's input. Deliberately a DIFFERENT
+ * bullpen call from fetchActivityBounds above: `wallet-stats --section
+ * activity` only returns first/last timestamps and a count, not per-trade
+ * records. This one hits `polymarket activity --address`, which does.
+ * Mirrors propose_pool_refill.py's fetch_recent_trades exactly (same
+ * endpoint, same TRADE-only filter, same default sample size).
+ * INPUT:  a wallet address
+ * OUTPUT: an array of TRADE-type activity records (empty array if the call
+ *         failed or the wallet has no trade history)
+ */
+async function fetchRecentTrades(address: string): Promise<RecentTradeRecord[]> {
+  try {
+    const response = await runBullpenJson(
+      ["polymarket", "activity", "--address", address, "--limit", String(RECENT_TRADES_SAMPLE_SIZE)],
+      { retries: READ_RETRIES, retryDelayMs: READ_RETRY_DELAY_MS }
+    );
+    const activities: RecentTradeRecord[] = response?.activities ?? [];
+    return activities.filter((a) => a.type === "TRADE");
+  } catch (err) {
+    console.warn(`  polymarket activity failed for ${address}: ${(err as Error).message}`);
+    return [];
+  }
+}
+
+/**
+ * Plain diagnostic stats computed from a real trade sample — the same two
+ * numbers propose_pool_refill.py's summarize_liquidity_farming_signal
+ * surfaces for human review, now used programmatically as a hard gate:
+ *   - extremePricePct: fraction of sampled trades at price <0.05 or >0.95
+ *     (betting near-certain/near-impossible outcomes at scale, consistent
+ *     with farming Polymarket's liquidity-rewards program, not conviction).
+ *   - topRepeatedQuoteCount: how many times the single most-common
+ *     (market, price) pair recurs in the sample (hitting the exact same
+ *     quote repeatedly is a liquidity-provision signature).
+ * INPUT:  an array of TRADE records from fetchRecentTrades
+ * OUTPUT: { sampleSize, extremePricePct, topRepeatedQuoteCount }, or null
+ *         if the sample is empty (no trade history / fetch failed)
+ */
+export function computeLiquidityFarmingSignal(
+  trades: RecentTradeRecord[]
+): { sampleSize: number; extremePricePct: number; topRepeatedQuoteCount: number } | null {
+  if (trades.length === 0) return null;
+  const priced = trades.filter((t) => typeof t.price === "number");
+  const extreme = priced.filter((t) => t.price! < 0.05 || t.price! > 0.95).length;
+  const quoteCounts = new Map<string, number>();
+  for (const t of priced) {
+    const key = `${t.slug ?? ""}|${t.price!.toFixed(3)}`;
+    quoteCounts.set(key, (quoteCounts.get(key) ?? 0) + 1);
+  }
+  const topRepeatedQuoteCount = quoteCounts.size > 0 ? Math.max(...quoteCounts.values()) : 0;
+  return {
+    sampleSize: trades.length,
+    extremePricePct: priced.length > 0 ? extreme / priced.length : 0,
+    topRepeatedQuoteCount,
+  };
 }
 
 /**
@@ -1094,6 +1213,11 @@ export interface Pass2Result {
   // "unknown," not "confirmed low," and this wallet is exempt from the
   // toxic-flow hard gate in finalizeAndWrite.
   insufficientConsistencyData: boolean;
+  // From computeLiquidityFarmingSignal — null if the trade-sample fetch
+  // failed or the wallet has no trade history (exempt from the liquidity-
+  // farming gate in finalizeAndWrite, same "missing data isn't evidence"
+  // reasoning as insufficientConsistencyData above).
+  liquidityFarmingSignal: { sampleSize: number; extremePricePct: number; topRepeatedQuoteCount: number } | null;
   scoreBreakdown: Record<string, unknown>;
 }
 
@@ -1111,16 +1235,18 @@ export interface Pass2Result {
  */
 async function runPass2(survivors: Pass1Survivor[], rules: ScoringRules): Promise<Pass2Result[]> {
   console.log(
-    `Pass 2 (deep dive): fetching pnl-series + behavior + activity for ${survivors.length} wallets that ` +
-      `passed pass 1, ${PASS2_CONCURRENCY} at a time...`
+    `Pass 2 (deep dive): fetching pnl-series + behavior + activity + recent trades for ${survivors.length} ` +
+      `wallets that passed pass 1, ${PASS2_CONCURRENCY} at a time...`
   );
 
   return mapWithConcurrency(survivors, PASS2_CONCURRENCY, async (candidate) => {
-    const [series, behaviorStats, activityBounds] = await Promise.all([
+    const [series, behaviorStats, activityBounds, recentTrades] = await Promise.all([
       fetchPnlSeries(candidate.address),
       fetchBehaviorStats(candidate.address),
       fetchActivityBounds(candidate.address),
+      fetchRecentTrades(candidate.address),
     ]);
+    const liquidityFarmingSignal = computeLiquidityFarmingSignal(recentTrades);
 
     const { consistencyScore, oneHitWonderPenalty, recentWinRate, insufficientData } = analyzePnlSeries(
       series,
@@ -1162,6 +1288,7 @@ async function runPass2(survivors: Pass1Survivor[], rules: ScoringRules): Promis
       compositeScore,
       daysSinceLastTrade,
       insufficientConsistencyData: insufficientData,
+      liquidityFarmingSignal,
       scoreBreakdown: {
         pass: 2,
         roiScore: candidate.roiScore,
@@ -1178,6 +1305,7 @@ async function runPass2(survivors: Pass1Survivor[], rules: ScoringRules): Promis
         behaviorWinRate7d: behaviorStats?.win_rate_7d ?? null,
         behaviorTradesPerDay30d: behaviorStats?.avg_trades_per_day_30d ?? null,
         daysSinceLastTrade,
+        liquidityFarmingSignal,
       },
     };
   });
@@ -1266,6 +1394,51 @@ export function checkRecencyGate(r: Pass2Result, rules: ScoringRules): { status:
 }
 
 /**
+ * Liquidity-farming hard gate (v4) (pure decision logic — see the
+ * "Liquidity-farming hard gate (v4)" doc comment on ScoringRules). Extracted
+ * for the same testability reason as checkToxicFlowGate/checkRecencyGate.
+ *
+ * Gated on BOTH extreme-price-% AND repeated-quote-count together, not
+ * either alone — a wallet heavily concentrated at extreme prices AND
+ * repeatedly hitting the same quote is the confirmed live pattern
+ * (gloriafoster/Asperatus/etc.); either signal alone is weaker on its own
+ * (e.g. legitimately buying several DIFFERENT longshots isn't farming any
+ * single one).
+ *
+ * INPUT:  r — a Pass2Result; rules — active ScoringRules
+ * OUTPUT: the ignore verdict + reason if gated, or null if this wallet
+ *         passes through. liquidityFarmingSignal === null (the activity
+ *         fetch failed or the wallet has no trade history) or a sample
+ *         below rules.liquidityFarming.minSampleSize always passes through
+ *         — this gate fails OPEN on missing/thin data, same "unknown isn't
+ *         confirmed" reasoning as the toxic-flow gate's insufficientData
+ *         exemption.
+ */
+export function checkLiquidityFarmingGate(
+  r: Pass2Result,
+  rules: ScoringRules
+): { status: "ignore"; reason: string } | null {
+  const signal = r.liquidityFarmingSignal;
+  if (!signal || signal.sampleSize < rules.liquidityFarming.minSampleSize) {
+    return null;
+  }
+  const extremeGated = signal.extremePricePct >= rules.liquidityFarming.maxExtremePricePct;
+  const repeatedQuoteGated = signal.topRepeatedQuoteCount >= rules.liquidityFarming.minRepeatedQuoteCount;
+  if (!extremeGated || !repeatedQuoteGated) {
+    return null;
+  }
+  return {
+    status: "ignore",
+    reason:
+      `liquidity farming / unreplicable edge: ${(signal.extremePricePct * 100).toFixed(1)}% of ${signal.sampleSize} ` +
+      `sampled trades were at an extreme price (<0.05 or >0.95), and the single most-repeated (market, price) ` +
+      `pair recurred ${signal.topRepeatedQuoteCount} times — >= ${rules.liquidityFarming.minRepeatedQuoteCount} ` +
+      `threshold (composite score was ${r.compositeScore.toFixed(3)}, ignored regardless of score: being ` +
+      `algorithmic isn't disqualifying, profit unreplicable via a copy with lag/fees is)`,
+  };
+}
+
+/**
  * Top-N pool cap (pure decision logic — see the "TOP-15 POOL" doc comment
  * at the top of this file). Extracted for the same testability reason as
  * checkToxicFlowGate/checkRecencyGate.
@@ -1301,9 +1474,16 @@ export function computeDemotedAddresses<T extends { address: string; status: str
  *   2. Recency gate: any wallet with no trade within maxDaysSinceLastTrade
  *      is force-"ignore"'d immediately, independent of its score, and
  *      written right away — it never competes for a pool slot.
- *   3. Every remaining wallet gets its RAW status via decideStatus (the
+ *   3. Liquidity-farming gate (v4): any wallet whose sampled recent trades
+ *      are dominated by extreme-price fills AND a heavily-repeated quote is
+ *      force-"ignore"'d immediately, independent of compositeScore — see
+ *      the "Liquidity-farming hard gate (v4)" doc comment on ScoringRules.
+ *      Being algorithmic isn't disqualifying; this catches profit that's
+ *      structurally unreplicable via a copy with lag/fees, which the
+ *      composite-score formula alone rewards rather than penalizes.
+ *   4. Every remaining wallet gets its RAW status via decideStatus (the
  *      same absolute-threshold logic as before — unchanged).
- *   4. Among wallets that independently earned "track", only the top
+ *   5. Among wallets that independently earned "track", only the top
  *      `poolSize` (by compositeScore) keep "track"; the rest are demoted to
  *      "watch" — still a good wallet, just not one of this month's picks.
  *
@@ -1375,7 +1555,37 @@ async function finalizeAndWrite(results: Pass2Result[], rules: ScoringRules): Pr
     eligible.push(r);
   }
 
-  const decided = eligible.map((r) => ({ ...r, ...decideStatus(r.compositeScore, r.walletStats.trades_count, rules) }));
+  const afterLiquidityFarmingGate: Pass2Result[] = [];
+  let liquidityFarmingDropped = 0;
+
+  for (const r of eligible) {
+    const gate = checkLiquidityFarmingGate(r, rules);
+    if (gate) {
+      await upsertWalletProfile({
+        walletAddress: r.address,
+        displayName: r.displayName,
+        walletStats: r.walletStats,
+        tradeFlow: r.tradeFlow,
+        roiScore: r.roiScore,
+        consistencyScore: r.consistencyScore,
+        copyabilityScore: r.copyabilityScore,
+        oneHitWonderPenalty: r.oneHitWonderPenalty,
+        recentWinRate: r.recentWinRate,
+        compositeScore: r.compositeScore,
+        status: gate.status,
+        statusReason: gate.reason,
+        scoreBreakdown: r.scoreBreakdown,
+      });
+      liquidityFarmingDropped++;
+      continue;
+    }
+    afterLiquidityFarmingGate.push(r);
+  }
+
+  const decided = afterLiquidityFarmingGate.map((r) => ({
+    ...r,
+    ...decideStatus(r.compositeScore, r.walletStats.trades_count, rules),
+  }));
 
   const demotedAddresses = computeDemotedAddresses(decided, poolSize);
 
@@ -1411,11 +1621,12 @@ async function finalizeAndWrite(results: Pass2Result[], rules: ScoringRules): Pr
     });
   }
 
-  const totalIgnored = ignored + recencyDropped + toxicFlowDropped;
+  const totalIgnored = ignored + recencyDropped + toxicFlowDropped + liquidityFarmingDropped;
   console.log(
     `Pass 2 + ranking complete: ${tracked} track, ${watched} watch, ${totalIgnored} ignore ` +
-      `(${toxicFlowDropped} force-ignored as toxic flow / volume farmers, ${recencyDropped} force-ignored ` +
-      `for going cold, ${demotedAddresses.size} demoted from track by the pool cap).`
+      `(${toxicFlowDropped} force-ignored as toxic flow / volume farmers, ${liquidityFarmingDropped} ` +
+      `force-ignored as liquidity farming / unreplicable edge, ${recencyDropped} force-ignored for going ` +
+      `cold, ${demotedAddresses.size} demoted from track by the pool cap).`
   );
 }
 
@@ -1432,6 +1643,9 @@ async function main() {
       `winRate=${rules.weights.winRate}, copyability=${rules.weights.copyability}; ` +
       `rolling window=${rules.rollingWindowDays}d; recency limit=${rules.maxDaysSinceLastTrade}d; ` +
       `min consistency=${rules.minConsistencyScore} (toxic-flow gate); ` +
+      `liquidity-farming gate: >=${rules.liquidityFarming.minSampleSize} sample, ` +
+      `>=${(rules.liquidityFarming.maxExtremePricePct * 100).toFixed(0)}% extreme price + ` +
+      `>=${rules.liquidityFarming.minRepeatedQuoteCount}x repeated quote; ` +
       `top-N pool=${rules.topNPoolSize} (+${rules.topNPoolExpansion} if signal is thin))`
   );
 

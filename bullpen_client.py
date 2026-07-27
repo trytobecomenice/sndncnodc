@@ -34,6 +34,18 @@ class BullpenTimeoutError(RuntimeError):
     """
 
 
+class BullpenAuthError(RuntimeError):
+    """The bullpen CLI exited 2 ("Authentication failure" — the CLI's own
+    documented exit code, confirmed via `bullpen --help`). Distinct from a
+    generic RuntimeError specifically so callers can tell "the session is
+    dead, a human needs to run `bullpen login`" apart from an ordinary
+    transient failure worth just retrying. Added 2026-07-21 after a real
+    incident where an expired session was silently retried every 30s for
+    ~2 hours (264 identical error rows) instead of being recognized and
+    escalated — see bot.py's main() auth-halt handling.
+    """
+
+
 def run_bullpen_json(args, retries=1, retry_delay=0.5, timeout=None):
     """retries=1 means "try once, no retry" — that's the default and MUST stay
     the default for any call that can move funds (buy/sell). Only read-only
@@ -92,9 +104,10 @@ def _run_bullpen_json_once(args, timeout=None):
         detail = result.stderr.strip()
         if isinstance(data, dict):
             detail = data.get("error") or data.get("error_code") or data.get("message") or detail
-        raise RuntimeError(
-            f"bullpen {' '.join(args)} exited {result.returncode}: {detail or 'no error detail'}"
-        )
+        message = f"bullpen {' '.join(args)} exited {result.returncode}: {detail or 'no error detail'}"
+        if result.returncode == 2:
+            raise BullpenAuthError(message)
+        raise RuntimeError(message)
     if data is None:
         raise RuntimeError(f"bullpen {' '.join(args)} produced no parseable JSON output: {result.stdout!r}")
     if isinstance(data, dict) and data.get("ok") is False:
@@ -133,4 +146,54 @@ def extract_fill_price(response):
         value = response.get(key)
         if isinstance(value, (int, float)) and 0 < value <= 1:
             return float(value)
+    return None
+
+
+def extract_filled_shares(response):
+    """Best-effort read of the ACTUAL number of shares filled from a buy
+    response (2026-07-26, entry-side FAK integration) -- specifically to
+    avoid overstating our position on a PARTIAL fill: a Fill-And-Kill order
+    can legitimately fill less than requested and cancel the remainder, so
+    the caller must not assume the full requested size executed just
+    because a fill_price is present. Same UNVERIFIED-against-a-real-
+    response status as extract_fill_price/extract_order_id -- no live FAK
+    order has ever been placed by this bot. Returns None (not 0) when no
+    plausible field is present, so the caller can distinguish "genuinely
+    filled zero shares" (a real, present numeric 0) from "response shape
+    doesn't tell us" (None) and fall back accordingly.
+    """
+    for key in ("filled_shares", "shares_filled", "matched_shares", "shares", "size"):
+        value = response.get(key)
+        if isinstance(value, (int, float)) and value >= 0:
+            return float(value)
+    return None
+
+
+def extract_order_id(response):
+    """Best-effort read of a resting order's id from a `limit-buy`/
+    `limit-sell` response (2026-07-26, Priority 3's patient exit pegging).
+    Same honesty status as extract_fill_price(): no live limit order has
+    ever been placed by this bot (paper mode only, all session), so the
+    exact field name is UNVERIFIED — tries the plausible candidates,
+    returns None if none present, in which case the caller must treat the
+    order as unable-to-track (log the raw response, do not assume a
+    successful placement) rather than silently proceed as if it had an id.
+    """
+    for key in ("order_id", "orderId", "id"):
+        value = response.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def extract_order_status(response):
+    """Best-effort read of a resting order's status field (2026-07-26,
+    Priority 3). Same UNVERIFIED status as extract_order_id() — no live
+    limit order has ever been placed or polled by this bot. Returns the
+    raw string (uppercased) or None.
+    """
+    for key in ("status", "order_status", "state"):
+        value = response.get(key)
+        if isinstance(value, str) and value:
+            return value.upper()
     return None
