@@ -127,6 +127,31 @@ def wallet_exposure_cap_usd(wallet_address):
     return override if override is not None else config.MAX_WALLET_EXPOSURE_USD
 
 
+def depth_capped_trade_size_usd(trade_size_usd, book_depth_usd, depth_fraction):
+    """Clamps a single trade's own size to a fraction of ITS market's visible
+    order-book depth (added 2026-07-28) -- a genuinely different axis from
+    every other guard in this file: those cap aggregate exposure across many
+    positions/markets for one wallet/event/portfolio; this caps how much of
+    ONE market's own liquidity a SINGLE trade is allowed to eat, independent
+    of whatever else is open. Deliberately NOT folded into
+    wallet_exposure_cap_usd()/event_exposure_usd() -- book depth is a
+    property of the specific market being traded right now, not something
+    that aggregates the way dollars-deployed-across-positions does (see
+    docs/copy-trading/RISK_MANAGEMENT.md's Depth-Aware Trade Sizing rule for
+    the full reasoning).
+
+    book_depth_usd is None (fetch failed/unavailable, or simply never
+    computed by a caller that doesn't have it) returns trade_size_usd
+    UNCLAMPED -- a guard that can't get real data must not invent a worse
+    number (same posture as compute_unrealized_pnl's treatment of an
+    unpriceable position below), and never treats "unknown" as "zero
+    liquidity." Pure function, unit-testable without a DB or network call.
+    """
+    if book_depth_usd is None:
+        return trade_size_usd
+    return min(trade_size_usd, book_depth_usd * depth_fraction)
+
+
 def check_buy(positions, market_to_event, event_slug, trade_usd, kill_switch, wallet_address=None):
     """The pre-BUY risk gate. Returns (ok, skip_event_type, reason):
     (True, None, None) if the BUY may proceed, otherwise ok=False with the

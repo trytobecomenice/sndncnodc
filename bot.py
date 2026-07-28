@@ -555,6 +555,29 @@ def get_market_bid_ask(market_slug, outcome):
     return best_bid, best_ask, None
 
 
+def fetch_book_depth_usd(market_slug, outcome):
+    """Visible ASK-side depth in USD (sum of price*size across every level
+    the book returns) for risk_manager.depth_capped_trade_size_usd() —
+    the side a BUY consumes. Added 2026-07-28 (Depth-Aware Trade Sizing).
+
+    Returns None on ANY fetch failure (network/timeout/parse/stale-book —
+    same failure modes fetch_order_book already raises on), never a guessed
+    or zero value — the caller (process_trade) treats None as "skip the
+    depth clamp for this trade," same fail-open posture as every other
+    price-fetch helper in this file (get_market_ask_price/get_market_bid_ask
+    above).
+    """
+    try:
+        _, book = polymarket_simulator.fetch_order_book_for_outcome(market_slug, outcome)
+    except Exception:
+        return None
+
+    asks = book.get("asks") or []
+    if not asks:
+        return None
+    return sum(price * size for price, size in asks)
+
+
 def compute_slippage_floor_price(mid_price, live_edge_pct, protection_fraction=None):
     """Priority 3's slippage floor for a patient SELL: the worst (lowest)
     price we'll accept, expressed as protection_fraction of the LIVE
@@ -2502,6 +2525,29 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
             return
 
         trade_usd = compute_trade_size_usd(wallet_score_entry, price, category)
+
+        # Depth-Aware Trade Sizing (2026-07-28) — always fetches and logs
+        # what the depth-capped size WOULD be when it would actually bind,
+        # regardless of config.ENABLE_DEPTH_AWARE_TRADE_SIZING; only the
+        # actual shrink of trade_usd is gated behind that flag (same
+        # "watch what would happen in the log first" rollout as
+        # ENABLE_ZOMBIE_POSITION_DUMP). Skipped entirely when trade_usd is
+        # already non-positive — no point spending a network call sizing a
+        # copy that's about to be skipped anyway.
+        if trade_usd > 0:
+            book_depth_usd = fetch_book_depth_usd(market_slug, outcome)
+            depth_capped_usd = risk_manager.depth_capped_trade_size_usd(
+                trade_usd, book_depth_usd, config.TRADE_SIZE_DEPTH_FRACTION
+            )
+            if depth_capped_usd < trade_usd:
+                append_log({**base_event, "event_type": "depth_cap_would_apply",
+                            "reason": f"trade_usd ${trade_usd:.2f} exceeds "
+                                      f"{config.TRADE_SIZE_DEPTH_FRACTION:.0%} of this market's "
+                                      f"visible ask-side book depth (${book_depth_usd:.2f}) — "
+                                      f"would clamp to ${depth_capped_usd:.2f} if "
+                                      f"ENABLE_DEPTH_AWARE_TRADE_SIZING were on"})
+                if config.ENABLE_DEPTH_AWARE_TRADE_SIZING:
+                    trade_usd = depth_capped_usd
 
         # Score snapshot (2026-07-23, point 3.2 prerequisite; updated
         # 2026-07-24 for half-Kelly sizing) — mirrors compute_trade_size_usd()'s

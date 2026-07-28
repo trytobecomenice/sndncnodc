@@ -665,6 +665,33 @@ VIP_WALLET_EXPOSURE_CAP_USD = {
     "0x510904c9a58f5c5ad799a1b44947077564175e9c": 100.0,
 }
 
+# Depth-Aware Trade Sizing (added 2026-07-28) — clamps a SINGLE trade's own
+# size to a fraction of ITS market's visible order-book depth
+# (risk_manager.depth_capped_trade_size_usd()), independent of
+# MAX_EVENT_EXPOSURE_USD/MAX_WALLET_EXPOSURE_USD above. Deliberately NOT a
+# change to those two caps: book depth is a property of the specific market
+# being traded right now, not something that aggregates the way dollars-
+# deployed-across-positions does — there's no single "depth" number for a
+# whole wallet's exposure, which can span many different markets each with
+# their own book. See docs/copy-trading/RISK_MANAGEMENT.md's Depth-Aware
+# Trade Sizing rule for the full reasoning.
+#
+# OPT-IN, default OFF: bot.py's process_trade() always fetches and logs what
+# the depth-capped size WOULD have been (event_type="depth_cap_would_apply",
+# only when it would have actually bound) regardless of this flag — only the
+# actual clamp (shrinking trade_usd before _execute_buy) is gated behind it,
+# same "watch what would happen in the log first" rollout pattern as
+# ENABLE_ZOMBIE_POSITION_DUMP.
+ENABLE_DEPTH_AWARE_TRADE_SIZING = False
+
+# Max fraction of a market's own visible ask-side book depth (in USD, summed
+# across levels) a single trade may consume. 0.05 (5%): an explicit judgment
+# call, not derived from data — same "chosen, not measured" status as
+# SLIPPAGE_PROTECTION_FRACTION and every other constant in this file labeled
+# that way. Revisit once ENABLE_DEPTH_AWARE_TRADE_SIZING has run in
+# observability-only mode long enough to show how often it would actually bind.
+TRADE_SIZE_DEPTH_FRACTION = 0.05
+
 # "Dip & Rebound" resting paper orders (added 2026-07-24, Rule 29 — pilot
 # scoped to strict-4 only). Wallets in this set skip the normal immediate
 # copy path entirely: instead of buying at whatever price is live the

@@ -126,6 +126,35 @@ class TestVipWalletExposureCap(ConfigPatchingTestCase):
         self.assertEqual(event_type, "skip_risk_wallet_cap")
 
 
+class TestDepthCappedTradeSizeUsd(unittest.TestCase):
+    """Depth-Aware Trade Sizing, 2026-07-28. Pure function -- no config to
+    patch, depth_fraction is passed explicitly at every call site."""
+
+    def test_uncapped_when_trade_fits_within_depth_fraction(self):
+        # $5 trade, 5% of $200 depth = $10 -- fits, unchanged.
+        self.assertEqual(risk_manager.depth_capped_trade_size_usd(5.0, 200.0, 0.05), 5.0)
+
+    def test_clamps_when_trade_exceeds_depth_fraction(self):
+        # $10 trade, 5% of $100 depth = $5 -- clamps down to $5.
+        self.assertEqual(risk_manager.depth_capped_trade_size_usd(10.0, 100.0, 0.05), 5.0)
+
+    def test_landing_exactly_on_the_depth_fraction_is_unclamped(self):
+        # $5 trade, 5% of $100 depth = exactly $5 -- not a clamp, same "would
+        # exceed" semantics as check_buy's other limits.
+        self.assertEqual(risk_manager.depth_capped_trade_size_usd(5.0, 100.0, 0.05), 5.0)
+
+    def test_none_book_depth_returns_trade_size_unclamped(self):
+        # Fetch failure/unavailable -- fail-open, never invents a worse
+        # number or treats unknown as zero liquidity.
+        self.assertEqual(risk_manager.depth_capped_trade_size_usd(7.5, None, 0.05), 7.5)
+
+    def test_zero_book_depth_clamps_to_zero(self):
+        # A real, successfully-fetched book with genuinely zero visible
+        # depth (distinct from None/unavailable) correctly clamps to 0 --
+        # this IS real information, not a fetch failure.
+        self.assertEqual(risk_manager.depth_capped_trade_size_usd(5.0, 0.0, 0.05), 0.0)
+
+
 class TestCheckBuy(ConfigPatchingTestCase):
     def setUp(self):
         super().setUp()

@@ -765,6 +765,7 @@ class TestProcessTradeScoreSnapshot(unittest.TestCase):
         kwargs = self._base_kwargs(wallet_score_entry)
         with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
              patch("bot.measure_paper_shortfall", return_value={}), \
+             patch("bot.fetch_book_depth_usd", return_value=None), \
              patch("bot.append_log", return_value="decision-journal-id-123") as mock_log:
             bot.process_trade(**kwargs)
 
@@ -796,6 +797,7 @@ class TestProcessTradeScoreSnapshot(unittest.TestCase):
         kwargs = self._base_kwargs(wallet_score_entry)
         with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
              patch("bot.measure_paper_shortfall", return_value={}), \
+             patch("bot.fetch_book_depth_usd", return_value=None), \
              patch("bot.append_log", return_value="decision-journal-id-456") as mock_log:
             bot.process_trade(**kwargs)
 
@@ -811,6 +813,7 @@ class TestProcessTradeScoreSnapshot(unittest.TestCase):
         kwargs = self._base_kwargs(None)
         with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
              patch("bot.measure_paper_shortfall", return_value={}), \
+             patch("bot.fetch_book_depth_usd", return_value=None), \
              patch("bot.append_log", return_value=None) as mock_log:
             bot.process_trade(**kwargs)
 
@@ -839,6 +842,7 @@ class TestProcessTradeScoreSnapshot(unittest.TestCase):
         kwargs = self._base_kwargs(wallet_score_entry)
         with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
              patch("bot.measure_paper_shortfall", return_value={}), \
+             patch("bot.fetch_book_depth_usd", return_value=None), \
              patch("bot.append_log", return_value=None) as mock_log:
             bot.process_trade(**kwargs)
 
@@ -851,6 +855,106 @@ class TestProcessTradeScoreSnapshot(unittest.TestCase):
         self.assertLessEqual(event["score_breakdown"]["kelly_fraction"], 0)
         self.assertEqual(event["score_breakdown"]["trade_size_usd"], 0.0)
         self.assertNotIn("0xtrader|some-market|Yes", kwargs["positions"])
+
+
+class TestDepthAwareTradeSizing(unittest.TestCase):
+    """Depth-Aware Trade Sizing (2026-07-28) integration through
+    process_trade() — mirrors TestProcessTradeScoreSnapshot's drive-a-real-
+    BUY-through-process_trade style, patching bot.fetch_book_depth_usd
+    instead of hitting the network."""
+
+    def setUp(self):
+        self._saved = (config.ENABLE_DEPTH_AWARE_TRADE_SIZING, config.TRADE_SIZE_DEPTH_FRACTION)
+        config.TRADE_SIZE_DEPTH_FRACTION = 0.05
+
+    def tearDown(self):
+        config.ENABLE_DEPTH_AWARE_TRADE_SIZING, config.TRADE_SIZE_DEPTH_FRACTION = self._saved
+
+    def _base_kwargs(self):
+        # composite_win_rate=0.9 vs price=0.5 -> a large positive Kelly
+        # fraction, so trade_usd lands near MAX_TRADE_USD and a thin book
+        # will actually bind the depth clamp in these tests.
+        wallet_score_entry = {
+            "composite": 0.9, "composite_win_rate": 0.9, "composite_trade_count": 1000,
+            "categories": {},
+        }
+        return dict(
+            trade={
+                "user_address": "0xTrader", "market_slug": "some-market", "outcome": "Yes",
+                "side": "BUY", "price": 0.5, "size_usd": 100.0, "trade_id": "tid1",
+                "timestamp": "2026-07-23T00:00:00Z", "market_title": "Some Market",
+            },
+            positions={}, source_positions={}, source_cost_basis={}, trader_performance={}, muted_traders={},
+            tracked_by_lower={"0xtrader": ("0xTrader", "nick")},
+            risk_state={
+                "market_to_event": {"some-market": "some-event"},
+                "market_to_category": {"some-market": "crypto"},
+                "kill_switch": None,
+                "active_rule_set_version": 3,
+            },
+            wallet_scores={"0xtrader": wallet_score_entry},
+        )
+
+    def test_default_off_logs_would_apply_but_does_not_shrink_the_trade(self):
+        config.ENABLE_DEPTH_AWARE_TRADE_SIZING = False
+        kwargs = self._base_kwargs()
+        with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
+             patch("bot.measure_paper_shortfall", return_value={}), \
+             patch("bot.fetch_book_depth_usd", return_value=1.0), \
+             patch("bot.append_log", return_value=None) as mock_log:
+            bot.process_trade(**kwargs)
+
+        would_apply = [c for c in mock_log.call_args_list
+                       if c.args[0].get("event_type") == "depth_cap_would_apply"]
+        self.assertEqual(len(would_apply), 1)
+        buy_calls = [c for c in mock_log.call_args_list if c.args[0].get("event_type") == "paper_buy"]
+        self.assertEqual(len(buy_calls), 1)
+        # Depth would clamp to 1.0*0.05=0.05, but the flag is off -- the
+        # recorded size must be the ORIGINAL (unclamped) Kelly size.
+        self.assertGreater(buy_calls[0].args[0]["score_breakdown"]["trade_size_usd"], 0.05)
+
+    def test_enabled_actually_shrinks_the_trade_when_it_would_bind(self):
+        config.ENABLE_DEPTH_AWARE_TRADE_SIZING = True
+        kwargs = self._base_kwargs()
+        with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
+             patch("bot.measure_paper_shortfall", return_value={}), \
+             patch("bot.fetch_book_depth_usd", return_value=1.0), \
+             patch("bot.append_log", return_value=None) as mock_log:
+            bot.process_trade(**kwargs)
+
+        buy_calls = [c for c in mock_log.call_args_list if c.args[0].get("event_type") == "paper_buy"]
+        self.assertEqual(len(buy_calls), 1)
+        # book_depth_usd=1.0 * TRADE_SIZE_DEPTH_FRACTION=0.05 -> clamped to 0.05.
+        self.assertAlmostEqual(buy_calls[0].args[0]["score_breakdown"]["trade_size_usd"], 0.05)
+
+    def test_none_book_depth_fetch_failure_leaves_trade_unclamped_even_when_enabled(self):
+        config.ENABLE_DEPTH_AWARE_TRADE_SIZING = True
+        kwargs = self._base_kwargs()
+        with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
+             patch("bot.measure_paper_shortfall", return_value={}), \
+             patch("bot.fetch_book_depth_usd", return_value=None), \
+             patch("bot.append_log", return_value=None) as mock_log:
+            bot.process_trade(**kwargs)
+
+        buy_calls = [c for c in mock_log.call_args_list if c.args[0].get("event_type") == "paper_buy"]
+        would_apply = [c for c in mock_log.call_args_list
+                       if c.args[0].get("event_type") == "depth_cap_would_apply"]
+        self.assertEqual(len(would_apply), 0)
+        self.assertEqual(len(buy_calls), 1)
+        self.assertGreater(buy_calls[0].args[0]["score_breakdown"]["trade_size_usd"], 0.05)
+
+    def test_ample_depth_never_logs_would_apply(self):
+        config.ENABLE_DEPTH_AWARE_TRADE_SIZING = False
+        kwargs = self._base_kwargs()
+        with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
+             patch("bot.measure_paper_shortfall", return_value={}), \
+             patch("bot.fetch_book_depth_usd", return_value=100_000.0), \
+             patch("bot.append_log", return_value=None) as mock_log:
+            bot.process_trade(**kwargs)
+
+        would_apply = [c for c in mock_log.call_args_list
+                       if c.args[0].get("event_type") == "depth_cap_would_apply"]
+        self.assertEqual(len(would_apply), 0)
 
 
 class TestComputeAnchorPrice(unittest.TestCase):
@@ -1335,6 +1439,7 @@ class TestProcessTradeDualTrackReconciliation(unittest.TestCase):
         source_cost_basis = {key: 6.0}
 
         with patch("bot.measure_paper_shortfall", return_value={}), \
+             patch("bot.fetch_book_depth_usd", return_value=None), \
              patch("bot.append_log") as mock_log:
             bot.process_trade(**self._kwargs(
                 positions, source_positions, source_cost_basis,
@@ -1358,6 +1463,7 @@ class TestProcessTradeDualTrackReconciliation(unittest.TestCase):
         not a full successful buy."""
         with patch("bot.risk_manager.check_buy",
                    return_value=(False, "skip_risk_exposure_ceiling", "over cap")), \
+             patch("bot.fetch_book_depth_usd", return_value=None), \
              patch("bot.append_log") as mock_log:
             bot.process_trade(**self._kwargs({}, {}, {}))
 
@@ -1477,6 +1583,7 @@ class TestProcessTradeShadowRehabWiring(unittest.TestCase):
         shadow_positions = {}
         with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
              patch("bot.measure_paper_shortfall", return_value={"shortfall_status": "preview_unavailable"}), \
+             patch("bot.fetch_book_depth_usd", return_value=None), \
              patch("bot.append_log"):
             bot.process_trade(**self._kwargs({}, {}, {}, shadow_positions, {}))
         self.assertEqual(shadow_positions, {})

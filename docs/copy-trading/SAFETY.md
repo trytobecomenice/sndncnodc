@@ -3171,3 +3171,65 @@ samples especially — exactly where this gap showed up live).
 assertions), 1 new `TestProcessTradeScoreSnapshot` integration test
 (`test_non_positive_kelly_edge_skips_the_copy_entirely`). **405 Python
 tests passing** (was 404). No TS changes.
+
+## 47. Depth-Aware Trade Sizing (Rule 47 technical detail)
+
+**`risk_manager.py`, new pure function:**
+```python
+def depth_capped_trade_size_usd(trade_size_usd, book_depth_usd, depth_fraction):
+    if book_depth_usd is None:
+        return trade_size_usd
+    return min(trade_size_usd, book_depth_usd * depth_fraction)
+```
+`None` is a distinct, deliberate case from a real `0.0` depth reading —
+the former means "couldn't find out, don't guess," the latter means "the
+book really is empty, and 0 is the correct answer." Conflating them would
+either silently disable the clamp on a real zero-liquidity book, or wrongly
+zero out a trade just because a fetch failed.
+
+**`bot.py`, new `fetch_book_depth_usd(market_slug, outcome)`** — same
+shape and fail-open posture as the existing `get_market_ask_price()`/
+`get_market_bid_ask()` above it: catches any exception from
+`polymarket_simulator.fetch_order_book_for_outcome()` and returns `None`
+rather than propagating, sums `price*size` across every visible ask level.
+
+**`bot.py`, `process_trade()`** — wired in immediately after `trade_usd`
+is computed, before the score-breakdown snapshot:
+```python
+trade_usd = compute_trade_size_usd(wallet_score_entry, price, category)
+
+if trade_usd > 0:
+    book_depth_usd = fetch_book_depth_usd(market_slug, outcome)
+    depth_capped_usd = risk_manager.depth_capped_trade_size_usd(
+        trade_usd, book_depth_usd, config.TRADE_SIZE_DEPTH_FRACTION
+    )
+    if depth_capped_usd < trade_usd:
+        append_log({**base_event, "event_type": "depth_cap_would_apply", ...})
+        if config.ENABLE_DEPTH_AWARE_TRADE_SIZING:
+            trade_usd = depth_capped_usd
+```
+Skipped entirely when `trade_usd <= 0` already (Rule 46) — no point
+spending a network call sizing a copy about to be skipped anyway. The
+`depth_cap_would_apply` log only fires when the clamp would actually
+bind (not on every trade), so normal, well-liquidated trades produce zero
+extra log volume.
+
+**Distinct from `MAX_EVENT_EXPOSURE_USD`/`MAX_WALLET_EXPOSURE_USD`
+(`risk_manager.check_buy()`)**: those are portfolio-level aggregates —
+total dollars deployed across many positions for one event or wallet —
+computed and enforced entirely independently of this. This clamp acts
+purely on the single trade's own size, against the single market's own
+depth, and runs earlier in `process_trade()` than `check_buy()` does
+(`check_buy()` is called from inside `_execute_buy()`, downstream of
+sizing) — worth stating precisely since it was the source of a real
+testing mistake (see RISK_MANAGEMENT.md Rule 47's own writeup): mocking
+`check_buy()` to block a trade does NOT prevent this depth fetch from
+running, because sizing happens first regardless.
+
+**Tests:** RISK_MANAGEMENT.md Rule 47 has the full breakdown, including
+the real unmocked-network-call testing gap found and fixed while building
+this. `TestDepthCappedTradeSizeUsd` (5, `test_risk_manager.py`),
+`TestDepthAwareTradeSizing` (4, `test_bot_risk_checks.py`), plus 6
+existing tests patched to mock the new fetch. **414 Python tests passing**
+(was 405). `ENABLE_DEPTH_AWARE_TRADE_SIZING` defaults `False` — not live
+until explicitly enabled after a `bot.py` restart.

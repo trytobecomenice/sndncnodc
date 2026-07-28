@@ -3670,6 +3670,97 @@ that drove it). **405 Python tests passing** (was 404). No TS changes.
 port 8787) to take effect, same restart-pending pattern as every other
 sizing/risk change in this ledger.
 
+## 47. Depth-Aware Trade Sizing — a per-trade clamp, not a portfolio-cap change (2026-07-28)
+
+### Summary
+
+**Challenge:** a quant-desk-lens review of the system (prompted by a
+career/networking conversation, not a bug report) surfaced that
+`MAX_EVENT_EXPOSURE_USD`/`MAX_WALLET_EXPOSURE_USD` are flat dollar
+figures derived from bankroll math, with no connection to how much
+liquidity a specific market can actually absorb — a real trader would
+ask "how much of this book are we eating?" Real order-book depth data
+already exists in this codebase (`polymarket_simulator.
+fetch_order_book_for_outcome()`, `(price, size)` tuples per level), but
+confirmed via direct code read: it was only ever fetched AFTER both
+sizing (`compute_trade_size_usd()`) and the portfolio risk gate
+(`risk_manager.check_buy()`, itself called from inside `_execute_buy()`)
+— purely for paper-mode fill measurement (`measure_paper_shortfall`),
+never to inform how large a trade should be in the first place.
+
+A second, related design question (resolved before writing code): book
+depth is a property of the SPECIFIC market being traded, not something
+that aggregates the way dollars-deployed-across-positions does — there's
+no single "depth" number for a whole wallet's or event's exposure, which
+can span many different markets each with its own book. So this is
+deliberately a new, independent **per-trade** clamp, not a redefinition
+of either existing portfolio-level cap.
+
+**Mechanism:** `risk_manager.depth_capped_trade_size_usd(trade_size_usd,
+book_depth_usd, depth_fraction)` — `min(trade_size_usd, book_depth_usd *
+depth_fraction)`, pure and unit-testable, `None` `book_depth_usd` (fetch
+failed/unavailable) returns `trade_size_usd` UNCLAMPED rather than
+inventing a worse number or treating "unknown" as "zero liquidity" (same
+fail-open posture as every other price-fetch helper in `bot.py`). A new
+`bot.fetch_book_depth_usd()` sums `price*size` across the visible
+ask-side levels (the side a BUY consumes). Wired into `process_trade()`
+immediately after `trade_usd = compute_trade_size_usd(...)` — BEFORE the
+score-breakdown snapshot, so `score_breakdown["trade_size_usd"]` reflects
+whatever size actually got used, and before `_execute_buy()`/`check_buy()`
+run at all.
+
+Two new config constants follow the same opt-in pattern as
+`ENABLE_ZOMBIE_POSITION_DUMP`: `ENABLE_DEPTH_AWARE_TRADE_SIZING` (default
+`False`) and `TRADE_SIZE_DEPTH_FRACTION` (`0.05` — an explicit judgment
+call, not derived from data, same status as `SLIPPAGE_PROTECTION_FRACTION`
+and its neighbors). Detection and logging always run regardless of the
+flag — a `depth_cap_would_apply` event fires whenever the clamp WOULD
+have bound, so the first rollout is pure observability; only the actual
+shrink of `trade_usd` is gated behind the flag.
+
+**A real testing gap found and fixed while building this, worth stating
+plainly rather than glossing over**: the new fetch call is unconditional
+whenever `trade_usd > 0`, which meant several PRE-EXISTING
+`process_trade()`-driving tests — ones that never anticipated this new
+call and don't mock it — started making a real, unmocked network request
+to `gamma-api.polymarket.com` the moment this code was wired in. It didn't
+show up as an immediate crash; it surfaced as an unrelated test in
+`test_polymarket_simulator.py` failing only when the FULL suite ran (never
+when run in isolation), because `polymarket_simulator.py`'s per-thread
+connection cache (`_thread_local.conns`) got populated with a real,
+un-mockable connection object that a later test's `patch("http.client.
+HTTPSConnection", ...)` couldn't override — the same category of shared
+mutable-state bug this ledger has hit before (see Rule 30's Dual-Track
+entry). Root-caused by instrumenting `HTTPSConnection.__init__` directly
+to print a stack trace on every real instantiation, then bisecting test
+classes, rather than guessing. A wrong initial assumption cost real time
+here too: `risk_manager.check_buy()` runs INSIDE `_execute_buy()`, which
+is called AFTER sizing — so tests that mock `check_buy` to block a trade
+do NOT prevent this new fetch from running, since sizing (and now this
+depth check) happens first regardless of how the later risk gate is
+mocked. Six existing tests across `TestProcessTradeScoreSnapshot`,
+`TestProcessTradeDualTrackReconciliation`, and
+`TestProcessTradeShadowRehabWiring` needed `patch("bot.fetch_book_depth_
+usd", return_value=None)` added; confirmed clean afterward by
+instrumenting the whole file and asserting zero real `HTTPSConnection`
+instantiations.
+
+**Tests:** `TestDepthCappedTradeSizeUsd` (5, `test_risk_manager.py`) for
+the pure clamp function; `TestDepthAwareTradeSizing` (4,
+`test_bot_risk_checks.py`) for the `process_trade()` integration —
+default-off logs but doesn't shrink, enabled shrinks correctly, a `None`
+depth (fetch failure) never clamps even when enabled, ample depth never
+logs a would-apply event. **414 Python tests passing (was 405 before this
+rule; +9)**. A separate, unrelated addition from the same session — a
+read-only parameter-sensitivity backtest script, not a risk-parameter
+change — added 15 more on top (429 total); not part of this rule.
+
+**Not yet live** — needs a `bot.py` restart (dashboard `/api/toggle`, port
+8787) to take effect, same restart-pending pattern as every other
+sizing/risk change in this ledger. `ENABLE_DEPTH_AWARE_TRADE_SIZING`
+defaults `False`, so a restart alone changes nothing observable until it's
+explicitly flipped on.
+
 ## What is intentionally still simple
 
 The current setup is conservative by design — it focuses on avoiding obvious bad fills, bad
