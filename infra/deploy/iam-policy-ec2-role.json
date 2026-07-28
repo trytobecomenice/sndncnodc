@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadCopybotRpcUrlParameterOnly",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/copybot/prod/polygon_rpc_url"
+    },
+    {
+      "Sid": "DecryptViaAwsManagedSsmKey",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "KMS_KEY_ARN_FROM_STEP_BELOW"
+    }
+  ]
+}

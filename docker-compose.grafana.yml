@@ -1,0 +1,48 @@
+# Personal Grafana dashboard (2026-07-28) — reads the SAME shared SQLite
+# DB bot.py writes to, read-only, for long-term equity/edge/system-health
+# tracking. Not part of the trading system itself; safe to stop/remove
+# without affecting bot.py, dashboard.py, or anything else.
+#
+# WHY THE WHOLE ./data DIRECTORY IS MOUNTED, NOT JUST app.db: this DB runs
+# in WAL mode (packages/db/src/migrate.ts enables it) — recent commits can
+# sit in app.db-wal/app.db-shm alongside the main file rather than being
+# flushed into it immediately. Mounting only app.db would let Grafana read
+# a real but STALE view, silently missing anything not yet checkpointed.
+# Mounting the directory read-only lets SQLite's own WAL-aware reader see
+# the same consistent, up-to-date data bot.py itself would.
+#
+# SETUP:
+#   1. docker compose -f docker-compose.grafana.yml up -d
+#   2. Open http://localhost:3001 (default login admin/admin, changes on
+#      first login)
+#   3. Add a data source: Connections -> Add new connection -> search
+#      "SQLite" (frser-sqlite-datasource, auto-installed below) -> set
+#      Path to /data/app.db (the path INSIDE the container, from the
+#      mount below — not your host path)
+#   4. Create panels using the queries in docs/copy-trading/GRAFANA_SETUP.md
+
+services:
+  grafana:
+    image: grafana/grafana-oss:11.4.0
+    container_name: copybot-grafana
+    ports:
+      - "3001:3000" # 3000 is already the Next.js dashboard on the host
+    environment:
+      # Auto-installs the community SQLite plugin on first start — Grafana
+      # has no built-in SQLite data source. Pinned by name only (no
+      # version pin) since this is a personal, locally-run dashboard, not
+      # something with a reproducible-build requirement.
+      - GF_INSTALL_PLUGINS=frser-sqlite-datasource
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    volumes:
+      # Read-only: Grafana only ever SELECTs. Protects the live trading DB
+      # from ever being written to by anything running in this container.
+      - ./data:/data:ro
+      # Grafana's OWN config/dashboards/plugins persist across restarts —
+      # a separate, empty-on-first-run named volume, nothing to do with
+      # the trading DB above.
+      - grafana-storage:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  grafana-storage:
