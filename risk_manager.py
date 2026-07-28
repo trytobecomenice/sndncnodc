@@ -184,8 +184,12 @@ def check_buy(positions, market_to_event, event_slug, trade_usd, kill_switch, wa
     return True, None, None
 
 
-def compute_equity(positions, prices_by_key, realized_pnl):
-    """Portfolio equity = bankroll + realized PnL + unrealized PnL.
+def compute_unrealized_pnl(positions, prices_by_key):
+    """Sum of (mark value - cost basis) across every open position we have
+    a usable price for. Extracted out of compute_equity (2026-07-28, the
+    Grafana dashboard's daily-snapshot breakdown) so both that function and
+    compute_equity_breakdown below share the exact same math rather than
+    two independently-maintained copies of it.
 
     prices_by_key maps position key -> latest indicative price (collected
     by the TTP sweep). A position the sweep couldn't price contributes ZERO
@@ -199,7 +203,41 @@ def compute_equity(positions, prices_by_key, realized_pnl):
         if price is None or price <= 0:
             continue
         unrealized += pos.get("shares", 0.0) * price - pos.get("cost_basis_usd", 0.0)
-    return config.PAPER_BANKROLL_USD + realized_pnl + unrealized
+    return unrealized
+
+
+def compute_equity(positions, prices_by_key, realized_pnl):
+    """Portfolio equity = bankroll + realized PnL + unrealized PnL.
+
+    Unchanged in behavior/signature by the 2026-07-28 refactor above — this
+    still returns exactly the single float every existing caller (the
+    kill-switch evaluation in bot.py's main loop) already depends on.
+    """
+    return config.PAPER_BANKROLL_USD + realized_pnl + compute_unrealized_pnl(positions, prices_by_key)
+
+
+def compute_equity_breakdown(positions, prices_by_key, realized_pnl):
+    """Same inputs as compute_equity, but returns every component
+    separately — built for the Grafana daily-snapshot table
+    (daily_portfolio_snapshots), which wants total_cash and
+    total_unrealized_pnl as their own columns, not just the combined
+    equity figure compute_equity has always returned.
+
+    total_cash here means "bankroll not currently deployed into an open
+    position" — bankroll adjusted for realized gains/losses, minus
+    whatever's tied up in open positions AT COST (their cost_basis_usd
+    sum, not mark value — cash freed by a position isn't affected by that
+    position's current unrealized swing, only by it actually closing).
+    """
+    unrealized_pnl = compute_unrealized_pnl(positions, prices_by_key)
+    deployed_cost_basis = sum(pos.get("cost_basis_usd", 0.0) for pos in positions.values())
+    total_cash = config.PAPER_BANKROLL_USD + realized_pnl - deployed_cost_basis
+    total_equity = config.PAPER_BANKROLL_USD + realized_pnl + unrealized_pnl
+    return {
+        "total_equity": total_equity,
+        "total_cash": total_cash,
+        "total_unrealized_pnl": unrealized_pnl,
+    }
 
 
 def evaluate_equity(equity, prior_hwm):

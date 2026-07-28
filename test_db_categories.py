@@ -33,7 +33,7 @@ class _TempDbTestCase(unittest.TestCase):
         conn.execute(
             "CREATE TABLE wallet_profile (id TEXT PRIMARY KEY, wallet_address TEXT NOT NULL, "
             "composite_score REAL, win_rate REAL, trade_count_all_time INTEGER, "
-            "category_scores_json TEXT)"
+            "capital_multiplier REAL, category_scores_json TEXT)"
         )
         conn.commit()
         conn.close()
@@ -146,7 +146,10 @@ class TestGetWalletCompositeScoresWithCategories(_TempDbTestCase):
         result = db.get_wallet_composite_scores()
         self.assertEqual(
             result["0xaaa"],
-            {"composite": 0.6, "composite_win_rate": None, "composite_trade_count": None, "categories": {}},
+            {
+                "composite": 0.6, "composite_win_rate": None, "composite_trade_count": None,
+                "capital_multiplier": None, "categories": {},
+            },
         )
 
     def test_composite_win_rate_and_trade_count_are_surfaced(self):
@@ -189,7 +192,10 @@ class TestGetWalletCompositeScoresWithCategories(_TempDbTestCase):
         result = db.get_wallet_composite_scores()
         self.assertEqual(
             result["0xccc"],
-            {"composite": 0.4, "composite_win_rate": None, "composite_trade_count": None, "categories": {}},
+            {
+                "composite": 0.4, "composite_win_rate": None, "composite_trade_count": None,
+                "capital_multiplier": None, "categories": {},
+            },
         )
 
     def test_keys_are_lowercased(self):

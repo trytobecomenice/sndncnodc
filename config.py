@@ -445,6 +445,26 @@ TRAILING_TP_CHECK_INTERVAL_SECONDS = 300
 # trades in the feed).
 CLOSEOUT_INTERVAL_SECONDS = 3600
 
+# --- Daily portfolio snapshot (2026-07-28, Grafana personal dashboard) ----
+# One row/day in daily_portfolio_snapshots — equity, cash, unrealized PnL,
+# today's realized PnL, and active-trader count, for a personal Grafana
+# dashboard tracking long-term equity growth/edge/system stability. Purely
+# additive logging — reads risk_manager.compute_equity_breakdown() and
+# db.realized_pnl_today(), writes nothing back into any trading decision.
+
+# UTC, not local time — same reason every other timestamp in this codebase
+# is UTC (see now_iso()). 23 means "any poll cycle at or after 23:00 UTC
+# that hasn't already snapshotted today" — the idempotency check is
+# DB-backed (db.has_snapshot_for_today()), not a fixed-minute trigger, so
+# this fires reliably even if the bot isn't polling at exactly 23:59:00.
+DAILY_SNAPSHOT_TRIGGER_HOUR_UTC = 23
+
+# How often the trigger condition itself gets checked — same cadence as
+# the TTP sweep. The actual snapshot only ever writes once per day
+# regardless of this interval; this just bounds how many "is it time yet"
+# checks happen (a single indexed DB lookup each time, cheap either way).
+DAILY_SNAPSHOT_CHECK_INTERVAL_SECONDS = 300
+
 # --- "Zombie position" dump exit (2026-07-27) -----------------------------
 # Found live: MAX_BOOK_AGE_SECONDS=15 is deliberately tight (see that
 # constant's own comment) and correctly, routinely refuses individual TTP

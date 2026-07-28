@@ -193,7 +193,8 @@ class TestComputeTradeSizeUsd(unittest.TestCase):
          config.KELLY_SHRINKAGE_PSEUDO_COUNT, config.KELLY_FRACTION_MULTIPLIER) = self._saved
 
     @staticmethod
-    def _entry(composite=None, composite_win_rate=None, composite_trade_count=None, categories=None):
+    def _entry(composite=None, composite_win_rate=None, composite_trade_count=None, categories=None,
+               capital_multiplier=None):
         """categories is {category: (win_rate_or_None, trade_count)}
         shorthand — wraps each into the real {"score":..., "pnl_t_stat":...,
         "win_rate":..., "trade_count":...} shape
@@ -206,6 +207,7 @@ class TestComputeTradeSizeUsd(unittest.TestCase):
             "composite": composite,
             "composite_win_rate": composite_win_rate,
             "composite_trade_count": composite_trade_count,
+            "capital_multiplier": capital_multiplier,
             "categories": wrapped,
         }
 
@@ -215,16 +217,18 @@ class TestComputeTradeSizeUsd(unittest.TestCase):
     def test_unscored_wallet_gets_the_base_amount(self):
         self.assertEqual(bot.compute_trade_size_usd(self._entry(), 0.5), 5.0)
 
-    def test_zero_track_record_composite_gets_the_floor_not_a_guess(self):
+    def test_zero_track_record_composite_gets_skipped_not_a_guess(self):
         # composite_trade_count=0 -> shrunk win rate == price exactly ->
-        # zero Kelly edge -> the floor, regardless of the (untrustworthy,
-        # zero-sample) observed win_rate.
+        # zero Kelly edge -> skipped (0.0), regardless of the
+        # (untrustworthy, zero-sample) observed win_rate. "No track
+        # record, no assumed edge" (Rule 25) means no trade, not a floor
+        # guess (2026-07-28).
         entry = self._entry(composite=0.5, composite_win_rate=0.95, composite_trade_count=0)
-        self.assertAlmostEqual(bot.compute_trade_size_usd(entry, 0.5), 3.0)
+        self.assertEqual(bot.compute_trade_size_usd(entry, 0.5), 0.0)
 
-    def test_win_rate_equal_to_price_gets_the_floor(self):
+    def test_win_rate_equal_to_price_gets_skipped(self):
         entry = self._entry(composite_win_rate=0.5, composite_trade_count=100)
-        self.assertAlmostEqual(bot.compute_trade_size_usd(entry, 0.5), 3.0)
+        self.assertEqual(bot.compute_trade_size_usd(entry, 0.5), 0.0)
 
     def test_win_rate_above_price_with_deep_sample_sizes_above_the_floor(self):
         # n=1000 -> barely shrunk -> a real, sizeable edge -> above the floor.
@@ -235,9 +239,9 @@ class TestComputeTradeSizeUsd(unittest.TestCase):
         self.assertGreater(trade_usd, 3.0)
         self.assertLessEqual(trade_usd, 10.0)
 
-    def test_win_rate_below_price_gets_the_floor_not_a_negative_size(self):
+    def test_win_rate_below_price_gets_skipped_not_a_negative_size(self):
         entry = self._entry(composite_win_rate=0.2, composite_trade_count=1000)
-        self.assertAlmostEqual(bot.compute_trade_size_usd(entry, 0.5), 3.0)
+        self.assertEqual(bot.compute_trade_size_usd(entry, 0.5), 0.0)
 
     def test_stronger_edge_sizes_larger_than_a_weaker_edge_monotonic(self):
         weak = self._entry(composite_win_rate=0.55, composite_trade_count=1000)
@@ -273,8 +277,8 @@ class TestComputeTradeSizeUsd(unittest.TestCase):
             composite_win_rate=0.5, composite_trade_count=1000,  # zero edge
             categories={"crypto": (0.9, 1000)},
         )
-        # "sports" isn't in categories at all -> falls back to composite (zero edge -> floor)
-        self.assertAlmostEqual(bot.compute_trade_size_usd(entry, 0.5, category="sports"), 3.0)
+        # "sports" isn't in categories at all -> falls back to composite (zero edge -> skipped)
+        self.assertEqual(bot.compute_trade_size_usd(entry, 0.5, category="sports"), 0.0)
 
     def test_category_present_but_win_rate_none_falls_back_to_composite(self):
         # e.g. a category that WAS looked up but had too few samples to score
@@ -293,6 +297,40 @@ class TestComputeTradeSizeUsd(unittest.TestCase):
     def test_neither_composite_nor_category_gets_base_amount(self):
         entry = self._entry(composite=None, categories={})
         self.assertEqual(bot.compute_trade_size_usd(entry, 0.5, category="crypto"), 5.0)
+
+    def test_missing_capital_multiplier_behaves_identically_to_1_0(self):
+        # No capital_multiplier key at all (e.g. a wallet scored before v7)
+        # must size EXACTLY the same as an explicit 1.0 — never treated as
+        # None/0 collapsing the range to nothing.
+        entry = self._entry(composite_win_rate=0.7, composite_trade_count=1000)
+        without_key = bot.compute_trade_size_usd(entry, 0.5)
+        entry["capital_multiplier"] = 1.0
+        with_explicit_one = bot.compute_trade_size_usd(entry, 0.5)
+        self.assertAlmostEqual(without_key, with_explicit_one, places=6)
+
+    def test_capital_multiplier_stretches_the_sizing_range_proportionally(self):
+        entry = self._entry(composite_win_rate=0.7, composite_trade_count=1000, capital_multiplier=2.0)
+        trade_usd = bot.compute_trade_size_usd(entry, 0.5)
+        # Same shape as test_half_kelly_fraction's floor/ceiling checks,
+        # just against the DOUBLED range (config.MIN/MAX_TRADE_USD are 3.0/10.0
+        # in setUp, so the effective range is 6.0-20.0).
+        self.assertGreater(trade_usd, 6.0)
+        self.assertLessEqual(trade_usd, 20.0)
+
+    def test_capital_multiplier_never_inflates_the_no_evidence_base_amount(self):
+        # A capital_multiplier present on an otherwise-unscored entry must
+        # NOT inflate config.BASE_TRADE_USD -- the multiplier rewards
+        # proven edge, it must never apply when there's no win-rate
+        # evidence to size against at all.
+        entry = self._entry(capital_multiplier=2.0)  # no win_rate anywhere
+        self.assertEqual(bot.compute_trade_size_usd(entry, 0.5), 5.0)
+
+    def test_capital_multiplier_does_not_rescue_a_non_positive_kelly_edge(self):
+        # A capital multiplier rewards proven edge; it must never turn a
+        # zero/negative Kelly edge into a trade (2026-07-28) — skipped
+        # (0.0) regardless of how large the multiplier is.
+        entry = self._entry(composite_win_rate=0.5, composite_trade_count=100, capital_multiplier=2.0)
+        self.assertEqual(bot.compute_trade_size_usd(entry, 0.5), 0.0)
 
 
 class TestShouldSkipCategory(unittest.TestCase):
@@ -784,6 +822,35 @@ class TestProcessTradeScoreSnapshot(unittest.TestCase):
         self.assertIsNone(breakdown["kelly_fraction"])
         pos = kwargs["positions"]["0xtrader|some-market|Yes"]
         self.assertIsNone(pos["last_decision_journal_id"])
+
+    def test_non_positive_kelly_edge_skips_the_copy_entirely(self):
+        # 2026-07-28: found live — a wallet with a weak, not-yet-
+        # statistically-significant category track record kept getting
+        # floor-sized copies despite Kelly reading negative, since
+        # should_skip_category()'s bar is deliberately stricter. This
+        # confirms process_trade() now skips at the sizing layer instead
+        # of opening a position on a signal the model's own math disagrees
+        # with — no paper_buy, no position, a skip event logged with the
+        # score_breakdown that drove the decision.
+        wallet_score_entry = {
+            "composite": 0.1, "composite_win_rate": 0.1, "composite_trade_count": 1000,
+            "categories": {},
+        }
+        kwargs = self._base_kwargs(wallet_score_entry)
+        with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
+             patch("bot.measure_paper_shortfall", return_value={}), \
+             patch("bot.append_log", return_value=None) as mock_log:
+            bot.process_trade(**kwargs)
+
+        buy_calls = [c for c in mock_log.call_args_list if c.args[0].get("event_type") == "paper_buy"]
+        self.assertEqual(len(buy_calls), 0)
+        skip_calls = [c for c in mock_log.call_args_list
+                      if c.args[0].get("event_type") == "skip_non_positive_kelly_edge"]
+        self.assertEqual(len(skip_calls), 1)
+        event = skip_calls[0].args[0]
+        self.assertLessEqual(event["score_breakdown"]["kelly_fraction"], 0)
+        self.assertEqual(event["score_breakdown"]["trade_size_usd"], 0.0)
+        self.assertNotIn("0xtrader|some-market|Yes", kwargs["positions"])
 
 
 class TestComputeAnchorPrice(unittest.TestCase):
@@ -2166,6 +2233,77 @@ class TestClosePositionZombieDump(unittest.TestCase):
         mock_cb.assert_not_called()
         logged_types = [c.args[0]["event_type"] for c in mock_log.call_args_list]
         self.assertIn("failed_trade", logged_types)
+
+
+class TestMaybeSnapshotDailyPortfolio(unittest.TestCase):
+    """Grafana personal-dashboard daily snapshot (2026-07-28) — mocks every
+    DB/risk_manager boundary, same style as the zombie-position tests
+    above. Real timezone/idempotency behavior is covered directly in
+    test_db_daily_snapshot.py; this class only checks bot.py's own wiring
+    (trigger-hour gate, piggybacking on prices_by_key, active_traders_
+    followed = tracked minus muted, never crashing the caller).
+    """
+
+    def _breakdown(self):
+        return {"total_equity": 1234.56, "total_cash": 500.0, "total_unrealized_pnl": 50.0}
+
+    def test_does_nothing_before_the_trigger_hour(self):
+        before_trigger = datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc)  # well before hour 23
+        with patch.object(config, "DAILY_SNAPSHOT_TRIGGER_HOUR_UTC", 23), \
+             patch("bot.datetime") as mock_dt, \
+             patch("bot.has_snapshot_for_today") as mock_has_snapshot, \
+             patch("bot.record_daily_snapshot") as mock_record:
+            mock_dt.now.return_value = before_trigger
+            bot.maybe_snapshot_daily_portfolio({}, {}, {"0xa": "n"}, {})
+        mock_has_snapshot.assert_not_called()  # never even checks -- too early
+        mock_record.assert_not_called()
+
+    def test_does_nothing_if_already_snapshotted_today(self):
+        at_trigger = datetime(2026, 7, 28, 23, 30, tzinfo=timezone.utc)
+        with patch.object(config, "DAILY_SNAPSHOT_TRIGGER_HOUR_UTC", 23), \
+             patch("bot.datetime") as mock_dt, \
+             patch("bot.has_snapshot_for_today", return_value=True), \
+             patch("bot.record_daily_snapshot") as mock_record:
+            mock_dt.now.return_value = at_trigger
+            bot.maybe_snapshot_daily_portfolio({}, {}, {"0xa": "n"}, {})
+        mock_record.assert_not_called()
+
+    def test_records_a_snapshot_past_the_trigger_hour_when_not_yet_done_today(self):
+        at_trigger = datetime(2026, 7, 28, 23, 30, tzinfo=timezone.utc)
+        with patch.object(config, "DAILY_SNAPSHOT_TRIGGER_HOUR_UTC", 23), \
+             patch("bot.datetime") as mock_dt, \
+             patch("bot.has_snapshot_for_today", return_value=False), \
+             patch("bot.risk_manager.compute_equity_breakdown", return_value=self._breakdown()), \
+             patch("bot.realized_pnl_total", return_value=999.0), \
+             patch("bot.realized_pnl_today", return_value=42.0), \
+             patch("bot.record_daily_snapshot") as mock_record, \
+             patch("bot.append_log"):
+            mock_dt.now.return_value = at_trigger
+            tracked = {"0xa": "n1", "0xb": "n2", "0xc": "n3"}
+            muted = {"0xb": {}}
+            bot.maybe_snapshot_daily_portfolio({}, {"key": 0.5}, tracked, muted)
+        mock_record.assert_called_once()
+        call_kwargs = mock_record.call_args.kwargs
+        self.assertAlmostEqual(call_kwargs["total_equity"], 1234.56)
+        self.assertAlmostEqual(call_kwargs["total_cash"], 500.0)
+        self.assertAlmostEqual(call_kwargs["total_unrealized_pnl"], 50.0)
+        self.assertAlmostEqual(call_kwargs["realized_pnl_today"], 42.0)
+        self.assertEqual(call_kwargs["active_traders_followed"], 2)  # 3 tracked - 1 muted
+
+    def test_a_failure_inside_does_not_propagate_uncaught(self):
+        # The main-loop call site wraps this in its own try/except, but the
+        # function itself should still be well-behaved: a DB error here
+        # must not be silently swallowed in a way that hides it either --
+        # confirmed by NOT catching internally, letting the caller's own
+        # try/except (already tested at the call site's own log line) see it.
+        at_trigger = datetime(2026, 7, 28, 23, 30, tzinfo=timezone.utc)
+        with patch.object(config, "DAILY_SNAPSHOT_TRIGGER_HOUR_UTC", 23), \
+             patch("bot.datetime") as mock_dt, \
+             patch("bot.has_snapshot_for_today", return_value=False), \
+             patch("bot.risk_manager.compute_equity_breakdown", side_effect=RuntimeError("boom")):
+            mock_dt.now.return_value = at_trigger
+            with self.assertRaises(RuntimeError):
+                bot.maybe_snapshot_daily_portfolio({}, {}, {"0xa": "n"}, {})
 
 
 if __name__ == "__main__":

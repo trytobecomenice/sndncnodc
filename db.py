@@ -717,6 +717,14 @@ def get_wallet_composite_scores():
     trade_count above — used only when no category-specific data exists for
     the market being copied.
 
+    "capital_multiplier" (added 2026-07-28, rule_set v7): scoreWallets.ts's
+    computeCapitalMultiplier() output — a Half-Kelly sizing RANGE
+    multiplier (>= 1.0, scales MIN/MAX_TRADE_USD, see bot.
+    compute_trade_size_usd()'s own docstring for why this stretches the
+    range Kelly operates within rather than replacing the Kelly formula
+    itself). NULL for a wallet never scored under v7+ — the caller treats
+    NULL exactly like 1.0 (no adjustment), never like 0.
+
     Deliberately independent of config.TRACKED_TRADERS_SOURCE: a wallet can
     be tracked via the static config.py list yet still have a real score
     in wallet_profile from a past scan:wallets run (the two aren't the same
@@ -732,7 +740,7 @@ def get_wallet_composite_scores():
     try:
         cur = conn.execute(
             "SELECT wallet_address, composite_score, win_rate, trade_count_all_time, "
-            "category_scores_json FROM wallet_profile"
+            "capital_multiplier, category_scores_json FROM wallet_profile"
         )
         rows = cur.fetchall()
     finally:
@@ -760,6 +768,7 @@ def get_wallet_composite_scores():
             "composite": row["composite_score"],
             "composite_win_rate": row["win_rate"],
             "composite_trade_count": row["trade_count_all_time"],
+            "capital_multiplier": row["capital_multiplier"],
             "categories": categories,
         }
     return result
@@ -1012,6 +1021,22 @@ def save_market_end_date(market_slug, end_date_iso):
         conn.close()
 
 
+# Every event_type that books a real, final realized-PnL figure onto
+# bot_event_log.payload_json.pnl_usd. Shared by realized_pnl_total() and
+# realized_pnl_today() so the two can never silently disagree on what
+# counts as a "close." Found and fixed 2026-07-28 (while building the
+# Grafana daily-snapshot feature): paper_sell_zombie_dump/
+# live_sell_zombie_dump (Rule 41, 2026-07-27) were missing from this list
+# entirely — zero live impact so far (ENABLE_ZOMBIE_POSITION_DUMP is still
+# off, so no zombie-dump close has ever actually happened), but a real gap
+# that would have silently under-counted equity/realized PnL the moment
+# that flag gets turned on.
+_REALIZED_PNL_EVENT_TYPES = (
+    "paper_sell", "live_sell", "paper_sell_trailing_tp", "live_sell_trailing_tp",
+    "paper_sell_zombie_dump", "live_sell_zombie_dump", "position_resolved",
+)
+
+
 def realized_pnl_total():
     """Total realized PnL across every position close the bot has ever
     logged — one term of the portfolio-equity calculation (see
@@ -1022,13 +1047,87 @@ def realized_pnl_total():
     """
     conn = _connect()
     try:
+        placeholders = ", ".join("?" for _ in _REALIZED_PNL_EVENT_TYPES)
         cur = conn.execute(
-            "SELECT COALESCE(SUM(json_extract(payload_json, '$.pnl_usd')), 0) AS total "
-            "FROM bot_event_log WHERE event_type IN "
-            "('paper_sell', 'live_sell', 'paper_sell_trailing_tp', "
-            "'live_sell_trailing_tp', 'position_resolved')"
+            f"SELECT COALESCE(SUM(json_extract(payload_json, '$.pnl_usd')), 0) AS total "
+            f"FROM bot_event_log WHERE event_type IN ({placeholders})",
+            _REALIZED_PNL_EVENT_TYPES,
         )
         return float(cur.fetchone()["total"])
+    finally:
+        conn.close()
+
+
+def realized_pnl_today(now=None):
+    """Same event-type universe as realized_pnl_total(), bounded to the
+    current UTC calendar day — the Grafana daily snapshot's
+    realized_pnl_today column. UTC (not local time) for the same reason
+    every other timestamp in this codebase is UTC — see now_iso() in
+    bot.py; a snapshot's "day" boundary needs to agree with everything
+    else that already reasons about time here, not introduce a second,
+    conflicting notion of "today."
+    """
+    now = now or datetime.now(timezone.utc)
+    start_of_day = int(datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp())
+    conn = _connect()
+    try:
+        placeholders = ", ".join("?" for _ in _REALIZED_PNL_EVENT_TYPES)
+        cur = conn.execute(
+            f"SELECT COALESCE(SUM(json_extract(payload_json, '$.pnl_usd')), 0) AS total "
+            f"FROM bot_event_log WHERE event_type IN ({placeholders}) AND timestamp >= ?",
+            (*_REALIZED_PNL_EVENT_TYPES, start_of_day),
+        )
+        return float(cur.fetchone()["total"])
+    finally:
+        conn.close()
+
+
+# --- daily_portfolio_snapshots (2026-07-28, Grafana personal dashboard) ---
+
+def has_snapshot_for_today(now=None):
+    """True if today's (UTC) row already exists — the DB-backed idempotency
+    check maybe_snapshot_daily_portfolio() uses instead of an in-memory
+    last-run flag. Deliberately DB-backed: bot.py restarts often (see
+    RISK_MANAGEMENT.md's restart-history investigation), and an in-memory
+    flag would either re-snapshot on every restart near the trigger time or
+    silently skip a day the bot happened to be down across the trigger.
+    """
+    now = now or datetime.now(timezone.utc)
+    date_str = now.strftime("%Y-%m-%d")
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM daily_portfolio_snapshots WHERE date = ?", (date_str,)
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def record_daily_snapshot(total_equity, total_cash, total_unrealized_pnl,
+                           realized_pnl_today, active_traders_followed, now=None):
+    """Idempotent upsert by UTC date — a second call for the same day
+    (e.g. after a same-day restart past the trigger time) overwrites
+    rather than duplicating, so the table always reflects the LAST
+    snapshot taken that day, not the first.
+    """
+    now = now or datetime.now(timezone.utc)
+    date_str = now.strftime("%Y-%m-%d")
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO daily_portfolio_snapshots "
+            "(date, snapshot_at, total_equity, total_cash, total_unrealized_pnl, "
+            "realized_pnl_today, active_traders_followed) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(date) DO UPDATE SET "
+            "snapshot_at = excluded.snapshot_at, total_equity = excluded.total_equity, "
+            "total_cash = excluded.total_cash, total_unrealized_pnl = excluded.total_unrealized_pnl, "
+            "realized_pnl_today = excluded.realized_pnl_today, "
+            "active_traders_followed = excluded.active_traders_followed",
+            (date_str, int(now.timestamp()), total_equity, total_cash, total_unrealized_pnl,
+             realized_pnl_today, active_traders_followed),
+        )
+        conn.commit()
     finally:
         conn.close()
 

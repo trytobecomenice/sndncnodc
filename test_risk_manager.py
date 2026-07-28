@@ -231,6 +231,31 @@ class TestEquity(ConfigPatchingTestCase):
         equity = risk_manager.compute_equity(positions, {}, realized_pnl=0.0)
         self.assertAlmostEqual(equity, 125.0)  # zero unrealized, not a guess
 
+    def test_compute_equity_breakdown_matches_compute_equity_total(self):
+        # The 2026-07-28 refactor split compute_equity's internals out for
+        # the Grafana snapshot breakdown -- the combined total must still
+        # agree exactly with the unchanged compute_equity.
+        positions = {"a|m|Yes": {"cost_basis_usd": 5.0, "shares": 10.0}}
+        prices = {"a|m|Yes": 0.80}
+        equity = risk_manager.compute_equity(positions, prices, realized_pnl=7.0)
+        breakdown = risk_manager.compute_equity_breakdown(positions, prices, realized_pnl=7.0)
+        self.assertAlmostEqual(breakdown["total_equity"], equity)
+
+    def test_compute_equity_breakdown_unrealized_and_cash_components(self):
+        # 10 shares @ cost $5, priced 0.80 -> mark value 8.0, unrealized +3.0.
+        # cash = bankroll(125) + realized(7) - deployed cost basis(5) = 127.
+        positions = {"a|m|Yes": {"cost_basis_usd": 5.0, "shares": 10.0}}
+        breakdown = risk_manager.compute_equity_breakdown(positions, {"a|m|Yes": 0.80}, realized_pnl=7.0)
+        self.assertAlmostEqual(breakdown["total_unrealized_pnl"], 3.0)
+        self.assertAlmostEqual(breakdown["total_cash"], 127.0)
+        self.assertAlmostEqual(breakdown["total_equity"], 135.0)  # 125 + 7 + 3
+
+    def test_compute_equity_breakdown_with_no_positions(self):
+        breakdown = risk_manager.compute_equity_breakdown({}, {}, realized_pnl=10.0)
+        self.assertAlmostEqual(breakdown["total_unrealized_pnl"], 0.0)
+        self.assertAlmostEqual(breakdown["total_cash"], 135.0)  # 125 + 10, nothing deployed
+        self.assertAlmostEqual(breakdown["total_equity"], 135.0)
+
     def test_hwm_seeds_at_first_equity_and_only_ratchets_up(self):
         hwm, triggers = risk_manager.evaluate_equity(232.0, None)
         self.assertEqual(hwm, 232.0)

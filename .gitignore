@@ -6,6 +6,8 @@ bot.pid
 bot.out.log
 dashboard.pid
 dashboard.out.log
+wss_listener.pid
+wss_listener.out.log
 *.pre-cutover-*
 .claude/settings.local.json
 

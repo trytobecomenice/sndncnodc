@@ -58,7 +58,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchOnePage(
+/**
+ * Fetches exactly ONE page (no auto-pagination) — for callers that want a
+ * bounded "most recent N trades" sample rather than full history. Exported
+ * for scoreWallets.ts's liquidity-farming gate (2026-07-27): a 50-trade
+ * sample is all `computeLiquidityFarmingSignal` needs, and paginating
+ * further (as fetchWalletTrades below would, since a full first page isn't
+ * a "short page") would fetch far more than intended for every wallet in a
+ * scan of hundreds.
+ */
+export async function fetchOnePage(
   walletAddress: string,
   limit: number,
   offset: number,

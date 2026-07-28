@@ -314,11 +314,36 @@ def compute_trade_size_usd(wallet_score_entry, market_price, category=None):
     by the time this runs, that decision has already been made, and is
     UNCHANGED by this rewrite — it never depended on the sizing formula.)
 
-    The resulting half-Kelly fraction is clamped to [0, 1] and mapped into
-    the SAME bounded config.MIN_TRADE_USD..MAX_TRADE_USD range this bot has
-    always used (a deliberate scope choice — true bankroll-fraction Kelly
-    would need total capital and would reshape the portfolio risk manager's
-    exposure ceiling interaction; not done here). Pure function,
+    A non-positive half-Kelly fraction (win_rate <= market_price once
+    shrunk, i.e. the model itself sees zero or negative edge) now returns
+    0.0 — a skip signal for process_trade() to act on — rather than
+    flooring at MIN_TRADE_USD (2026-07-28, found live: a wallet with a
+    weak-but-not-yet-statistically-significant category track record was
+    still trading a floor-sized copy on every signal despite Kelly reading
+    negative on 8 of 9 same-day trades, since should_skip_category()'s bar
+    is deliberately much stricter — "confidently bad", not "probably bad".
+    This closes that gap at the sizing layer instead: "no track record, no
+    assumed edge" already fell out of the shrinkage math at n=0 (Rule 25);
+    this extends the same principle to "negative assumed edge, no trade"
+    for n>0 too, rather than trading a nonzero amount on a signal the
+    model's own math disagrees with).
+
+    Otherwise, a positive half-Kelly fraction is clamped to (0, 1] and
+    mapped into config.MIN_TRADE_USD..MAX_TRADE_USD (a deliberate scope
+    choice — true bankroll-fraction Kelly would need total capital and
+    would reshape the portfolio risk manager's exposure ceiling
+    interaction; not done here) — stretched by
+    wallet_score_entry["capital_multiplier"] (2026-07-28, rule_set v7,
+    scoreWallets.ts's computeCapitalMultiplier, >= 1.0, defaults to 1.0/no
+    change when missing or None) BEFORE the clamped fraction is mapped in.
+    This is NOT a second sizing formula — it widens or narrows the RANGE
+    this same Kelly fraction lands in, so a wallet with an exceptional
+    risk-adjusted track record gets a bigger band to work with while the
+    underlying Kelly math is completely unchanged. Deliberately does NOT
+    scale config.BASE_TRADE_USD (the no-evidence fallback below) — a
+    capital multiplier rewards PROVEN edge; it must never inflate the
+    default used when there's no win-rate evidence at all, and it must
+    never rescue a non-positive edge into a trade either. Pure function,
     unit-testable without a DB call.
     """
     if wallet_score_entry is None:
@@ -342,8 +367,15 @@ def compute_trade_size_usd(wallet_score_entry, market_price, category=None):
     kelly_fraction = compute_kelly_fraction(shrunk_win_rate, market_price)
     half_kelly_fraction = kelly_fraction * config.KELLY_FRACTION_MULTIPLIER
 
-    clamped = max(0.0, min(1.0, half_kelly_fraction))
-    return config.MIN_TRADE_USD + (config.MAX_TRADE_USD - config.MIN_TRADE_USD) * clamped
+    if half_kelly_fraction <= 0:
+        return 0.0
+
+    capital_multiplier = wallet_score_entry.get("capital_multiplier") or 1.0
+    min_trade_usd = config.MIN_TRADE_USD * capital_multiplier
+    max_trade_usd = config.MAX_TRADE_USD * capital_multiplier
+
+    clamped = min(1.0, half_kelly_fraction)
+    return min_trade_usd + (max_trade_usd - min_trade_usd) * clamped
 
 
 def compute_shortfall(side, source_price, executable_price, trade_usd=None, shares=None):
@@ -1677,6 +1709,7 @@ from db import (  # noqa: E402
     update_pending_exit_order_price, close_pending_exit_order,
     load_market_end_dates, save_market_end_date,
     load_shadow_positions, save_shadow_positions, get_shadow_rehab_returns,
+    has_snapshot_for_today, record_daily_snapshot, realized_pnl_today,
 )
 import risk_manager  # noqa: E402
 
@@ -1963,6 +1996,56 @@ def sweep_shadow_rehab(muted_traders):
             append_log({"timestamp": now_iso(), "event_type": "shadow_rehab_reinstated",
                         "trader_address": key, "t_statistic": t_stat,
                         "shadow_trade_count": len(returns), "previous_mute_reason": old_reason})
+
+
+def maybe_snapshot_daily_portfolio(positions, prices_by_key, tracked_traders, muted_traders):
+    """Daily equity/cash/PnL/active-trader snapshot for the personal
+    Grafana dashboard (2026-07-28) — one row/day in
+    daily_portfolio_snapshots, read-only observability, feeds nothing back
+    into any trading decision.
+
+    Fires once conditions are both true: the current UTC hour is at/past
+    config.DAILY_SNAPSHOT_TRIGGER_HOUR_UTC, AND today's UTC date has no
+    row yet (db.has_snapshot_for_today() — a real DB check, not an
+    in-memory flag, so this is correct across restarts: it neither
+    re-snapshots on every restart near the trigger hour nor silently
+    misses a day the bot happened to be down across it).
+
+    active_traders_followed = tracked minus muted (the same "actively
+    copying" definition the Next.js dashboard already established, not
+    the raw static TRACKED_TRADERS count) — a muted wallet isn't actually
+    being followed right now, even though it's still configured.
+
+    Piggybacks on the TTP sweep's own prices_by_key (same reasoning as the
+    kill-switch equity evaluation right above this call site in main()) —
+    no separate price-fetch pass just for this.
+    """
+    now = datetime.now(timezone.utc)
+    if now.hour < config.DAILY_SNAPSHOT_TRIGGER_HOUR_UTC:
+        return
+    if has_snapshot_for_today(now=now):
+        return
+
+    breakdown = risk_manager.compute_equity_breakdown(positions, prices_by_key, realized_pnl_total())
+    active_traders_followed = len(tracked_traders) - len(muted_traders)
+
+    record_daily_snapshot(
+        total_equity=breakdown["total_equity"],
+        total_cash=breakdown["total_cash"],
+        total_unrealized_pnl=breakdown["total_unrealized_pnl"],
+        realized_pnl_today=realized_pnl_today(now=now),
+        active_traders_followed=active_traders_followed,
+        now=now,
+    )
+    append_log({"timestamp": now_iso(), "event_type": "daily_portfolio_snapshot",
+                "total_equity": breakdown["total_equity"], "total_cash": breakdown["total_cash"],
+                "total_unrealized_pnl": breakdown["total_unrealized_pnl"],
+                "active_traders_followed": active_traders_followed})
+    logger.info(
+        f"Daily portfolio snapshot recorded: equity=${breakdown['total_equity']:.2f}, "
+        f"cash=${breakdown['total_cash']:.2f}, unrealized=${breakdown['total_unrealized_pnl']:.2f}, "
+        f"active_traders_followed={active_traders_followed}"
+    )
 
 
 def check_circuit_breaker(trader, nickname, pnl_usd, cost_basis_usd, trader_performance, muted_traders):
@@ -2460,6 +2543,25 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
             "trade_size_usd": trade_usd, "sizing_tier": sizing_tier,
             "shrunk_win_rate": shrunk_win_rate, "kelly_fraction": kelly_fraction,
         }
+
+        # Non-positive Kelly edge (2026-07-28) — compute_trade_size_usd()
+        # returns exactly 0.0 when the model itself sees zero/negative edge
+        # (never for sizing_tier="base", where trade_usd is always the
+        # positive BASE_TRADE_USD constant). A softer signal than
+        # should_skip_category() above (that one requires STATISTICALLY
+        # SIGNIFICANT harm; this fires on any negative point estimate) —
+        # see compute_trade_size_usd()'s own docstring for why flooring at
+        # MIN_TRADE_USD here was wrong: found live, a wallet kept getting
+        # floor-sized copies on a category where 8 of 9 same-day signals
+        # had negative Kelly, well before the category's t-stat crossed
+        # should_skip_category()'s stricter bar.
+        if trade_usd <= 0:
+            append_log({**base_event, "event_type": "skip_non_positive_kelly_edge",
+                        "reason": f"half-Kelly fraction <= 0 for {nickname} in "
+                                  f"category={category!r} (shrunk_win_rate={shrunk_win_rate}, "
+                                  f"kelly_fraction={kelly_fraction}) — no assumed edge, no trade",
+                        "score_breakdown": score_breakdown})
+            return
 
         # Rule 29 (2026-07-24): tracked wallets in
         # config.LIMIT_ORDER_TRACKED_WALLETS never take the immediate-copy
@@ -3091,6 +3193,18 @@ def main():
                     except Exception as e:
                         append_log({"timestamp": now_iso(), "event_type": "error",
                                     "error": f"risk equity evaluation failed: {e}"})
+
+                    # Daily portfolio snapshot (2026-07-28, Grafana personal
+                    # dashboard) — piggybacks on this same TTP sweep's
+                    # prices_by_key for the same reason the kill-switch
+                    # evaluation above does; no separate price-fetch pass.
+                    # Idempotent (db.has_snapshot_for_today()), so checking
+                    # every ~5 minutes here is cheap and never double-writes.
+                    try:
+                        maybe_snapshot_daily_portfolio(positions, prices_by_key, tracked_traders, muted_traders)
+                    except Exception as e:
+                        append_log({"timestamp": now_iso(), "event_type": "error",
+                                    "error": f"daily portfolio snapshot failed: {e}"})
 
             if not SHUTDOWN_REQUESTED and now - last_closeout_sweep >= config.CLOSEOUT_INTERVAL_SECONDS:
                 last_closeout_sweep = now

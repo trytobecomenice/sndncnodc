@@ -21,6 +21,7 @@
     "review:outcomes": "pnpm --filter @copybot/copy-trading review:outcomes",
     "update:rules": "pnpm --filter @copybot/copy-trading update:rules",
     "report:daily": "pnpm --filter @copybot/copy-trading report:daily",
+    "reconcile:position-tracker": "pnpm --filter @copybot/copy-trading reconcile:position-tracker",
     "test": "pnpm -r test"
   }
 }

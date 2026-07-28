@@ -23,14 +23,18 @@ import {
   checkRecencyGate,
   checkToxicFlowGate,
   clamp,
+  computeCapitalMultiplier,
   computeCompositeScore,
   computeCopyabilityScore,
   computeDemotedAddresses,
   computeLiquidityFarmingSignal,
+  computeNextRescoreDueAt,
+  computePositionConfidence,
   computeRoiScore,
   computeSampleConfidence,
   computeWinRateScore,
   decideStatus,
+  deriveTier,
   mean,
   sampleStdev,
   trimToRollingWindow,
@@ -152,6 +156,7 @@ function basePass2Result(overrides: Partial<Pass2Result> = {}): Pass2Result {
     daysSinceLastTrade: 1,
     insufficientConsistencyData: false,
     liquidityFarmingSignal: null,
+    capitalMultiplier: 1,
     scoreBreakdown: {},
     ...overrides,
   };
@@ -242,6 +247,126 @@ describe("computeSampleConfidence", () => {
   });
   it("scales linearly below the floor", () => {
     expect(computeSampleConfidence(rules.sampleConfidenceTradesFloor / 2, rules)).toBeCloseTo(0.5, 6);
+  });
+});
+
+// =============================================================================
+// computePositionConfidence — the PositionTracker confidence discount,
+// motivated by the yield-farmer-1 reconciliation finding (2026-07-27):
+// realized-only PnL can differ enormously from bullpen's mark-to-market
+// figure when a lot of recent activity is still open/unresolved.
+// =============================================================================
+
+describe("computePositionConfidence", () => {
+  it("returns null (not 0) when there's no position data at all", () => {
+    expect(computePositionConfidence(0, 0, rules)).toBeNull();
+  });
+
+  it("scores 0 for activity with zero closes yet — a confirmed 'no track record yet,' not missing data", () => {
+    expect(computePositionConfidence(0, 10, rules)).toBe(0);
+  });
+
+  it("reproduces the yield-farmer-1 shape: mostly-open activity scores a low confidence", () => {
+    // Real numbers from the live reconciliation: this wallet had far more
+    // open positions than closed ones within the window.
+    const confidence = computePositionConfidence(212, 226, rules)!;
+    expect(confidence).toBeLessThan(0.5);
+  });
+
+  it("does not fully trust a 100%-closed wallet with too few closes to be a real sample", () => {
+    const confidence = computePositionConfidence(2, 0, rules)!;
+    // completeness is 1.0, but closedSampleConfidence is tiny (2 / floor) —
+    // the combined score must still be low, not 1.0.
+    expect(confidence).toBeLessThan(0.2);
+  });
+
+  it("scores close to 1.0 for a wallet with plenty of closes and few/no opens", () => {
+    const confidence = computePositionConfidence(rules.closedPositionConfidenceFloor * 2, 1, rules)!;
+    expect(confidence).toBeGreaterThan(0.9);
+  });
+
+  it("caps closedSampleConfidence at the floor, same ramp shape as computeSampleConfidence", () => {
+    const atFloor = computePositionConfidence(rules.closedPositionConfidenceFloor, 0, rules)!;
+    const wayAboveFloor = computePositionConfidence(rules.closedPositionConfidenceFloor * 100, 0, rules)!;
+    expect(atFloor).toBeCloseTo(1, 6);
+    expect(wayAboveFloor).toBeCloseTo(1, 6); // never exceeds 1.0
+  });
+});
+
+// =============================================================================
+// computeCapitalMultiplier — Half-Kelly sizing RANGE multiplier (v7),
+// confirmed with Joey (2026-07-28): saturation=0.35, max=2.0.
+// =============================================================================
+
+describe("computeCapitalMultiplier", () => {
+  it("is exactly 1.0 (no adjustment) at sharpeProxy=0, not below", () => {
+    expect(computeCapitalMultiplier(0, rules)).toBe(1);
+  });
+
+  it("clamps a negative (net-losing) sharpeProxy to exactly 1.0, never shrinking the base range", () => {
+    expect(computeCapitalMultiplier(-5, rules)).toBe(1);
+  });
+
+  it("caps at the configured max at/above saturation", () => {
+    expect(computeCapitalMultiplier(rules.capitalMultiplier.saturation, rules)).toBeCloseTo(rules.capitalMultiplier.max, 6);
+    expect(computeCapitalMultiplier(rules.capitalMultiplier.saturation * 10, rules)).toBeCloseTo(rules.capitalMultiplier.max, 6);
+  });
+
+  it("scales linearly between 1.0 and max below saturation", () => {
+    const halfway = computeCapitalMultiplier(rules.capitalMultiplier.saturation / 2, rules);
+    expect(halfway).toBeCloseTo(1 + 0.5 * (rules.capitalMultiplier.max - 1), 6);
+  });
+
+  it("does NOT reuse the track/watch consistencyScore cutoff (0.15) as its saturation point", () => {
+    // A wallet that JUST clears the track-threshold sharpeSaturation
+    // (0.15) must NOT already be at the max capital multiplier — that
+    // would defeat the whole point of differentiating among top
+    // performers, which is exactly the bug this test guards against.
+    const atTrackThreshold = computeCapitalMultiplier(rules.sharpeSaturation, rules);
+    expect(atTrackThreshold).toBeLessThan(rules.capitalMultiplier.max);
+  });
+});
+
+// =============================================================================
+// deriveTier / computeNextRescoreDueAt — the tiered-scoring self-throttle
+// (2026-07-28). Tier 1 is deliberately sourced from the LIVE tracked-wallet
+// set, not wallet_profile.status — see deriveTier's own doc comment for
+// why those two are known to drift apart.
+// =============================================================================
+
+describe("deriveTier", () => {
+  it("is tier1 for any address in the live tracked set, regardless of status", () => {
+    const tracked = new Set(["0xabc"]);
+    expect(deriveTier("0xABC", "ignore", tracked)).toBe("tier1"); // casing-insensitive, and status doesn't matter
+  });
+
+  it("is tier2 for status='watch' when not live-tracked", () => {
+    expect(deriveTier("0xnottracked", "watch", new Set())).toBe("tier2");
+  });
+
+  it("is tier3 for everything else", () => {
+    expect(deriveTier("0xnottracked", "ignore", new Set())).toBe("tier3");
+    expect(deriveTier("0xnottracked", "track", new Set())).toBe("tier3"); // 'track' status alone isn't tier1 — live-tracked set is
+  });
+});
+
+describe("computeNextRescoreDueAt", () => {
+  const now = new Date("2026-07-28T00:00:00Z");
+
+  it("uses the tier1 cadence for tier1", () => {
+    const due = computeNextRescoreDueAt("tier1", rules, now);
+    expect(due.getTime() - now.getTime()).toBe(rules.tierRescoreIntervalDays.tier1 * 86400 * 1000);
+  });
+
+  it("uses the tier3 (longer) cadence for tier3", () => {
+    const due = computeNextRescoreDueAt("tier3", rules, now);
+    expect(due.getTime() - now.getTime()).toBe(rules.tierRescoreIntervalDays.tier3 * 86400 * 1000);
+  });
+
+  it("tier3's cadence is longer than tier1's — the entire point of tiering", () => {
+    const tier1Due = computeNextRescoreDueAt("tier1", rules, now);
+    const tier3Due = computeNextRescoreDueAt("tier3", rules, now);
+    expect(tier3Due.getTime()).toBeGreaterThan(tier1Due.getTime());
   });
 });
 
@@ -526,13 +651,28 @@ describe("computeLiquidityFarmingSignal", () => {
     expect(computeLiquidityFarmingSignal([])).toBeNull();
   });
 
-  it("reproduces the live gloriafoster-shaped signature: same quote repeated many times at an extreme price", () => {
+  it("reproduces the live gloriafoster-shaped signature: same quote repeated many times at an extreme price, all SELL", () => {
     const trades = Array.from({ length: 30 }, () => ({ type: "TRADE", price: 0.007, side: "SELL", slug: "market-a" }));
     const signal = computeLiquidityFarmingSignal(trades);
     expect(signal).not.toBeNull();
     expect(signal?.sampleSize).toBe(30);
     expect(signal?.extremePricePct).toBe(1);
     expect(signal?.topRepeatedQuoteCount).toBe(30);
+    expect(signal?.extremePriceSellPct).toBe(1);
+  });
+
+  it("reproduces the live quant-generalist-2 false-positive shape: extreme + repeated, but BUY not SELL", () => {
+    // The real numbers that slipped through v4: 47 trades, 41 at an
+    // extreme price, 7x the same (market, price) pair, but the extreme
+    // trades were 39 BUY / 2 SELL (~4.9% sell) -- a longshot buyer, not a
+    // farmer.
+    const extremeBuys = Array.from({ length: 39 }, () => ({ type: "TRADE", price: 0.02, side: "BUY", slug: "market-x" }));
+    const extremeSells = Array.from({ length: 2 }, () => ({ type: "TRADE", price: 0.02, side: "SELL", slug: "market-x" }));
+    const nonExtreme = Array.from({ length: 6 }, () => ({ type: "TRADE", price: 0.5, side: "BUY", slug: "market-y" }));
+    const signal = computeLiquidityFarmingSignal([...extremeBuys, ...extremeSells, ...nonExtreme]);
+    expect(signal?.sampleSize).toBe(47);
+    expect(signal?.topRepeatedQuoteCount).toBe(41); // same (market-x, 0.02) pair across buys+sells
+    expect(signal?.extremePriceSellPct).toBeCloseTo(2 / 41, 5);
   });
 
   it("does not flag a diversified sample of different longshots in different markets", () => {
@@ -550,25 +690,46 @@ describe("computeLiquidityFarmingSignal", () => {
     expect(signal?.sampleSize).toBe(2);
     expect(signal?.extremePricePct).toBe(0);
   });
+
+  it("returns a null extremePriceSellPct when there are no extreme-price trades to split by side", () => {
+    const trades = Array.from({ length: 10 }, () => ({ type: "TRADE", price: 0.5, side: "BUY", slug: "m" }));
+    const signal = computeLiquidityFarmingSignal(trades);
+    expect(signal?.extremePriceSellPct).toBeNull();
+  });
 });
 
 // =============================================================================
-// checkLiquidityFarmingGate (v4) — the pre-filter added this session in
-// response to the "being a bot isn't inherently the problem, unreplicable
-// edge is" correction. Mirrors checkToxicFlowGate's test shape.
+// checkLiquidityFarmingGate (v5) — the pre-filter added in response to the
+// "being a bot isn't inherently the problem, unreplicable edge is"
+// correction, then given a sell-side-majority requirement after v4 caught
+// a confirmed false positive (quant-generalist-2, a longshot buyer, not a
+// farmer). Mirrors checkToxicFlowGate's test shape.
 // =============================================================================
 
 describe("checkLiquidityFarmingGate", () => {
   it("gates a wallet matching the confirmed live pattern, regardless of compositeScore", () => {
     const r = basePass2Result({
       compositeScore: 0.9,
-      liquidityFarmingSignal: { sampleSize: 30, extremePricePct: 1, topRepeatedQuoteCount: 30 },
+      liquidityFarmingSignal: { sampleSize: 30, extremePricePct: 1, topRepeatedQuoteCount: 30, extremePriceSellPct: 1 },
     });
     const gate = checkLiquidityFarmingGate(r, rules);
     expect(gate).not.toBeNull();
     expect(gate?.status).toBe("ignore");
     expect(gate?.reason).toContain("liquidity farming");
+    expect(gate?.reason).toContain("SELL-side");
     expect(gate?.reason).toContain("ignored regardless of score");
+  });
+
+  it("does NOT gate the real quant-generalist-2 false-positive shape (buy-heavy, ~4.9% sell)", () => {
+    const r = basePass2Result({
+      liquidityFarmingSignal: {
+        sampleSize: 47,
+        extremePricePct: 41 / 47,
+        topRepeatedQuoteCount: 41,
+        extremePriceSellPct: 2 / 41,
+      },
+    });
+    expect(checkLiquidityFarmingGate(r, rules)).toBeNull();
   });
 
   it("does NOT gate when liquidityFarmingSignal is null (fetch failed / no history) — fails open", () => {
@@ -576,45 +737,73 @@ describe("checkLiquidityFarmingGate", () => {
     expect(checkLiquidityFarmingGate(r, rules)).toBeNull();
   });
 
-  it("does NOT gate a sample below minSampleSize even if both other conditions are met", () => {
+  it("does NOT gate a sample below minSampleSize even if every other condition is met", () => {
     const r = basePass2Result({
       liquidityFarmingSignal: {
         sampleSize: rules.liquidityFarming.minSampleSize - 1,
         extremePricePct: 1,
         topRepeatedQuoteCount: 999,
+        extremePriceSellPct: 1,
       },
     });
     expect(checkLiquidityFarmingGate(r, rules)).toBeNull();
   });
 
-  it("does NOT gate on extreme price alone (repeated-quote count below threshold)", () => {
+  it("does NOT gate on extreme price + sell-side alone (repeated-quote count below threshold)", () => {
     const r = basePass2Result({
       liquidityFarmingSignal: {
         sampleSize: rules.liquidityFarming.minSampleSize,
         extremePricePct: 1,
         topRepeatedQuoteCount: rules.liquidityFarming.minRepeatedQuoteCount - 1,
+        extremePriceSellPct: 1,
       },
     });
     expect(checkLiquidityFarmingGate(r, rules)).toBeNull();
   });
 
-  it("does NOT gate on repeated-quote count alone (extreme price below threshold)", () => {
+  it("does NOT gate on repeated-quote count + sell-side alone (extreme price below threshold)", () => {
     const r = basePass2Result({
       liquidityFarmingSignal: {
         sampleSize: rules.liquidityFarming.minSampleSize,
         extremePricePct: rules.liquidityFarming.maxExtremePricePct - 0.01,
         topRepeatedQuoteCount: 999,
+        extremePriceSellPct: 1,
       },
     });
     expect(checkLiquidityFarmingGate(r, rules)).toBeNull();
   });
 
-  it("gates exactly at both thresholds (>=, not strictly >)", () => {
+  it("does NOT gate on extreme price + repeated-quote alone (sell-side pct below threshold)", () => {
+    const r = basePass2Result({
+      liquidityFarmingSignal: {
+        sampleSize: rules.liquidityFarming.minSampleSize,
+        extremePricePct: 1,
+        topRepeatedQuoteCount: 999,
+        extremePriceSellPct: rules.liquidityFarming.minExtremePriceSellPct - 0.01,
+      },
+    });
+    expect(checkLiquidityFarmingGate(r, rules)).toBeNull();
+  });
+
+  it("does NOT gate when extremePriceSellPct is null, even if the other two conditions are met", () => {
+    const r = basePass2Result({
+      liquidityFarmingSignal: {
+        sampleSize: rules.liquidityFarming.minSampleSize,
+        extremePricePct: 1,
+        topRepeatedQuoteCount: 999,
+        extremePriceSellPct: null,
+      },
+    });
+    expect(checkLiquidityFarmingGate(r, rules)).toBeNull();
+  });
+
+  it("gates exactly at all three thresholds (>=, not strictly >)", () => {
     const r = basePass2Result({
       liquidityFarmingSignal: {
         sampleSize: rules.liquidityFarming.minSampleSize,
         extremePricePct: rules.liquidityFarming.maxExtremePricePct,
         topRepeatedQuoteCount: rules.liquidityFarming.minRepeatedQuoteCount,
+        extremePriceSellPct: rules.liquidityFarming.minExtremePriceSellPct,
       },
     });
     expect(checkLiquidityFarmingGate(r, rules)?.status).toBe("ignore");

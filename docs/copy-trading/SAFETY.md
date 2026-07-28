@@ -2579,20 +2579,28 @@ liquidityFarming: {
 
 **`fetchRecentTrades(address)`** — new pass-2 call, genuinely distinct from
 the existing `fetchActivityBounds` (`wallet-stats --section activity`,
-timestamps/count only):
+timestamps/count only). **Direct Polymarket Data API, not bullpen** (moved
+2026-07-27, same day as the gate itself — see RISK_MANAGEMENT.md Rule 41's
+addendum for the full investigation into how much of the TS pipeline could
+drop bullpen):
 ```typescript
-const response = await runBullpenJson(
-  ["polymarket", "activity", "--address", address, "--limit", String(RECENT_TRADES_SAMPLE_SIZE)],
-  { retries: READ_RETRIES, retryDelayMs: READ_RETRY_DELAY_MS }
-);
-const activities: RecentTradeRecord[] = response?.activities ?? [];
-return activities.filter((a) => a.type === "TRADE");
+import { fetchOnePage } from "./polymarketDataApi";
+// ...
+return await fetchOnePage(address, RECENT_TRADES_SAMPLE_SIZE, 0);
 ```
-`RECENT_TRADES_SAMPLE_SIZE = 50`, matching `propose_pool_refill.py`'s
-`POOL_REFILL_ACTIVITY_SAMPLE_SIZE`. On failure, returns `[]` (caught,
-logged via `console.warn`, not thrown) — an empty sample makes
-`computeLiquidityFarmingSignal` return `null`, which is exactly what makes
-the gate fail open.
+Deliberately `fetchOnePage` (a single bounded fetch), not the existing
+`fetchWalletTrades` (which auto-paginates until a SHORT page — asking it
+for "50" on a wallet with >=50 trades would keep fetching well past the
+intended sample size, silently multiplying request volume across a scan of
+hundreds of wallets). `RECENT_TRADES_SAMPLE_SIZE = 50`, matching
+`propose_pool_refill.py`'s `POOL_REFILL_ACTIVITY_SAMPLE_SIZE`. On failure,
+returns `[]` (caught, logged via `console.warn`, not thrown) — an empty
+sample makes `computeLiquidityFarmingSignal` return `null`, which is
+exactly what makes the gate fail open. `RecentTradeRecord`'s own type
+narrowed to just `{ price?, slug? }` (dropped `type`/`side`/`size`, unused
+by `computeLiquidityFarmingSignal`) — kept deliberately decoupled from
+`polymarketDataApi.ts`'s full `RawActivityRecord` so the pure scoring
+function isn't coupled to that module's exact fetch shape.
 
 **`computeLiquidityFarmingSignal(trades)`** — pure, TS mirror of
 `propose_pool_refill.py`'s `summarize_liquidity_farming_signal`:
@@ -2641,6 +2649,35 @@ excluded from the percentage but still counted in sample size) and
 regardless of compositeScore, fails open on null signal, fails open below
 minSampleSize, requires BOTH conditions — neither alone gates — and gates
 exactly at the `>=` boundary on both). 195 TS tests passing total.
+
+**v5 fix, same day: added a sell-side-majority check after a confirmed
+false positive.** `computeLiquidityFarmingSignal` gained
+`extremePriceSellPct`:
+```typescript
+const extremeTrades = priced.filter((t) => t.price! < 0.05 || t.price! > 0.95);
+const extremeSellCount = extremeTrades.filter((t) => t.side === "SELL").length;
+const extremePriceSellPct = extremeTrades.length > 0 ? extremeSellCount / extremeTrades.length : null;
+```
+`RecentTradeRecord` gained `side?: string` back (dropped in the v4 bullpen
+migration since it looked unused — turned out to matter). `ScoringRules.
+liquidityFarming` gained `minExtremePriceSellPct: 0.5`. `checkLiquidityFarmingGate`
+now requires all three: `extremeGated && repeatedQuoteGated && sellGated`,
+where `sellGated = signal.extremePriceSellPct !== null && signal.extremePriceSellPct
+>= rules.liquidityFarming.minExtremePriceSellPct` — explicit null-check
+rather than assuming `extremeGated` guarantees a non-null value, matching
+this gate's existing fail-open-on-missing-data posture. Rule_set bumped
+v4 -> v5 (same auto-deactivate/insert mechanism as v3->v4, no manual DB
+work). Full incident writeup (the real quant-generalist-2 numbers, root
+cause, why 0.5 isn't a knife-edge choice): RISK_MANAGEMENT.md Rule 41's
+second addendum.
+
+**Tests:** 5 new/updated — the exact quant-generalist-2 shape (44 buy/
+2 sell within 41 extreme-price trades sharing one repeated quote)
+reproduced synthetically and confirmed NOT gated by
+`checkLiquidityFarmingGate`, a null-`extremePriceSellPct` case confirmed
+to fail open, and the pre-existing "does NOT gate on X alone" tests
+extended so all three conditions are isolated individually rather than
+just the original two. 200 TS tests passing (was 195).
 
 ## 41. "Zombie position" dump exit (Rule 41 technical detail)
 
@@ -2719,3 +2756,418 @@ close math, spread check skipped, slippage floor uses
 position open) and `test_polymarket_simulator.py`
 (`ignore_staleness=True` bypasses the raise; default `False` still raises
 for existing callers). **384 Python tests passing** (371 + 13 new).
+
+## 42. `PositionTracker` (Rule 42 technical detail)
+
+**`applyTrade(state, trade)`** — the weighted-average update, deliberately
+fed `usdcSize`/`size` directly rather than computing a fee:
+```typescript
+if (trade.side === "BUY") {
+  const newShares = prevShares + trade.size;
+  const newCost = prevCost + trade.usdcSize;   // usdcSize is ALREADY fee-inclusive
+  // avgEntryPrice = newCost / newShares
+}
+```
+On SELL, a sale larger than tracked shares is clamped rather than allowed
+to go negative:
+```typescript
+const soldShares = Math.min(trade.size, existing.shares);
+const fractionSold = soldShares / existing.shares;
+const proceeds = trade.usdcSize * (soldShares / trade.size);  // only the
+const realizedSlice = proceeds - existing.costBasisUsd * fractionSold;  // clamped portion
+```
+Idempotency uses the identical composite trade-id
+`polymarket_data_api.py` already established
+(`tx_hash:asset:side:timestamp`) — a `Set<string>` per wallet state, kept
+the same across languages on purpose rather than inventing a second
+uniqueness scheme.
+
+**`checkMarketResolution(marketSlug)`** — two-step Gamma lookup, mirroring
+`polymarket_simulator.py`'s `fetch_market_info`:
+```typescript
+const plain = await fetchGammaMarket(marketSlug, false);
+if (plain) return parseGammaMarket(plain);
+const closed = await fetchGammaMarket(marketSlug, true);  // &closed=true
+if (closed) return parseGammaMarket(closed);
+return { status: "delisted" };
+```
+`parseGammaMarket` reads `closed`/`outcomes`/`outcomePrices` directly off
+the market object — verified live (2026-07-27) against
+`wnba-tor-atl-2026-06-22`: `closed=true`, `outcomes=["Toronto Tempo",
+"Atlanta Dream"]`, `outcomePrices=["0","1"]` (same index order, confirmed
+by the same pattern already relied on for `outcomes`/`clobTokenIds` in
+`polymarket_simulator.py`), `umaResolutionStatus="resolved"`.
+
+**`resolveOpenPositions(state)`** — scoped to currently-held markets only
+(never a bulk sweep), and a transient fetch error explicitly does NOT
+count as delisted:
+```typescript
+try {
+  resolution = await checkMarketResolution(pos.marketSlug);
+} catch (err) {
+  console.warn(...);
+  continue; // retry next update — NOT a delisted verdict
+}
+```
+A genuine `{status: "delisted"}` closes the position with
+`realizedPnlUsd: null` and increments a per-market throttle counter
+(`unresolvableMarkets: Map<string, number>`) — first failure warns, every
+`UNRESOLVABLE_LOG_EVERY=4`th repeat warns again, identical shape/reasoning
+to `bot.py`'s `_zombie_unresolvable_failures`/`_closeout_fetch_failures`.
+
+**`computeWalletMetrics(state)`** filters `closedPositions` to
+`realizedPnlUsd !== null` before computing anything — a delisted close's
+`null` is never coerced into `0` and averaged into win rate or total PnL.
+`winRate` itself is `null`, not `0`, when there are zero closed positions
+yet — "unknown" and "confirmed 0%" are different claims.
+
+**`updateWalletState(state)`** sorts trades ascending before applying —
+confirmed live that `data-api.polymarket.com/activity` returns
+newest-first, so trusting fetch order would apply a SELL before the BUY
+it's closing out, corrupting the weighted-average math silently.
+
+**`reconcile:position-tracker`** reads the ground-truth wallet list from
+`bot_risk_state.tracked_traders` (Drizzle: `db.select().from(botRiskState)
+.where(eq(botRiskState.key, "tracked_traders"))`) rather than a hardcoded
+address list, so it never drifts from whatever `bot.py` is actually
+running. Compares against `wallet_profile.pnlAllTime` per wallet, flags
+(doesn't fail) any diff over `PNL_DIFF_FLAG_THRESHOLD_PCT=10` for manual
+read, and separately surfaces a truncation warning whenever
+`tradeCountAllTime > 5000` (the `fetchWalletTrades` page cap) so an
+incomplete reconstruction's gap isn't mistaken for a math bug.
+
+**Tests:** `positionTracker.test.ts` — `describe("applyTrade")` (single
+BUY cost basis, two-BUY weighted average, idempotent re-apply, partial
+sell's realized slice, full sell's `sold_out` close, a no-op sell against
+no tracked position, a clamped over-sized sell), `describe("checkMarketResolution")`
+(open, resolved-on-first-try, resolved-only-after-retry, delisted-only-
+after-both-empty), `describe("resolveOpenPositions")` (stays open,
+resolves with correct PnL, delists with `null` PnL and throttle
+increment, transient failure leaves the position open),
+`describe("computeWalletMetrics")` (null win rate on zero closes,
+delisted exclusion), and `describe("updateWalletState")` (chronological
+application despite newest-first fetch order, `lastFetchedAt` set for the
+next delta).
+
+**Concurrency fix (Rule 42 addendum, same day)**: `resolveOpenPositions`
+fans resolution checks out with `mapWithConcurrency` instead of one
+sequential `await` per held market:
+```typescript
+const uniqueSlugs = Array.from(new Set(Array.from(state.openPositions.values()).map((p) => p.marketSlug)));
+const resolutions = await mapWithConcurrency(uniqueSlugs, RESOLUTION_CHECK_CONCURRENCY, async (slug) => {
+  try {
+    return { slug, resolution: await checkMarketResolution(slug) };
+  } catch (err) {
+    return { slug, error: (err as Error).message };
+  }
+});
+```
+`RESOLUTION_CHECK_CONCURRENCY = 5`, matching `scoreWallets.ts`'s existing
+pass-1/pass-2 concurrency rather than a freshly-tuned number. Deduped by
+market slug (a `Set`) before fanning out — a wallet holding both outcomes
+of one market previously triggered two identical Gamma calls. The
+per-position mutation loop that follows (delete from `openPositions`,
+push to `closedPositions`) still runs single-threaded, reading from a
+plain `Map<string, {resolution} | {error}>` built after the fan-out
+completes — no concurrent writers ever touch `state` itself. **Tests:**
+2 new — same-market/different-outcome dedup (`fetchMock` called once for
+two positions), and two DIFFERENT markets resolving to different correct
+outcomes under the same concurrent batch (guards against a fan-out bug
+that resolves everything to whichever market's response happened to
+arrive first). **221 TS tests passing** (was 219).
+
+**Outcome-name normalization fix (Rule 42 addendum, same day)**:
+```typescript
+function normalizeOutcomeName(name: string): string {
+  return name.replace(/['‘’ʼ`]/g, "");
+}
+// ...
+const normalizedTarget = normalizeOutcomeName(pos.outcome);
+const outcomeIndex = resolution.outcomes.findIndex((o) => normalizeOutcomeName(o) === normalizedTarget);
+```
+Real live finding: `data-api.polymarket.com/activity`'s `outcome` field
+and `gamma-api.polymarket.com/markets`' `outcomes` array disagree on
+apostrophes for the same real-world name (confirmed on 6+ occurrences in
+one wallet's history — "St Josephs FC" vs. "St Joseph's FC", "OHiggins
+FC" vs. "O'Higgins FC", "Côte dIvoire" vs. "Côte d'Ivoire"). Deliberately
+narrow — only apostrophe-like characters are stripped, nothing is
+lowercased or otherwise fuzzy-matched, since over-normalizing risks
+silently conflating two genuinely different outcome names. **Tests:** 1
+new — the exact "St Josephs FC" case reproduced against a mocked
+`closed:true` Gamma response with the apostrophe intact, confirmed
+resolving correctly. **222 TS tests passing** (was 221).
+
+**Reconciliation windowing fix (Rule 42 addendum, same day)**:
+```typescript
+const windowStartEpochSeconds = Math.floor(Date.now() / 1000) - RECONCILIATION_WINDOW_DAYS * 86400;
+// ...
+const state = newWalletPositionState(address);
+state.lastFetchedAt = windowStartEpochSeconds; // bounds fetchWalletTrades' startEpochSeconds
+await updateWalletState(state);
+// ...
+const bullpenPnl30d = profile[0]?.pnl30d ?? null;  // was profile[0]?.pnlAllTime
+```
+`RECONCILIATION_WINDOW_DAYS = 30` — reuses `WalletPositionState.
+lastFetchedAt` (already built for incremental delta updates) as a
+one-shot lower bound instead of leaving it `undefined` (full-history
+attempt, capped at 5000 trades). Diffs against `wallet_profile.pnl30d`
+(same direct bullpen pass-through provenance as `pnlAllTime`) rather than
+lifetime PnL. 30 days specifically because `wallet_profile` has that
+exact field to diff against — no `pnl90d` equivalent exists, so 30 was
+picked for a clean apples-to-apples comparison, not because it's the
+"right" window on principle. See RISK_MANAGEMENT.md Rule 42's addendum
+for the diagnostic pattern that motivated this (14/17 wallets with large
+diffs all hit the 5000-trade cap; the 3 clean matches never did).
+No new tests — `reconcile:position-tracker` stays in the live-
+integration-script category (same as `propose_pool_refill.py`), verified
+by re-running against the real 17 wallets, not unit-tested.
+
+## 43. `computePositionConfidence` (Rule 42 addendum, `scoreWallets.ts`)
+
+```typescript
+export function computePositionConfidence(closedCount: number, openCount: number, rules: ScoringRules): number | null {
+  const total = closedCount + openCount;
+  if (total === 0) return null;
+  const completeness = closedCount / total;
+  const closedSampleConfidence = clamp(closedCount / rules.closedPositionConfidenceFloor, 0, 1);
+  return completeness * closedSampleConfidence;
+}
+```
+`ScoringRules.closedPositionConfidenceFloor: 20` (v6). Not called from
+`computeCompositeScore` or anywhere in the pass-1/pass-2 fetch loop yet —
+`PositionTracker` has no call site in `scoreWallets.ts` at all currently;
+this function exists so the integration, when it happens, doesn't also
+need to design the discount math from scratch. Confirmed via `getActiveRuleSet()`'s
+existing version-mismatch auto-deactivate/insert logic that the v5 -> v6
+bump activates cleanly against the real DB (re-ran `scan:wallets` live).
+
+**Tests:** `scoreWallets.test.ts` — `describe("computePositionConfidence")`:
+null (not 0) on zero position data, 0 (not null) on activity with zero
+closes, the real yield-farmer-1 shape (212 closed / 226 open) scoring
+below 0.5, a 2-closed/0-open wallet scoring low despite 100% completeness
+(sample-size gate working independently of the ratio), a well-sampled
+mostly-closed wallet scoring above 0.9, and the ramp capping at 1.0 past
+the floor (same shape as `computeSampleConfidence`). **228 TS tests
+passing** (was 222).
+
+## 44. Capital multiplier + tiered scoring (Rule 44 technical detail)
+
+**`computeCapitalMultiplier`**:
+```typescript
+export function computeCapitalMultiplier(sharpeProxy: number, rules: ScoringRules): number {
+  const saturationFraction = clamp(sharpeProxy / rules.capitalMultiplier.saturation, 0, 1);
+  return 1 + saturationFraction * (rules.capitalMultiplier.max - 1);
+}
+```
+Fed `SeriesAnalysis.sharpeProxy` — the raw `meanDelta / stdevDelta`
+`analyzePnlSeries` already computes internally, now returned rather than
+discarded (only the saturated `consistencyScore = clamp(sharpeProxy /
+sharpeSaturation, 0, 1)` was exposed before). `rules.capitalMultiplier =
+{ saturation: 0.35, max: 2.0 }` (v7). Wired into `runPass2` right where
+`analyzePnlSeries` is already called — no new fetch, reuses data already
+paid for:
+```typescript
+const { ..., sharpeProxy } = analyzePnlSeries(series, rules);
+const capitalMultiplier = computeCapitalMultiplier(sharpeProxy, rules);
+```
+Threaded onto `Pass2Result.capitalMultiplier` and every `upsertWalletProfile`
+call site (all 5 — toxic-flow/recency/liquidity-farming gate rejections,
+the final decided loop, and pass-1 rejections pass `capitalMultiplier: null`
+since pass 1 never reaches `analyzePnlSeries`).
+
+**`db.get_wallet_composite_scores()`** (Python) extended to select and
+surface the new column:
+```python
+"SELECT wallet_address, composite_score, win_rate, trade_count_all_time, "
+"capital_multiplier, category_scores_json FROM wallet_profile"
+# ...
+result[row["wallet_address"].lower()] = {
+    "composite": row["composite_score"],
+    "composite_win_rate": row["win_rate"],
+    "composite_trade_count": row["trade_count_all_time"],
+    "capital_multiplier": row["capital_multiplier"],
+    "categories": categories,
+}
+```
+
+**`bot.compute_trade_size_usd()`** — the Kelly math is byte-for-byte
+unchanged; only the range it maps into is stretched:
+```python
+capital_multiplier = wallet_score_entry.get("capital_multiplier") or 1.0
+min_trade_usd = config.MIN_TRADE_USD * capital_multiplier
+max_trade_usd = config.MAX_TRADE_USD * capital_multiplier
+clamped = max(0.0, min(1.0, half_kelly_fraction))
+return min_trade_usd + (max_trade_usd - min_trade_usd) * clamped
+```
+`config.BASE_TRADE_USD` (the `wallet_score_entry is None` / no-win-rate-
+evidence fallback) is deliberately returned BEFORE this scaling — a
+multiplier never inflates the no-evidence default.
+
+**Tiered scoring**: `getTrackedWalletAddresses()` (mirrors
+`reconcilePositionTracker.ts`'s identical helper — same query, same
+`bot_risk_state.tracked_traders` source, not shared into a common module
+tonight for time reasons but doing the exact same thing) is fetched once
+per `main()` run and threaded through `runPass1`/`finalizeAndWrite`/
+`upsertWalletProfile` as `trackedAddresses`. `upsertWalletProfile` derives
+`tier` and `nextRescoreDueAt` internally on every write:
+```typescript
+const tier = deriveTier(args.walletAddress, args.status, args.trackedAddresses);
+const nextRescoreDueAt = computeNextRescoreDueAt(tier, args.rules, now);
+```
+`filterDueForRescore(candidates)` runs once in `main()`, right after
+`getCandidateWallets()`, and drops anything not yet due — a single query
+joining the candidate list against `wallet_profile.nextRescoreDueAt`,
+treating both "no row at all" and "row exists but `nextRescoreDueAt` is
+NULL or in the past" as due.
+
+**Verified live** (rule_set auto-bumped v6 -> v7, same auto-deactivate/
+insert mechanism as every prior version bump): re-ran `scan:wallets`.
+First run: 692 of 692 candidates due — expected, since `nextRescoreDueAt`
+never existed as a concept before this exact code change, so every row is
+legitimately "never scored under this system." Second, immediate re-run:
+**10 of 692 due (98.6% reduction)**, completing in seconds — the
+self-throttle confirmed working on real data, not just unit tests.
+
+**Tests:** 11 new (`scoreWallets.test.ts`), 4 new (`test_bot_risk_checks.py`)
+— see RISK_MANAGEMENT.md Rule 44 for the full list. **239 TS / 388 Python
+tests passing.**
+
+## 45. Personal Grafana dashboard (Rule 45 technical detail)
+
+**`risk_manager.py`** — the refactor, byte-for-byte behavior-preserving:
+```python
+def compute_unrealized_pnl(positions, prices_by_key):
+    unrealized = 0.0
+    for key, pos in positions.items():
+        price = prices_by_key.get(key)
+        if price is None or price <= 0:
+            continue
+        unrealized += pos.get("shares", 0.0) * price - pos.get("cost_basis_usd", 0.0)
+    return unrealized
+
+def compute_equity(positions, prices_by_key, realized_pnl):
+    return config.PAPER_BANKROLL_USD + realized_pnl + compute_unrealized_pnl(positions, prices_by_key)
+
+def compute_equity_breakdown(positions, prices_by_key, realized_pnl):
+    unrealized_pnl = compute_unrealized_pnl(positions, prices_by_key)
+    deployed_cost_basis = sum(pos.get("cost_basis_usd", 0.0) for pos in positions.values())
+    total_cash = config.PAPER_BANKROLL_USD + realized_pnl - deployed_cost_basis
+    total_equity = config.PAPER_BANKROLL_USD + realized_pnl + unrealized_pnl
+    return {"total_equity": total_equity, "total_cash": total_cash, "total_unrealized_pnl": unrealized_pnl}
+```
+
+**`db.py`** — the shared event-type constant (the zombie-dump bug fix
+lives here) and the two new functions:
+```python
+_REALIZED_PNL_EVENT_TYPES = (
+    "paper_sell", "live_sell", "paper_sell_trailing_tp", "live_sell_trailing_tp",
+    "paper_sell_zombie_dump", "live_sell_zombie_dump", "position_resolved",
+)
+
+def realized_pnl_today(now=None):
+    now = now or datetime.now(timezone.utc)
+    start_of_day = int(datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp())
+    # ... same SUM(json_extract(...)) query as realized_pnl_total(), + "AND timestamp >= ?"
+
+def has_snapshot_for_today(now=None):
+    # SELECT 1 FROM daily_portfolio_snapshots WHERE date = ? (today's UTC 'YYYY-MM-DD')
+
+def record_daily_snapshot(total_equity, total_cash, total_unrealized_pnl,
+                           realized_pnl_today, active_traders_followed, now=None):
+    # INSERT ... ON CONFLICT(date) DO UPDATE SET ... -- idempotent upsert by UTC date
+```
+
+**`bot.py`** — `maybe_snapshot_daily_portfolio(positions, prices_by_key,
+tracked_traders, muted_traders)`, called from `main()`'s TTP-sweep block
+right after the kill-switch equity evaluation (same `prices_by_key`,
+same `if prices_by_key is not None` guard), wrapped in its own
+try/except so a snapshot failure can never take down the poll loop:
+```python
+now = datetime.now(timezone.utc)
+if now.hour < config.DAILY_SNAPSHOT_TRIGGER_HOUR_UTC:
+    return
+if has_snapshot_for_today(now=now):
+    return
+breakdown = risk_manager.compute_equity_breakdown(positions, prices_by_key, realized_pnl_total())
+active_traders_followed = len(tracked_traders) - len(muted_traders)
+record_daily_snapshot(..., now=now)
+```
+
+**Schema** (`packages/db/src/schema.ts`, migration `0017_magical_turbo.sql`):
+`daily_portfolio_snapshots(date TEXT PRIMARY KEY, snapshot_at INTEGER,
+total_equity REAL, total_cash REAL, total_unrealized_pnl REAL,
+realized_pnl_today REAL, active_traders_followed INTEGER)`.
+
+**`docker-compose.grafana.yml`**: `grafana-oss:11.4.0`, port `3001:3000`
+(3000 stays the Next.js dashboard), `GF_INSTALL_PLUGINS=frser-sqlite-datasource`,
+`./data:/data:ro` (whole directory, not just `app.db` — WAL mode means
+recent commits can sit in `app.db-wal` until checkpointed), a separate
+named volume (`grafana-storage`) for Grafana's own config so dashboards
+survive a container restart.
+
+**Tests:** see RISK_MANAGEMENT.md Rule 45 for the full breakdown — 4 new
+in `test_risk_manager.py`, 9 new in `test_db_daily_snapshot.py` (new
+file), 5 new in `test_bot_risk_checks.py`. **404 Python tests passing**
+(was 388). TS suite unaffected (239, unchanged) — this feature touches
+no TypeScript.
+
+## 46. Non-positive Kelly edge skips the copy (Rule 46 technical detail)
+
+**`bot.py`, `compute_trade_size_usd()`** — one new early return, right
+after `half_kelly_fraction` is computed and before `capital_multiplier`/
+`min_trade_usd`/`max_trade_usd` are even looked at:
+```python
+half_kelly_fraction = kelly_fraction * config.KELLY_FRACTION_MULTIPLIER
+
+if half_kelly_fraction <= 0:
+    return 0.0
+
+capital_multiplier = wallet_score_entry.get("capital_multiplier") or 1.0
+min_trade_usd = config.MIN_TRADE_USD * capital_multiplier
+max_trade_usd = config.MAX_TRADE_USD * capital_multiplier
+
+clamped = min(1.0, half_kelly_fraction)  # was: max(0.0, min(1.0, half_kelly_fraction))
+return min_trade_usd + (max_trade_usd - min_trade_usd) * clamped
+```
+The `sizing_tier="base"` path (no win-rate evidence anywhere) returns
+`config.BASE_TRADE_USD` earlier in the function and never reaches this
+code at all — unaffected.
+
+**`bot.py`, `process_trade()`** — the new skip check sits right after the
+`score_breakdown` snapshot dict is assembled (so the exact
+`shrunk_win_rate`/`kelly_fraction` that triggered it are still captured
+for `decision_journal`), and before Rule 29's `LIMIT_ORDER_TRACKED_
+WALLETS` branch — a wallet on the limit-order pilot with a non-positive
+edge now skips before a `pending_execution` row is ever created, instead
+of resting a `target_usd=0` order:
+```python
+score_breakdown = {..., "trade_size_usd": trade_usd, ...}
+
+if trade_usd <= 0:
+    append_log({**base_event, "event_type": "skip_non_positive_kelly_edge",
+                "reason": f"half-Kelly fraction <= 0 for {nickname} in "
+                          f"category={category!r} (shrunk_win_rate={shrunk_win_rate}, "
+                          f"kelly_fraction={kelly_fraction}) — no assumed edge, no trade",
+                "score_breakdown": score_breakdown})
+    return
+```
+`trade_usd <= 0` is a safe proxy for "`compute_trade_size_usd` decided to
+skip": every other return path in that function (`BASE_TRADE_USD`, or a
+positive-Kelly floor/ceiling value) is guaranteed `> 0` given the
+existing `MIN_TRADE_USD`/`BASE_TRADE_USD` config invariants, so this
+never accidentally catches a legitimate floor-sized trade.
+
+**Distinct from `should_skip_category()` (Rule 19)**: that gate requires
+a category `pnl_t_stat` more extreme than `-CATEGORY_SKIP_Z_CRITICAL` —
+STATISTICALLY SIGNIFICANT harm — and runs *before* `compute_trade_size_
+usd()` is even called, so it can skip without computing a size at all.
+This new check is independent and strictly softer: any negative point
+estimate, evaluated *after* sizing, on wallet/category combinations that
+never cross Rule 19's stricter statistical bar (small or noisy category
+samples especially — exactly where this gap showed up live).
+
+**Tests:** RISK_MANAGEMENT.md Rule 46 has the full breakdown — 5 existing
+`TestComputeTradeSizeUsd` tests updated (floor assertions → `0.0`
+assertions), 1 new `TestProcessTradeScoreSnapshot` integration test
+(`test_non_positive_kelly_edge_skips_the_copy_entirely`). **405 Python
+tests passing** (was 404). No TS changes.

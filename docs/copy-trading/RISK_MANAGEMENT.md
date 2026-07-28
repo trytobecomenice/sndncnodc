@@ -3038,9 +3038,12 @@ upstream in the scorer itself, independent of compositeScore.
 toxic-flow/recency gates' exact `{status: "ignore", reason} | null` shape
 and slotting into `finalizeAndWrite`'s same force-ignore-and-write-
 immediately pipeline. A new pass-2 fetch (`fetchRecentTrades`, genuinely
-new — `bullpen polymarket activity --address`, not reusable from the
-existing `wallet-stats --section activity` timestamps-only call) samples up
-to 50 recent trades; `computeLiquidityFarmingSignal` computes what fraction
+new — the direct Polymarket Data API via `polymarketDataApi.ts`'s
+`fetchOnePage`, NOT bullpen (migrated 2026-07-27, same day as the gate
+itself — see the "direct-API migration" entry below), not reusable from
+the existing `wallet-stats --section activity` timestamps-only call)
+samples up to 50 recent trades; `computeLiquidityFarmingSignal` computes
+what fraction
 sit at an extreme price (<0.05 or >0.95) and how many times the single
 most-repeated (market, price) pair recurs. Gated on BOTH conditions
 together (≥50% extreme price AND ≥5x repeated quote, sample ≥20) — not
@@ -3062,6 +3065,79 @@ itself.
 boundary cases, both-conditions-required cases, the missing-data fail-open
 case, `computeLiquidityFarmingSignal`'s own math) — 195 TS tests passing
 total. 371 Python tests unaffected (TS-only change).
+
+**Addendum, same day: `fetchRecentTrades` moved off bullpen.** Joey asked
+whether the whole bot could drop bullpen entirely. Investigated rather than
+assumed: `bot.py`'s live trading loop (tracking + TTP pricing) is already
+bullpen-free (Rule 14/16), but the TS wallet-discovery/scoring pipeline
+(`scanLeaderboard.ts`, `scoreWallets.ts`) was NOT — every read (wallet-
+stats, pnl-series, discover-traders, and this gate's new `activity` call)
+still went through bullpen. Live-checked which of those are simple
+pass-throughs of a public Polymarket endpoint vs. bullpen's own computed
+analytics: `data-api.polymarket.com/activity` and `/value` are public and
+already used elsewhere (`polymarket_data_api.py`); no public leaderboard/
+ranking/smart-money endpoint could be found (several reasonable guesses
+all 404'd). That means `discover traders`/`data leaderboard`/`smart-money`
+(ranked + farmer/bot-filtered) and `wallet-stats`'s behavior metrics
+(`is_likely_bot`, `trader_tier`, win rate, trade frequency) are bullpen's
+own product analytics, not raw Polymarket data — recomputable from raw
+trade history in principle, but a real project, not a migration. Scoped
+that as a separate, deliberate decision rather than started on
+speculatively. The one clean, zero-downside win: `fetchRecentTrades` now
+calls `polymarketDataApi.ts`'s `fetchOnePage` (the SAME direct Data API
+endpoint the Python side already uses) instead of `bullpen polymarket
+activity`. Exporting `fetchOnePage` specifically (not the existing
+`fetchWalletTrades`) mattered: `fetchWalletTrades` auto-paginates until a
+SHORT page, so asking it for "50" on any wallet with >=50 trades would
+silently over-fetch well past the intended bounded sample — `fetchOnePage`
+is a genuine single bounded fetch, matching bullpen's old `--limit 50`
+semantics exactly. Execution (buy/sell/redeem) stays on bullpen
+deliberately — see Rule 1 / SAFETY.md §6 ("no private keys in this app" is
+a hard v1 requirement, not an oversight); removing it there would mean
+this codebase signing its own transactions, a deliberate decision to
+revisit, not a side effect of "use less bullpen." Tests: 195 TS tests
+passing, unchanged (no new tests added — `fetchRecentTrades` stays
+untested directly, same precedent as its sibling fetch functions in this
+file; `fetchOnePage`'s own pagination/backoff logic already has coverage in
+`polymarketDataApi.test.ts`).
+
+**Second addendum, same day: v4's gate caught a real false positive —
+fixed in v5.** The next `scan:wallets` run after v4 shipped gated 9
+wallets as liquidity farming. Manually checking each rather than trusting
+the gate blind: 8 looked like the confirmed pattern, but
+**"quant-generalist-2"** (`0xe154165732...`, one of the 7 wallets actually
+curated into `config.TRACKED_TRADERS` under Rule 28) did not. Its real
+47-trade sample: 44 of 47 BUY (not SELL), a **47.6% win rate** (a real
+farmer selling near-certain outcomes wins nearly every time — a
+near-coin-flip rate is the opposite signature), $179K lifetime profit,
+and its "7x repeated quote" turned out to be 7 BUYS at the same $0.02
+price within a 5-second window, sizes varying (52.8/117.1/132.9/50/50/
+150/117.1 shares) — sweeping a thin ask side to build a longshot
+position, not sitting there farming liquidity.
+
+**Root cause:** v4's `computeLiquidityFarmingSignal` measured
+extreme-price concentration and quote repetition, but never checked BUY
+vs. SELL — exactly the distinction between "farms rebates by repeatedly
+selling into an extreme price" and "genuinely bets on longshots by
+repeatedly buying one," which is the entire distinction Rule 40 was
+built around. Fixed in v5: a third required condition,
+`minExtremePriceSellPct = 0.5` — of the extreme-price trades
+specifically, at least half must be SELL-side. All three conditions
+required together now, not any two. 0.5 was chosen deliberately loose
+(a plain majority, not a tight cutoff): the confirmed-bad wallets sit at
+98-100% sell, this false positive sits at ~4.9% sell — there's no
+knife-edge number to get wrong here, a wide margin separates the two
+cases cleanly. Live re-verification (re-running `scan:wallets` against
+the real DB to confirm quant-generalist-2 no longer gates while the
+other 8 originally-caught wallets still do) was in progress at write
+time — see the `wallet_profile` table for the actual outcome rather than
+trusting this sentence.
+
+**Tests:** 5 new/updated in `scoreWallets.test.ts` — the exact
+quant-generalist-2 shape reproduced synthetically and confirmed NOT
+gated, a null-`extremePriceSellPct` fail-open case, and the existing
+both-conditions tests extended to isolate each of the three conditions
+individually. 200 TS tests passing (was 195).
 
 ---
 
@@ -3124,6 +3200,475 @@ unresolvable throttle counter (set AND clear), the live-mode slippage floor
 using `ZOMBIE_EXIT_MAX_SLIPPAGE` not `SLIPPAGE_TOLERANCE`, the skipped
 spread check, and a failed sell leaving the position open for retry.
 **384 Python tests passing** (371 + 13 new).
+
+## 42. `PositionTracker` — in-house position/PnL reconstruction for external wallets (2026-07-27)
+
+**Challenge:** the "Build vs. Borrow" architecture discussion, following
+directly from Rule 40/41's finding that bullpen's own qualitative flags
+(`is_likely_bot`, smart-money scores) don't match this project's actual
+disqualifier and caught 16 confirmed liquidity farmers only once real
+trade-pattern evidence was checked by hand. Bullpen's raw discovery/
+tracking data is trustworthy (already migrated, Rule 14/16); its
+*computed analytics* (win rate, PnL, trader classification) aren't, for
+the same reason `is_likely_bot` wasn't. The proposal: keep bullpen as a
+"dumb data hose," compute win rate/PnL ourselves from raw trade history so
+the scoring engine's own definitions — not bullpen's — decide what counts
+as skill.
+
+**Mechanism:** `positionTracker.ts` reconstructs a wallet's real position
+lifecycle from `data-api.polymarket.com/activity` (the same direct,
+no-auth endpoint `polymarket_data_api.py`/`polymarket_simulator.py`
+already use — no bullpen involved).
+
+- **Cost basis uses the trade's real `usdcSize` directly, not a fee
+  formula.** Verified against `polymarket_data_api.py`'s own module
+  docstring (already live-confirmed in an earlier session):
+  `usdcSize` is the actual on-chain settled amount, already fee-inclusive
+  — cross-checked exactly against Polymarket's documented fee formula on
+  two independent real trades. `polymarket_simulator.py`'s nonlinear fee
+  formula is for SIMULATING a fill that hasn't happened yet (our own
+  prospective paper trades); reconstructing a wallet's *already-settled*
+  history needs no such estimate — a genuine scope simplification found
+  while building, not assumed going in.
+- **Win rate is computed from CLOSED positions only.** An open position's
+  win/loss is genuinely unknown until it resolves — same "missing data
+  isn't evidence" posture as every other gate in this codebase. No
+  mark-to-market/unrealized-PnL estimate is computed; this scoring use
+  case doesn't need one.
+- **Market resolution via Gamma, not bullpen** — verified live before
+  building (2026-07-27): `gamma-api.polymarket.com/markets?slug=&closed=true`
+  carries `closed`, `outcomePrices` (same index order as `outcomes`), and
+  `umaResolutionStatus` directly on the market object. Confirmed against a
+  real resolved market (`wnba-tor-atl-2026-06-22`: `closed=true`,
+  `outcomePrices=["0","1"]`). Two-step lookup mirrors
+  `polymarket_simulator.py`'s `fetch_market_info` exactly: Gamma's default
+  listing excludes resolved markets, so a plain miss is retried once with
+  `&closed=true` before concluding "genuinely delisted" — skipping that
+  retry would misclassify every recently-resolved market as delisted.
+- **Delisted markets get an explicit, distinct outcome** —
+  `realizedPnlUsd: null`, never `0` — and every aggregate filters these
+  out rather than averaging a null in as a loss. Throttled warning on
+  repeat failures, same `_zombie_unresolvable_failures`/
+  `_closeout_fetch_failures` pattern already established in `bot.py`.
+- **Stateful, incremental updates** — `WalletPositionState` persists
+  `lastFetchedAt` and only fetches the delta since then (idempotent via
+  the same composite trade-id format `polymarket_data_api.py` already
+  uses: `tx_hash:asset:side:timestamp`, kept identical across languages
+  deliberately). Trades are explicitly sorted oldest-first before
+  applying — confirmed live that `/activity` returns newest-first, so
+  trusting fetch order would apply SELLs before the BUYs they close.
+
+**Ground-truth reconciliation** (`reconcile:position-tracker`): runs
+`PositionTracker` against every wallet in `bot_risk_state.tracked_traders`
+(the same live, always-current list `bot.py` itself publishes — not a
+hardcoded copy) and diffs the resulting realized PnL against
+`wallet_profile.pnl_all_time` (a direct, unmodified pass-through of
+bullpen's own `wallet-stats` `lifetime_pnl` — confirmed by reading
+`scoreWallets.ts`'s `upsertWalletProfile` call, genuinely bullpen-sourced,
+not scorer-computed). Deliberately does NOT collapse this into a single
+pass/fail number: it prints the open-position count and delisted count
+alongside the diff, since a gap could mean a real bug OR a methodology
+difference (bullpen's lifetime figure may account for open positions in
+a way this script can't see) — a human judgment call, not something to
+automate away. Also surfaces a truncation warning for any wallet whose
+lifetime trade count exceeds the 5000-trade fetch cap (confirmed live
+today: `quant-generalist-2` has 5219), since a partial reconstruction's
+PnL gap isn't evidence of a bug either.
+
+**Explicitly NOT built yet** (per the agreed build order — this ships
+first, everything else waits on it passing): Tier 2/3 scheduling
+(currently `track`/`watch`/`ignore` already exist as the tiering concept
+via `decideStatus()`, just not on an automated cadence), and any
+promotion path from the new engine's output into `config.TRACKED_TRADERS`
+— that stays human-reviewed, matching every promotion decision this
+project has made (`propose_pool_refill.py`, `discoverCategorySpecialists.ts`
+have never auto-promoted, and this doesn't either).
+
+**Tests:** 19 new unit tests (`positionTracker.test.ts`) — weighted-average
+cost basis across multiple buys, idempotent re-application, partial and
+full sells (including a sell larger than tracked shares, clamped rather
+than going negative), the two-step Gamma resolution lookup (open/
+resolved/delisted, retry-before-delisted), a transient fetch failure
+leaving a position open rather than misclassifying it, delisted closes
+excluded from `computeWalletMetrics` entirely, and newest-first trades
+applied in chronological order regardless of fetch order. `reconcile:
+position-tracker` itself is a live-integration script (same category as
+`propose_pool_refill.py`), verified by running it against the real 17
+tracked wallets, not unit-tested.
+
+**Concurrency fix, same day, found during the first live reconciliation
+run**: `resolveOpenPositions` originally checked one held market's
+resolution at a time — sequential, awaited, one Gamma round-trip after
+another. The very first wallet the reconciliation script ran against was
+hyperactive enough (5219 lifetime trades, hit the 5000-trade fetch cap)
+to hold 100+ distinct markets, and the script stalled rather than moving
+on to wallet 2. Fixed by fanning resolution checks out with
+`mapWithConcurrency` (limit 5 — the same number `scoreWallets.ts`'s own
+pass-1/pass-2 fan-out already uses, reused rather than tuned fresh),
+deduplicated by market slug first (a wallet holding both Yes and No of
+the same market only needs one Gamma call, not one per outcome). All
+network I/O happens in the fan-out; the actual open/closed state
+mutations still run single-threaded afterward, so there's no risk of two
+concurrent lanes racing on the same `Map`. **Tests:** 2 new
+(`positionTracker.test.ts`) — same-market-different-outcome
+deduplication, and multiple different markets resolving correctly and
+independently under concurrency, not just the first one checked. **221
+TS tests passing** (was 219).
+
+**Outcome-name normalization fix, same reconciliation run**: `strict-10`'s
+run surfaced 6+ resolved positions that failed to match at all —
+`data-api.polymarket.com/activity`'s `outcome` field strips apostrophes
+("St Josephs FC", "OHiggins FC", "Côte dIvoire") while
+`gamma-api.polymarket.com/markets`' `outcomes` array keeps them ("St
+Joseph's FC", "O'Higgins FC", "Côte d'Ivoire") — two different Polymarket
+APIs disagreeing on the spelling of the same real-world name. A plain
+`indexOf` match failed on every one, silently leaving those positions
+stuck open forever (not delisted, not resolved — just permanently
+unmatched, since the mismatch is structural and no future run fixes it on
+its own). Fixed with a targeted `normalizeOutcomeName()` that strips
+apostrophe-like characters from both sides before comparing —
+deliberately NOT lowercasing or normalizing anything else unproven, since
+over-normalizing risks silently matching two genuinely different
+outcomes. **Tests:** 1 new — the exact "St Josephs FC" vs. "St Joseph's
+FC" case reproduced and confirmed matching. **222 TS tests passing** (was
+221).
+
+**Reconciliation target fixed from lifetime to a 30-day rolling window,
+same day**: the first full reconciliation run (17 wallets) showed 14 of
+17 with large diffs (60-120%, two sign-flipped) and only 3 close matches
+(all under 10%). The pattern was diagnostic, not just noisy: every one of
+the 3 close matches was a wallet whose ENTIRE trade history fit under
+`fetchWalletTrades`' 5000-trade cap; every one of the 14 large diffs had
+hit that cap. Comparing a capped, recent-slice reconstruction against
+bullpen's TRUE LIFETIME `pnl_all_time` was never going to agree — the
+gap was explained by scope mismatch, not a bug in the math. This was also
+the wrong comparison on principle: this whole architecture (this Rule's
+liquidity-farming gate, `scoreWallets.ts`'s 90-day rolling-window
+consistency/win-rate scoring) already committed to bounded, recent-window
+evaluation over lifetime reconstruction. Fixed by binding BOTH sides to
+the same 30-day window — `WalletPositionState.lastFetchedAt` seeded to
+`now - 30d` before the reconstruction fetch (the exact mechanism already
+built for incremental delta updates, just repurposed for a one-shot bound
+here), diffed against `wallet_profile.pnl30d` (bullpen's own windowed
+figure, same direct-pass-through provenance as `pnlAllTime`) instead of
+`pnl_all_time`. **Honest remaining caveat**: a position opened before the
+window but closed inside it is invisible to a windowed fetch — the
+opening BUY never gets applied, so `applyTrade`'s existing "SELL with no
+tracked position" no-op silently excludes that close's PnL. This
+under-counts relative to bullpen's true 30-day figure for any wallet with
+boundary-straddling positions — a smaller, more bounded gap than the
+lifetime-vs-slice mismatch it replaces, not a claim of an exact match.
+30 days (not the 90-day window used elsewhere) was picked specifically
+because `wallet_profile` has a `pnl30d` field to diff against and no
+`pnl90d` equivalent — chosen for a clean apples-to-apples comparison, not
+because 30 days is inherently the "right" window for anything else.
+
+**Windowed reconciliation result, same day**: 3 of 17 wallets with zero
+open positions in the window matched near-perfectly (0.0%, 0.7%, 1.9%
+diff) — strong confirmation the fee/cost-basis/resolution math is
+correct. Most other diffs correlate with open-position count, consistent
+with the boundary-straddling caveat above. But `yield-farmer-1`'s gap
+(-$8,467 ours vs. +$449,944 bullpen's `pnl_30d`) was investigated directly
+rather than assumed: a throwaway script fetched this wallet's full
+available history (5000 trades, reaching back 42 days — far enough to
+rule out the boundary theory) and checked both hypotheses precisely.
+Boundary-straddling positions (first buy before the window, closed
+inside it): only 2, totaling **-$167.45** — nowhere near enough. Missed
+resolution-based closes (positions closed by market resolution, not a
+SELL trade, within the window): 123 more closes found, totaling
+**-$11,096.83** — still nowhere close; grand total realized PnL in-window
+was **-$9,451.73**, essentially unchanged from the original figure.
+**Neither theory explains a $450K gap.**
+
+**The actual explanation, confirmed by elimination**: `wallet_profile.
+pnl30d` (and presumably `pnl_all_time`/`pnl_7d` — same bullpen source) is
+very likely a MARK-TO-MARKET metric — portfolio value change over the
+window, derived from bullpen's `pnl-series` (a value-over-time series,
+not a trade ledger) — not a sum of realized closes. That would include
+unrealized gains on this wallet's 41 still-open positions, which
+`PositionTracker` deliberately excludes (see the module's own "missing
+data isn't evidence" doc comment on why open positions are never
+estimated). `yield-farmer-1`'s own name/profile — accumulating many cheap
+longshot positions that appreciate in price without necessarily resolving
+— is exactly the shape where realized-only and mark-to-market diverge
+most. **This is not a bug** — `PositionTracker` is correctly answering a
+different, more conservative question than bullpen's figure by design.
+It IS a real scope clarification worth stating plainly: for any wallet
+whose recent performance is dominated by unrealized moves on positions
+still open, `PositionTracker`'s realized-only PnL will understate recent
+performance relative to bullpen's number, and no amount of fixing the
+reconstruction logic closes that gap — it isn't measuring the same thing.
+**Implication for the eventual scoring engine**: a wallet's realized-PnL-
+based score should probably be confidence-weighted by its closed-vs-open
+position ratio (same spirit as `sampleConfidence` already used elsewhere
+in `scoreWallets.ts`) rather than trusted equally regardless of how much
+of its recent activity is still unresolved.
+
+**`computePositionConfidence`, same day**: built as a standalone, tested
+function in `scoreWallets.ts`, ready for whenever `PositionTracker` gets
+wired into the live pipeline — **not yet consumed by `compositeScore`**,
+since `PositionTracker` isn't called anywhere in the pass-1/pass-2 fetch
+loop yet (that's a separate, larger integration with its own real
+performance implications — a full position reconstruction per candidate
+wallet, not a single bullpen call — deliberately deferred as its own
+decision rather than bundled into a formula addition). Two factors,
+multiplied rather than one ratio doing both jobs: `completeness =
+closedCount / (closedCount + openCount)` (the direct fix for the
+mark-to-market divergence above) times `closedSampleConfidence =
+clamp(closedCount / closedPositionConfidenceFloor, 0, 1)` (same ramp
+shape as the existing `computeSampleConfidence`, over closed POSITIONS —
+a `PositionTracker` concept — rather than raw trades, a bullpen
+`wallet-stats` concept; a wallet with 2 closed and 0 open positions would
+score 100% completeness but 2 closes still isn't a real sample).
+`closedPositionConfidenceFloor = 20`, matching `liquidityFarming.
+minSampleSize`'s precedent as a reasonable "minimum evidence" bar. Returns
+`null` (not 0) when there's no position data at all — genuinely unknown,
+not zero trust — but 0 (not null) when there's open activity with zero
+closes yet, since that's a confirmed "no realized track record," a
+different claim from "no data." `ScoringRules` bumped to v6 for the new
+field alone (no behavior change yet) rather than let a future consumer
+silently read `undefined` off an old, pre-v6 `rule_set` row. **Tests:** 6
+new (`scoreWallets.test.ts`) — the null-vs-zero distinction, the exact
+yield-farmer-1 shape (212 closed/226 open) scoring below 0.5, a
+100%-complete-but-thin-sample wallet correctly scoring low, and the ramp
+cap matching `computeSampleConfidence`'s own shape. **228 TS tests
+passing** (was 222).
+
+## 44. Capital multiplier + tiered scoring (rule_set v7, 2026-07-28)
+
+**Challenge (capital multiplier):** Joey's ask — allocate more capital to
+best-performing wallets, based on a standard quant formula. Rule 25's
+existing Half-Kelly sizing (`compute_trade_size_usd()`) already does real,
+correct position sizing — Empirical-Bayes shrinkage of win rate toward the
+market's own implied probability, then the Kelly formula itself — and it
+structurally *can't* move into the Scorer, because Kelly fraction depends
+on the market price at TRADE time, which the Scorer (a periodic scan) never
+has. So this isn't a new sizing formula — it's a per-wallet multiplier on
+the RANGE Rule 25's existing, unmodified Kelly math operates within.
+
+**Mechanism (capital multiplier):** `computeCapitalMultiplier(sharpeProxy,
+rules)` — `1 + clamp(sharpeProxy / capitalMultiplier.saturation, 0, 1) *
+(capitalMultiplier.max - 1)`. Fed the RAW, unsaturated Sharpe proxy
+(`analyzePnlSeries` already computes `meanDelta / stdevDelta` internally
+to derive `consistencyScore`, but that value is clamped at `sharpeSaturation
+= 0.15` — reusing it here would pin every "track"-tier wallet at the same
+1.0, killing the differentiation this needs entirely). `sharpeProxy` is now
+exposed as its own `SeriesAnalysis` field for exactly this reason.
+`capitalMultiplier: { saturation: 0.35, max: 2.0 }` — both explicitly
+confirmed with Joey (2026-07-28), not picked unilaterally; 0.35 is
+deliberately well above the 0.15 track-threshold so only genuinely
+exceptional track records earn the full 2x, not everyone who merely
+qualifies for tracking. Never shrinks below 1.0 — a losing or unproven
+wallet gets the unmodified base range, this only ever rewards documented
+skill. `bot.py`'s `compute_trade_size_usd()` reads
+`wallet_score_entry["capital_multiplier"]` (via `db.
+get_wallet_composite_scores()`, extended to select the new column) and
+scales `MIN_TRADE_USD`/`MAX_TRADE_USD` by it before the existing clamped
+Kelly fraction gets mapped in — the Kelly math itself is byte-for-byte
+unchanged. Missing/`None` behaves identically to `1.0`. Deliberately does
+NOT scale `config.BASE_TRADE_USD` (the no-evidence fallback) — a
+multiplier rewards proven edge; it must never inflate the default used
+when there's no win-rate evidence at all.
+
+**Challenge (tiered scoring):** the "Build vs. Borrow" architecture
+discussion's Part A — avoid re-scoring the full ~700-wallet candidate pool
+on every run regardless of whether anything changed. Confirmed live during
+tonight's reconciliation work that Tier 1 can't be sourced from
+`wallet_profile.status='track'` — that's this scorer's own recommendation,
+and it's known to drift from what `bot.py` actually copies.
+
+**Mechanism (tiered scoring):** `deriveTier(address, status,
+trackedAddresses)` — Tier 1 = live in `bot_risk_state.tracked_traders`
+(ground truth, fetched once per run via the new `getTrackedWalletAddresses()`,
+same source `reconcilePositionTracker.ts` already uses), Tier 2 =
+`status='watch'`, Tier 3 = everything else. A manually-promoted wallet is
+Tier 1 immediately regardless of its stored score — tier reflects what's
+actually being copied, not the scorer's opinion of it. `wallet_profile.
+nextRescoreDueAt` (new column) is set at every write via
+`computeNextRescoreDueAt(tier, rules)` — `tierRescoreIntervalDays:
+{tier1: 1, tier2: 1, tier3: 7}`. A new `filterDueForRescore()` runs
+BEFORE pass 1 and drops any candidate whose `nextRescoreDueAt` is still in
+the future (a wallet never scored, or with no row at all, is always due —
+new candidates can never be starved). This is a **single, frequently-
+scheduled job**, not three separately-scheduled ones — the self-throttling
+lives in the data (`nextRescoreDueAt`), not in cron's timing, matching the
+Weather Bot's own `launchd`-based scheduling precedent rather than
+inventing a new mechanism. **Known, accepted limitation**: a manual
+`TRACKED_TRADERS` promotion doesn't force an immediate re-score — the
+wallet becomes Tier 1 (and gets the right cadence) starting next run, but
+if it was last scored as Tier 3 with a due date a week out, it keeps that
+old due date rather than jumping the queue. Accepted for v1 rather than
+solved — a human just reviewed this wallet before promoting it.
+
+**Tests:** 11 new (`scoreWallets.test.ts`) — `computeCapitalMultiplier`
+(exactly 1.0 at zero edge, clamps a negative/losing Sharpe to 1.0 not
+below, caps at `max` at/above saturation, scales linearly below it, and
+explicitly does NOT reuse the 0.15 track-threshold as its own saturation
+point); `deriveTier` (tier1 wins regardless of status, casing-insensitive
+against the tracked set); `computeNextRescoreDueAt` (correct per-tier
+interval, tier3 longer than tier1 — the entire point). Python side: 4 new
+(`test_bot_risk_checks.py`) — missing multiplier behaves identically to an
+explicit 1.0, the range stretches proportionally, the multiplier never
+inflates `BASE_TRADE_USD`, and the floor itself scales
+(`min_trade_usd * multiplier`). **239 TS tests passing** (was 228).
+**388 Python tests passing** (was 384).
+
+**Verified live, confirmed after-warm-up numbers**: rule_set auto-bumped
+v6 -> v7 cleanly. First `scan:wallets` run: 692 of 692 candidates due —
+expected, `nextRescoreDueAt` never existed as a concept before this exact
+code change. Immediately re-ran a second time: **10 of 692 candidates due
+— a 98.6% reduction**, and the run completed in seconds (10 candidates
+through pass 1, 0 survived to pass 2) instead of the several minutes a
+full 692-candidate pass normally takes. The self-throttle works exactly
+as designed on real data, not just in unit tests.
+
+## 45. Personal Grafana dashboard: `daily_portfolio_snapshots` (2026-07-28)
+
+**Challenge:** a read-only, personal Grafana dashboard for long-term
+equity/edge/system-health tracking — explicitly NOT a trading-decision
+feature, purely observability. Requested: a daily snapshot table, Docker
+Compose for Grafana, and SQL for equity curve/high-water-mark, Sharpe/
+win-rate, and tiering-system throttle panels.
+
+**Mechanism:** `daily_portfolio_snapshots` (new table, one row per UTC
+calendar day, `date` as the primary/idempotency key) — deliberately NOT a
+repurposing of the existing-but-never-written `pnl_snapshot` table (a
+different, multi-scope per-wallet/per-market design with no `total_cash`/
+`active_traders_followed` fields; a fresh table matches what was actually
+asked for). `bot.maybe_snapshot_daily_portfolio()` fires once conditions
+are both true — current UTC hour >= `config.
+DAILY_SNAPSHOT_TRIGGER_HOUR_UTC` (23) AND `db.has_snapshot_for_today()`
+is false — a DB-backed idempotency check, not an in-memory flag, so this
+is correct across the bot's frequent restarts: it can't re-snapshot twice
+near the trigger hour after a restart, and can't silently miss a day the
+bot happened to be down across 23:00 UTC. Piggybacks on the TTP sweep's
+own `prices_by_key` (same reasoning as the kill-switch equity evaluation
+right above this call site) — no separate price-fetch pass.
+
+**`risk_manager.compute_equity_breakdown()`** — a refactor, not a
+parallel accounting system: the existing `compute_equity()`'s internals
+(the unrealized-PnL loop) were extracted into `compute_unrealized_pnl()`,
+which both functions now share; `compute_equity()`'s own signature/return
+value/every existing test is byte-for-byte unchanged. The new breakdown
+adds `total_cash` = bankroll adjusted for realized PnL, minus deployed
+cost basis (not mark value — cash freed by a position isn't affected by
+its current unrealized swing, only by actually closing).
+`active_traders_followed` = tracked minus muted — the same "actively
+copying" definition the Next.js dashboard already established (Rule 36),
+not the raw static `TRACKED_TRADERS` count; a muted wallet isn't actually
+being followed right now even though it's still configured.
+
+**Real bug found and fixed while building this**: `db.realized_pnl_total()`'s
+event-type list was missing `paper_sell_zombie_dump`/`live_sell_zombie_dump`
+(Rule 41, shipped 2026-07-27) entirely — zero live impact so far
+(`ENABLE_ZOMBIE_POSITION_DUMP` is still off, so no zombie-dump close has
+ever actually happened), but a real gap that would have silently
+under-counted realized PnL and equity the moment that flag gets turned
+on. Fixed by centralizing the event-type list into one shared constant
+(`_REALIZED_PNL_EVENT_TYPES`) both `realized_pnl_total()` and the new
+`realized_pnl_today()` read from, so the two can never drift apart again.
+
+**Grafana**: `docker-compose.grafana.yml` mounts the whole `data/`
+directory read-only (not just `app.db` — the DB runs in WAL mode, so
+mounting only the main file risks Grafana seeing a stale view of anything
+not yet checkpointed) and auto-installs the community
+`frser-sqlite-datasource` plugin (Grafana has no built-in SQLite support).
+Full setup + every panel query: `docs/copy-trading/GRAFANA_SETUP.md`. The
+Sharpe panel deliberately reuses the EXACT SAME formula
+(`meanDelta / stdevDelta` over value deltas) `scoreWallets.ts` already
+uses to score external wallets — applied to this bot's own equity curve
+instead, for one consistent definition of "Sharpe" across the whole
+system rather than two. The win-rate panel queries the real `paper_trade`
+table (filtered to `strategy = 'bot_filtered'`, excluding shadow-rehab/
+benchmark rows sharing the table) — there is no table literally named
+"trades" in this schema. The tiering-efficiency panels query
+`wallet_profile.lastScoredAt` directly for real re-scoring volume over
+time (the honest measurement of whether the self-throttle is working)
+and `bot_risk_state.tracked_traders` via `json_each` for the true Tier 1
+count (the JSON1 extension already relied on elsewhere via
+`json_extract` in `db.realized_pnl_total()`).
+
+**Tests:** `test_risk_manager.py` (4 new — `compute_equity_breakdown`'s
+total agrees exactly with the unchanged `compute_equity`, correct
+unrealized/cash components, and the no-positions case), `test_db_daily_
+snapshot.py` (9 new — `realized_pnl_today` correctly excludes yesterday's
+closes, includes the previously-missing zombie-dump event types, ignores
+unrelated event types; snapshot idempotency: false before any write, true
+after, a same-day second write overwrites rather than duplicating, false
+again for a row from a different day), `test_bot_risk_checks.py` (5 new —
+does nothing before the trigger hour, does nothing if already
+snapshotted today, records correctly past the trigger with the right
+`active_traders_followed` math, and a failure inside isn't silently
+swallowed). **404 Python tests passing** (was 388). No new TS — this
+feature is entirely Python + SQL, TS suite unaffected at 239.
+
+## 46. Non-positive Kelly edge now skips the copy, instead of flooring at MIN_TRADE_USD (2026-07-28)
+
+### Summary
+
+**Challenge:** investigating a day where `strict-10` (sports category)
+kept losing small amounts — asked directly whether slippage was the
+cause. It wasn't (shortfall/spread stayed in the low single-digit
+percent, well within tolerance on every trade checked). The real driver:
+all 9 of that day's closed trades came from the SAME wallet+category
+combo, `compute_trade_size_usd()`'s composite-tier fallback, with a
+`composite_score` of 0.129 (well below the ~0.3 watch threshold) and a
+NEGATIVE half-Kelly fraction on 8 of the 9 — the sizing model itself was
+saying "no edge here," yet every one still executed at the $3 floor,
+because a non-positive half-Kelly fraction clamped to 0 and then got
+mapped to `MIN_TRADE_USD`, not skipped. `should_skip_category()` (Rule
+19) exists for exactly this kind of wallet but is a deliberately
+*stricter* bar — it requires STATISTICALLY SIGNIFICANT harm (a t-test),
+not just a negative point estimate — so a "probably bad, not yet proven
+bad" wallet sailed under that bar and kept getting sized at the floor on
+every signal. (The portfolio-level circuit breaker, Rule 5, did
+eventually catch this same wallet via a different signal — a t-test on
+REALIZED trade outcomes — and muted it the same morning; this rule closes
+the gap at the sizing layer so the floor-priced copies don't keep
+happening in the meantime.)
+
+**Mechanism:** `compute_trade_size_usd()` now returns exactly `0.0` when
+`half_kelly_fraction <= 0`, instead of clamping to 0 and mapping into the
+`MIN..MAX_TRADE_USD` range (which always produced `MIN_TRADE_USD`,
+scaled by `capital_multiplier`, regardless of how negative the edge was —
+a `kelly_fraction` of `-0.08` and `-12.27` sized identically). This
+extends Rule 25's own stated principle — "no track record, no assumed
+edge" already fell out of the shrinkage math at `n=0` — to `n>0` too:
+a confidently-negative point estimate should mean no trade, not a
+guessed-at floor trade. `process_trade()` checks `trade_usd <= 0`
+immediately after building the score-breakdown snapshot (so the exact
+`shrunk_win_rate`/`kelly_fraction` that drove the skip is still logged)
+and returns before either the immediate-copy path or Rule 29's
+limit-order path — a new `skip_non_positive_kelly_edge` event, distinct
+from `should_skip_category`'s `skip_poor_category_performance` (that one
+fires on statistical significance; this one fires on any negative point
+estimate, a softer and more frequent trigger by design). `sizing_tier =
+"base"` (no win-rate evidence at all) is unaffected — that path returns
+`config.BASE_TRADE_USD` before Kelly is ever computed, unchanged.
+
+**A real, intentional consequence, stated plainly**: this makes the bot
+strictly more selective, not more aggressive — some wallet/category
+combinations that used to get a floor-sized copy on every signal will now
+get skipped entirely until their edge estimate turns positive again (more
+category-specific trades, or a market price move). Nothing about
+`should_skip_category()`'s stricter statistical bar changed; this is an
+independent, softer check layered underneath it, same relationship Rule
+19's own docstring already describes ("probably bad" vs. "confidently
+bad" call for different responses) — now "probably bad" gets a skip
+instead of a floor trade, rather than no response at all.
+
+**Tests:** 5 existing `compute_trade_size_usd()` tests updated (previously
+asserted a `$3.00`/scaled floor for zero or negative Kelly cases — now
+assert `0.0`, including the capital-multiplier case: a multiplier no
+longer rescues a non-positive edge into a trade), 1 new
+`process_trade()`-level integration test (`test_non_positive_kelly_edge_
+skips_the_copy_entirely` — no `paper_buy`, no position opened, exactly
+one `skip_non_positive_kelly_edge` event carrying the score breakdown
+that drove it). **405 Python tests passing** (was 404). No TS changes.
+
+**Not yet live** — needs a `bot.py` restart (dashboard `/api/toggle`,
+port 8787) to take effect, same restart-pending pattern as every other
+sizing/risk change in this ledger.
 
 ## What is intentionally still simple
 

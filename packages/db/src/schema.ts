@@ -95,12 +95,32 @@ export const walletProfile = sqliteTable(
     firstSeenAt: timestampCol("first_seen_at"),
     notes: text("notes"),
     isDemoData: integer("is_demo_data", { mode: "boolean" }).notNull().default(false),
+    // Half-Kelly sizing range multiplier (2026-07-28, rule_set v7) —
+    // scales bot.py's compute_trade_size_usd() MIN/MAX_TRADE_USD band
+    // per-wallet, based on a raw (unsaturated) Sharpe-proxy from
+    // analyzePnlSeries. Deliberately NOT a replacement for the existing
+    // Kelly formula (which needs the market price at TRADE time, not scan
+    // time) — this only stretches the RANGE Kelly then operates within.
+    // NULL until this wallet's first v7+ scoring pass; bot.py treats NULL
+    // as 1.0 (no adjustment), never as 0.
+    capitalMultiplier: real("capital_multiplier"),
+    // Tiered-scoring self-throttle (2026-07-28): NULL means "never scored,
+    // always due." Set at write time to now + the wallet's tier-derived
+    // cadence (see scoreWallets.ts's TIER_RESCORE_INTERVAL_DAYS) — the
+    // pass-1 candidate query skips any wallet whose value here is still in
+    // the future, so a frequent scheduler run mostly does nothing once the
+    // pool is "warm," rather than needing three separately-scheduled jobs.
+    nextRescoreDueAt: integer("next_rescore_due_at", { mode: "timestamp" }),
     createdAt: createdAt(),
     updatedAt: integer("updated_at", { mode: "timestamp" })
       .notNull()
       .default(sql`(unixepoch())`),
   },
-  (t) => [index("wallet_profile_status_idx").on(t.status), index("wallet_profile_score_idx").on(t.compositeScore)]
+  (t) => [
+    index("wallet_profile_status_idx").on(t.status),
+    index("wallet_profile_score_idx").on(t.compositeScore),
+    index("wallet_profile_next_rescore_due_idx").on(t.nextRescoreDueAt),
+  ]
 );
 
 export const observedTrade = sqliteTable(
@@ -211,6 +231,25 @@ export const paperTrade = sqliteTable(
   },
   (t) => [index("paper_trade_lookup_idx").on(t.walletAddress, t.marketSlug, t.outcome, t.status)]
 );
+
+// One row per UTC calendar day (2026-07-28) — the Grafana personal
+// dashboard's equity-curve/Sharpe/tiering-efficiency source table.
+// Exclusively written by bot.py's maybe_snapshot_daily_portfolio(); never
+// written from TS. Deliberately NOT a repurposing of pnl_snapshot above
+// (an existing, currently-unwritten table with a different shape — no
+// total_cash/active_traders_followed, and a multi-scope per-wallet/
+// per-market design this one-row-per-day table doesn't need) — a fresh,
+// narrowly-scoped table matches exactly what was asked for rather than
+// overloading an unrelated existing one.
+export const dailyPortfolioSnapshot = sqliteTable("daily_portfolio_snapshots", {
+  date: text("date").primaryKey(), // 'YYYY-MM-DD', UTC — the idempotency key
+  snapshotAt: integer("snapshot_at", { mode: "timestamp" }).notNull(), // exact capture moment, Grafana's time column
+  totalEquity: real("total_equity").notNull(),
+  totalCash: real("total_cash").notNull(),
+  totalUnrealizedPnl: real("total_unrealized_pnl").notNull(),
+  realizedPnlToday: real("realized_pnl_today").notNull(),
+  activeTradersFollowed: integer("active_traders_followed").notNull(),
+});
 
 export const pnlSnapshot = sqliteTable("pnl_snapshot", {
   id: id(),
