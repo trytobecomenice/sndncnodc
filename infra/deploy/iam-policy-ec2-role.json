@@ -5,7 +5,7 @@
       "Sid": "ReadCopybotRpcUrlParameterOnly",
       "Effect": "Allow",
       "Action": "ssm:GetParameter",
-      "Resource": "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/copybot/prod/polygon_rpc_url"
+      "Resource": "arn:aws:ssm:us-east-1:ACCOUNT_ID:parameter/copybot/prod/polygon_rpc_url"
     },
     {
       "Sid": "DecryptViaAwsManagedSsmKey",
