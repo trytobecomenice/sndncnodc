@@ -5,13 +5,13 @@
       "Sid": "ReadCopybotRpcUrlParameterOnly",
       "Effect": "Allow",
       "Action": "ssm:GetParameter",
-      "Resource": "arn:aws:ssm:us-east-1:ACCOUNT_ID:parameter/copybot/prod/polygon_rpc_url"
+      "Resource": "arn:aws:ssm:us-east-1:771606957503:parameter/copybot/prod/polygon_rpc_url"
     },
     {
       "Sid": "DecryptViaAwsManagedSsmKey",
       "Effect": "Allow",
       "Action": "kms:Decrypt",
-      "Resource": "KMS_KEY_ARN_FROM_STEP_BELOW"
+      "Resource": "arn:aws:kms:us-east-1:771606957503:key/4e08d533-9afd-452d-9ee1-99ff125dbc1c"
     }
   ]
 }
