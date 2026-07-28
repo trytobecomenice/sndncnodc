@@ -1096,11 +1096,7 @@ def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_
 
         if market_slug not in resolution_cache:
             try:
-                market_info = run_bullpen_json(
-                    ["polymarket", "market", market_slug],
-                    retries=config.FEED_FETCH_RETRIES,
-                    retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS,
-                )
+                market_info = polymarket_simulator.fetch_market_metadata(market_slug)
                 resolution_cache[market_slug] = _parse_market_resolution(market_info)
                 _closeout_fetch_failures.pop(market_slug, None)
             except Exception as e:
@@ -1739,11 +1735,13 @@ import risk_manager  # noqa: E402
 
 def resolve_market_event(market_slug):
     """market_slug -> (parent event slug, holding_rewards_enabled), via
-    `bullpen polymarket market` (the same read-only call the closeout sweep
-    already relies on). The response's `events` field is a list of event
-    objects (verified live 2026-07-18); sibling fields on this endpoint
-    arrive JSON-string-encoded in some cases (see _parse_market_resolution),
-    so tolerate both here too.
+    polymarket_simulator.fetch_market_metadata() (direct Gamma read, no
+    bullpen — swapped 2026-07-28 after an outage where bullpen wasn't
+    installed on the server at all, silently fail-closing every buy forever
+    since this risk gate has no LIVE_MODE guard). The response's `events`
+    field is a list of event objects (verified live 2026-07-18); sibling
+    fields on this endpoint arrive JSON-string-encoded in some cases (see
+    _parse_market_resolution), so tolerate both here too.
 
     holding_rewards_enabled is read straight off this SAME response's
     top-level `holdingRewardsEnabled` field (verified live 2026-07-23 against
@@ -1758,11 +1756,7 @@ def resolve_market_event(market_slug):
     since the buy is skipped anyway.
     """
     try:
-        info = run_bullpen_json(
-            ["polymarket", "market", market_slug],
-            retries=config.FEED_FETCH_RETRIES,
-            retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS,
-        )
+        info = polymarket_simulator.fetch_market_metadata(market_slug)
     except Exception:
         return None, None
     holding_rewards_enabled = info.get("holdingRewardsEnabled")
@@ -1783,23 +1777,19 @@ def resolve_market_event(market_slug):
 
 def resolve_market_end_date(market_slug):
     """market_slug -> end_date_iso (YYYY-MM-DD string) or None on failure.
-    "Priority 4" (2026-07-26, theta-decay TTP activation). Same read-only
-    `bullpen polymarket market` call resolve_market_event() already uses
-    for event/holding-rewards resolution, verified live to include
-    `endDateIso` in the same response (confirmed against a real market
-    before writing this) — but kept as its OWN function rather than folded
-    into resolve_market_event(), same precedent as resolve_market_category
-    being separate: this is called at a different point in a position's
-    lifecycle (TTP-sweep time, on an already-open position) than
-    resolve_market_event() (BUY time), so the two can't actually share one
-    network call across time even though they hit the same endpoint.
+    "Priority 4" (2026-07-26, theta-decay TTP activation). Same direct-Gamma
+    read resolve_market_event() uses (polymarket_simulator.
+    fetch_market_metadata(), swapped off bullpen 2026-07-28), which derives
+    `endDateIso` from Gamma's own `endDate` field — but kept as its OWN
+    function rather than folded into resolve_market_event(), same precedent
+    as resolve_market_category being separate: this is called at a
+    different point in a position's lifecycle (TTP-sweep time, on an
+    already-open position) than resolve_market_event() (BUY time), so the
+    two can't actually share one network call across time even though they
+    hit the same endpoint.
     """
     try:
-        info = run_bullpen_json(
-            ["polymarket", "market", market_slug],
-            retries=config.FEED_FETCH_RETRIES,
-            retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS,
-        )
+        info = polymarket_simulator.fetch_market_metadata(market_slug)
     except Exception:
         return None
     end_date_iso = info.get("endDateIso")

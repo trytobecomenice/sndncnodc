@@ -677,30 +677,39 @@ class TestFetchDirectFeed(unittest.TestCase):
 
 class TestResolveMarketEvent(unittest.TestCase):
     """resolve_market_event() — extended 2026-07-23 (point 3.1) to also read
-    holding_rewards_enabled off the SAME `bullpen polymarket market` response
-    used for event_slug, at zero extra API cost. See
-    bot_market_event.holding_rewards_enabled's schema comment: this is an
-    audit/documentation field only, never consumed by scoring/sizing."""
+    holding_rewards_enabled off the SAME market-metadata response used for
+    event_slug, at zero extra API cost. See bot_market_event.
+    holding_rewards_enabled's schema comment: this is an audit/documentation
+    field only, never consumed by scoring/sizing.
+
+    Patches polymarket_simulator.fetch_market_metadata (not bot.
+    run_bullpen_json) since 2026-07-28: resolve_market_event() was swapped
+    from `bullpen polymarket market` to a direct Gamma read after an outage
+    where bullpen wasn't installed on the server, silently fail-closing
+    every buy forever (this risk gate has no LIVE_MODE guard, unlike actual
+    order execution). fetch_market_metadata() reshapes Gamma's response to
+    the exact same field names bullpen used, so the fake_info dicts below
+    are unchanged."""
 
     def test_extracts_event_slug_and_holding_rewards_enabled_together(self):
         fake_info = {
             "events": [{"slug": "some-event"}],
             "holdingRewardsEnabled": True,
         }
-        with patch("bot.run_bullpen_json", return_value=fake_info):
+        with patch("polymarket_simulator.fetch_market_metadata", return_value=fake_info):
             event_slug, holding_rewards_enabled = bot.resolve_market_event("some-market")
         self.assertEqual(event_slug, "some-event")
         self.assertEqual(holding_rewards_enabled, True)
 
     def test_holding_rewards_enabled_false_is_preserved_not_coerced_to_none(self):
         fake_info = {"events": [{"slug": "some-event"}], "holdingRewardsEnabled": False}
-        with patch("bot.run_bullpen_json", return_value=fake_info):
+        with patch("polymarket_simulator.fetch_market_metadata", return_value=fake_info):
             _, holding_rewards_enabled = bot.resolve_market_event("some-market")
         self.assertEqual(holding_rewards_enabled, False)
 
     def test_missing_holding_rewards_field_defaults_to_none(self):
         fake_info = {"events": [{"slug": "some-event"}]}
-        with patch("bot.run_bullpen_json", return_value=fake_info):
+        with patch("polymarket_simulator.fetch_market_metadata", return_value=fake_info):
             _, holding_rewards_enabled = bot.resolve_market_event("some-market")
         self.assertIsNone(holding_rewards_enabled)
 
@@ -708,12 +717,12 @@ class TestResolveMarketEvent(unittest.TestCase):
         # Defensive: this endpoint's fields have arrived JSON-string-encoded
         # before (see events handling below) — never trust the type blindly.
         fake_info = {"events": [{"slug": "some-event"}], "holdingRewardsEnabled": "true"}
-        with patch("bot.run_bullpen_json", return_value=fake_info):
+        with patch("polymarket_simulator.fetch_market_metadata", return_value=fake_info):
             _, holding_rewards_enabled = bot.resolve_market_event("some-market")
         self.assertIsNone(holding_rewards_enabled)
 
     def test_subprocess_failure_returns_none_none(self):
-        with patch("bot.run_bullpen_json", side_effect=RuntimeError("boom")):
+        with patch("polymarket_simulator.fetch_market_metadata", side_effect=RuntimeError("boom")):
             event_slug, holding_rewards_enabled = bot.resolve_market_event("some-market")
         self.assertIsNone(event_slug)
         self.assertIsNone(holding_rewards_enabled)
@@ -722,7 +731,7 @@ class TestResolveMarketEvent(unittest.TestCase):
         # events missing/malformed -> event_slug None, but the holding-rewards
         # field (already extracted from the same response) isn't thrown away.
         fake_info = {"holdingRewardsEnabled": True}
-        with patch("bot.run_bullpen_json", return_value=fake_info):
+        with patch("polymarket_simulator.fetch_market_metadata", return_value=fake_info):
             event_slug, holding_rewards_enabled = bot.resolve_market_event("some-market")
         self.assertIsNone(event_slug)
         self.assertEqual(holding_rewards_enabled, True)

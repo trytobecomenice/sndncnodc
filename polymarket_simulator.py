@@ -204,6 +204,54 @@ def fetch_market_info(market_slug, timeout=DEFAULT_TIMEOUT_SECONDS):
     }
 
 
+def fetch_market_metadata(market_slug, timeout=DEFAULT_TIMEOUT_SECONDS):
+    """Direct Gamma replacement for `bullpen polymarket market <slug>` —
+    used by bot.py's resolve_market_event()/resolve_market_end_date()/
+    run_closeout_sweep(), all of which are risk-relevant reads that must
+    keep working in PAPER mode too (execution itself stays bullpen-only,
+    per this module's own docstring above). Added 2026-07-28 after an
+    outage where bullpen simply wasn't installed on the server, so all
+    three of those silently fail-closed (skip every trade) every cycle —
+    they have no LIVE_MODE gate the way order execution does.
+
+    Reshaped to match the field names those three callers already read off
+    bullpen's response, so none of their parsing logic changes: `events`
+    (list of dicts with a `slug` key), `holdingRewardsEnabled` (bool),
+    `endDateIso` (YYYY-MM-DD — Gamma's own field is `endDate`, a full
+    ISO-8601 datetime, truncated to the date here), `closed` (bool),
+    `umaResolutionStatus` (str, absent/empty on an unresolved market),
+    `outcomes`/`outcomePrices` (JSON-string-encoded arrays, passed through
+    as-is — the callers already tolerate that encoding, verified above in
+    fetch_market_info's own outcomes/clobTokenIds handling).
+
+    Same closed-market retry as fetch_market_info(): Gamma's default
+    /markets?slug= listing excludes already-resolved markets (verified live
+    2026-07-26), so an empty first response is retried once with
+    &closed=true before concluding the slug is genuinely unknown.
+    """
+    path = f"/markets?slug={urllib.parse.quote(market_slug)}"
+    data = _fetch_json(GAMMA_API_HOST, path, timeout)
+    if not data:
+        closed_path = f"/markets?slug={urllib.parse.quote(market_slug)}&closed=true"
+        data = _fetch_json(GAMMA_API_HOST, closed_path, timeout)
+    if not data:
+        raise RuntimeError(f"no market found for slug {market_slug!r}")
+    market = data[0]
+
+    end_date = market.get("endDate")
+    end_date_iso = end_date[:10] if isinstance(end_date, str) and len(end_date) >= 10 else None
+
+    return {
+        "events": market.get("events") or [],
+        "holdingRewardsEnabled": market.get("holdingRewardsEnabled"),
+        "endDateIso": end_date_iso,
+        "closed": market.get("closed"),
+        "umaResolutionStatus": market.get("umaResolutionStatus"),
+        "outcomes": market.get("outcomes"),
+        "outcomePrices": market.get("outcomePrices"),
+    }
+
+
 def token_id_for_outcome(market_info, outcome):
     outcome_lower = outcome.lower()
     for name, token_id in zip(market_info["outcomes"], market_info["clob_token_ids"]):
