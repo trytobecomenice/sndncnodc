@@ -25,6 +25,15 @@ data/*.db-shm
 data/*.db-wal
 data/*.db-journal
 
+# Secrets / credentials — never belong in git (2026-07-29: polymarket-key.pem
+# and AWSCLIV2.pkg were accidentally committed and pushed to a public GitHub
+# remote; history was purged and the EC2 key pair rotated, see
+# docs/copy-trading/SAFETY.md)
+*.pem
+*.ppk
+AWSCLIV2.pkg
+*.pkg
+
 # env
 .env
 
