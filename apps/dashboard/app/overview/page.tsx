@@ -1,5 +1,6 @@
 import { and, desc, eq, sql } from "drizzle-orm";
 import { botMarketEvent, botEventLog, botRiskState, db, paperTrade, walletProfile } from "@/lib/db";
+import AutoRefresh from "./auto-refresh";
 
 // Always re-read the shared DB per request — bot.py and the copy-trading
 // operator loop write to it independently of this Next.js process, so
@@ -196,7 +197,10 @@ export default async function OverviewPage() {
 
   return (
     <main className="min-h-screen bg-neutral-950 p-8 text-neutral-100">
-      <h1 className="text-2xl font-semibold">Copybot Overview</h1>
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-semibold">Copybot Overview</h1>
+        <AutoRefresh />
+      </div>
       <p className="mt-1 mb-8 text-sm text-neutral-400">
         Reads live from the shared SQLite DB (data/app.db) — the same store bot.py writes to.
       </p>
