@@ -3761,6 +3761,72 @@ sizing/risk change in this ledger. `ENABLE_DEPTH_AWARE_TRADE_SIZING`
 defaults `False`, so a restart alone changes nothing observable until it's
 explicitly flipped on.
 
+## 48. `last_trade_price` type bug — silently aborted the TTP sweep and kill-switch check for 3+ days (2026-07-29)
+
+### Summary
+
+**Challenge:** Joey asked directly why the dashboard hadn't updated in a
+few hours despite `bot.py`/`dashboard.py`/`wss_listener.py` all showing as
+live processes. Querying `bot_event_log` directly (not guessed at) showed
+a real signal buried under a separate, already-resolved transient network
+outage ("No route to host") — a distinct error, **"trailing take-profit
+check failed: '<=' not supported between instances of 'str' and 'int'"**,
+recurring 200 times over the prior ~73 hours, most recently 3 minutes
+before being investigated. Since this exception is caught at the outer
+`check_trailing_take_profit()` call site in `bot.py`'s main loop (not
+per-position inside it), a single bad comparison aborts the ENTIRE sweep
+for that cycle — meaning `prices_by_key = None`, which explicitly skips
+that cycle's kill-switch equity evaluation too (see the main loop's own
+comment: "Skipped when the sweep itself failed — a broken price fetch
+must not manufacture a phantom drawdown"). This had been silently
+happening on the large majority of 5-minute sweep cycles for days.
+
+Root-caused by directly querying `paper_trade.our_shares`/`avg_entry_price`
+first (both clean — `typeof()` confirmed no non-numeric values on any of
+the 103 real open positions, ruling out data corruption) before tracing
+into `get_market_prices()`'s fallback chain (`best_bid or midpoint or
+book.get("last_trade_price")`) and fetching a handful of REAL live order
+books directly to inspect the actual wire format. Confirmed live:
+Polymarket's `/book` endpoint always returns `last_trade_price` as a JSON
+**string** (e.g. `"0.999"`), never already numeric — directly
+contradicting `fetch_order_book()`'s own docstring ("last_trade_price:
+float or None") and, unlike `bids`/`asks` on the same response (already
+explicitly `float()`-cast), never coerced. Every existing test for this
+function passed an already-numeric float for `last_trade_price` when
+building its mock response — masking the real wire format and letting
+this ship untested for the type that actually occurs in production.
+
+**Mechanism:** `polymarket_simulator.py`'s `fetch_order_book()` now casts
+`last_trade_price` the same way `bids`/`asks` already are:
+```python
+last_trade_price_raw = data.get("last_trade_price")
+last_trade_price = float(last_trade_price_raw) if last_trade_price_raw is not None else None
+```
+Fixed at this one parsing boundary rather than patching `bot.py`'s
+`get_market_prices()` comparison directly — `last_trade_price` has
+exactly one production call site today, but fixing the type at its
+source means any future caller gets the correct contract for free,
+matching the pattern already used for `bids`/`asks`.
+
+**Tests:** the existing `test_surfaces_last_trade_price_from_the_same_response`
+updated to pass a string (the real format) rather than an already-numeric
+float, plus a new `test_last_trade_price_string_from_real_api_is_coerced_
+to_float` that pins the exact failure mode down as a type bug, not just a
+value check (asserts both the value AND `isinstance(..., float)`). **430
+Python tests passing** (was 429). No TS changes.
+
+**Live impact, stated plainly**: this bug has been in production this
+whole session (confirmed by the 73-hour-old first occurrence) — every
+sweep cycle that hit an illiquid position (empty book, falling through to
+`last_trade_price`) silently lost that ENTIRE cycle's TTP checks across
+ALL open positions, not just the one illiquid one, and skipped that
+cycle's kill-switch evaluation. The kill switch itself was never
+compromised in a way that would have let a real breach go undetected
+forever (the very next successful sweep would catch it), but its
+reaction time was worse than the documented ~5-minute cadence on any
+cycle this fired. **Needs a `bot.py` restart** to pick up the fix — same
+restart-pending status as every other change in this ledger.
+
 ## What is intentionally still simple
 
 The current setup is conservative by design — it focuses on avoiding obvious bad fills, bad

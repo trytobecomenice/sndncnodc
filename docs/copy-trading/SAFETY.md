@@ -3233,3 +3233,50 @@ this. `TestDepthCappedTradeSizeUsd` (5, `test_risk_manager.py`),
 existing tests patched to mock the new fetch. **414 Python tests passing**
 (was 405). `ENABLE_DEPTH_AWARE_TRADE_SIZING` defaults `False` — not live
 until explicitly enabled after a `bot.py` restart.
+
+## 48. `last_trade_price` type coercion (Rule 48 technical detail)
+
+**`polymarket_simulator.py`, `fetch_order_book()`** — one line changed,
+matching how `bids`/`asks` on the same response were already handled:
+```python
+# Before:
+last_trade_price = data.get("last_trade_price")
+
+# After:
+last_trade_price_raw = data.get("last_trade_price")
+last_trade_price = float(last_trade_price_raw) if last_trade_price_raw is not None else None
+```
+Confirmed live against 5 real open positions' actual order books before
+writing this fix — every one returned `last_trade_price` as a JSON
+string (`"0.999"`, `"0.008"`, `"0.001"`, ...), never already numeric.
+
+**Why this specific field, not `bids`/`asks` too**: `bids`/`asks` were
+ALREADY correctly cast (`float(level["price"])`) — this function's bug
+was narrower than it first looked. Only the `last_trade_price` fallback
+(reached in `bot.py`'s `get_market_prices()` when a book has no bids AND
+no usable midpoint — i.e. a thin or empty book) carried the uncoerced
+string through to a numeric comparison (`indicative <= 0`), which is
+exactly the failure mode: illiquid, rarely-traded markets are precisely
+where this fallback path fires, and precisely where a stale/older
+`last_trade_price` from days-old activity is most likely to be present
+at all.
+
+**Tests:** RISK_MANAGEMENT.md Rule 48 has the full investigation —
+root-caused by ruling out DB-level data corruption first (`typeof()`
+queries against real `paper_trade` rows, both clean), then fetching real
+live order books directly to inspect the actual API response shape,
+rather than guessing from the stack trace alone. `test_surfaces_
+last_trade_price_from_the_same_response` updated to mock the real string
+format; new `test_last_trade_price_string_from_real_api_is_coerced_to_
+float` pins the type (not just the value) down as a permanent regression
+test. **430 Python tests passing** (was 429).
+
+**Live impact**: this bug shipped silently and ran in production for
+3+ days (200 real occurrences, oldest ~73 hours old at discovery) before
+being found. Each occurrence aborted that entire TTP sweep cycle across
+ALL open positions (not just the illiquid one that triggered it) and
+skipped that cycle's kill-switch equity evaluation — the kill switch
+itself was never permanently blinded (the next successful sweep still
+catches a real breach), but its reaction time was worse than the
+documented ~5-minute cadence on any cycle this fired. Needs a `bot.py`
+restart to take effect.

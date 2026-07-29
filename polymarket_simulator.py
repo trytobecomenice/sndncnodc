@@ -360,7 +360,18 @@ def fetch_order_book(token_id, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness
         ((float(level["price"]), float(level["size"])) for level in data.get("asks", [])),
         key=lambda level: level[0],
     )
-    last_trade_price = data.get("last_trade_price")
+    # 2026-07-29: confirmed live against the real API — this field comes
+    # back as a JSON STRING (e.g. "0.999"), same as every bid/ask price
+    # above, NOT already a float despite this function's own docstring
+    # claiming "float or None". Uncoerced, this silently produced a str
+    # that crashed bot.py's get_market_prices() the moment a thin/empty
+    # book fell back to it (`indicative <= 0` -> "'<=' not supported
+    # between instances of 'str' and 'int'") — found live: 200 occurrences
+    # over 3+ days, each one aborting that entire TTP sweep cycle AND
+    # skipping that cycle's kill-switch evaluation (see bot.py's main loop,
+    # which explicitly skips the equity check when the sweep itself failed).
+    last_trade_price_raw = data.get("last_trade_price")
+    last_trade_price = float(last_trade_price_raw) if last_trade_price_raw is not None else None
     return {"bids": bids, "asks": asks, "last_trade_price": last_trade_price}
 
 

@@ -275,16 +275,36 @@ class TestFetchOrderBook(unittest.TestCase):
     def test_surfaces_last_trade_price_from_the_same_response(self):
         # Confirmed live: /book's own response includes last_trade_price
         # directly — no second call needed for bot.py's TTP price check.
+        # Passed as a STRING here (2026-07-29 fix) -- the real API's actual
+        # wire format, confirmed live: "0.999", not 0.999.
         raw = _book_body(
             bids=[{"price": "0.10", "size": "5"}],
             asks=[{"price": "0.90", "size": "2"}],
-            last_trade_price=0.51,
+            last_trade_price="0.51",
         )
         mock_conn = MagicMock()
         mock_conn.getresponse.side_effect = [_mock_response(200, raw)]
         with patch("http.client.HTTPSConnection", return_value=mock_conn):
             book = fetch_order_book("some-token")
         self.assertEqual(book["last_trade_price"], 0.51)
+
+    def test_last_trade_price_string_from_real_api_is_coerced_to_float(self):
+        # 2026-07-29: found live -- the real API always returns this field
+        # as a JSON string ("0.999"), never already numeric, despite this
+        # function's own docstring claiming "float or None". Uncoerced,
+        # this crashed bot.py's get_market_prices() ('<=' not supported
+        # between instances of 'str' and 'int') every time a thin/empty
+        # book fell back to it -- 200 real occurrences over 3+ days before
+        # being caught, each one silently aborting that TTP sweep AND that
+        # cycle's kill-switch evaluation. This pins the fix down as a type,
+        # not just a value.
+        raw = _book_body(bids=[], asks=[], last_trade_price="0.13")
+        mock_conn = MagicMock()
+        mock_conn.getresponse.side_effect = [_mock_response(200, raw)]
+        with patch("http.client.HTTPSConnection", return_value=mock_conn):
+            book = fetch_order_book("some-token")
+        self.assertEqual(book["last_trade_price"], 0.13)
+        self.assertIsInstance(book["last_trade_price"], float)
 
     def test_missing_last_trade_price_is_none_not_a_crash(self):
         raw = _book_body(bids=[], asks=[])
