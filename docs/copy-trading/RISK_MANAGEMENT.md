@@ -119,21 +119,28 @@ exceeds `config.SPREAD_TOLERANCE = 5%`, or if the market preview itself reports 
 warning.
 
 **How it works mechanically:** `check_spread_tolerance()` in `bot.py` calls
-`bullpen polymarket preview` for a fresh read of the CURRENT book — deliberately independent of
-the (possibly stale) price the trade feed reported for the source trade. Preview's `spread`
-field is an ABSOLUTE price-tick value (e.g. `0.01`), not a fraction — the function divides by
-price to get a comparable relative number across outcomes trading near $0.05 vs. near $0.95
-(verified empirically: a thin long-shot market and a liquid ~50/50 market can report the
-identical absolute spread while differing 10x+ in relative terms). This call is reused, not
-repeated, by the Disciplined Taker check (Rule 11) — see that rule for why that matters.
+`polymarket_simulator.simulate_fill()` for a fresh read of the CURRENT book — deliberately
+independent of the (possibly stale) price the trade feed reported for the source trade. The
+returned `spread` field is an ABSOLUTE price-tick value (e.g. `0.01`), not a fraction — the
+function divides by price to get a comparable relative number across outcomes trading near $0.05
+vs. near $0.95 (verified empirically: a thin long-shot market and a liquid ~50/50 market can
+report the identical absolute spread while differing 10x+ in relative terms). This call is
+reused, not repeated, by the Disciplined Taker check (Rule 11) — see that rule for why that
+matters.
 
-**System costs & trade-offs:** one extra `bullpen` subprocess call per live BUY/SELL
-(retried up to `FEED_FETCH_RETRIES = 3` times, 0.5s apart, on transient failure). Fails
-**closed**: if preview itself errors (network/timeout/parse failure), the function returns
-not-ok rather than skipping the check — the deliberate trade-off is missing a real copy over
-firing blind into an unknown book. Only runs in `LIVE_MODE`; paper fills never see this check, so
-paper P&L can look better than a live run would have, on exactly the trades this would have
-blocked.
+**System costs & trade-offs:** one direct CLOB order-book read (`clob.polymarket.com/book`) per
+live BUY/SELL, no bullpen subprocess involved. Fails **closed**: if the read itself errors
+(network/timeout/parse failure), the function returns not-ok rather than skipping the check — the
+deliberate trade-off is missing a real copy over firing blind into an unknown book. Only runs in
+`LIVE_MODE`; paper fills never see this check, so paper P&L can look better than a live run would
+have, on exactly the trades this would have blocked.
+
+**CUTOVER 2026-07-31:** migrated off `bullpen polymarket preview` onto a direct CLOB read, the
+same swap already made for paper-mode shortfall measurement on 2026-07-22 (§2026-07-22 note
+below/`polymarket_simulator.py`). This was the last live-order-flow bullpen dependency for market
+*data* — order EXECUTION (buy/sell/limit/cancel/closeout) is unaffected and stays on bullpen by
+design (`SAFETY.md` §6: private keys never live in this app; Gamma/CLOB are read-only public APIs
+with no order-placement or signing capability, so they cannot replace bullpen there).
 
 **Why it exists:** added 2026-07-15 as the first defense against the core risk of copy trading —
 a copy can fill at a much worse price than the source trader's own fill if the book has moved or

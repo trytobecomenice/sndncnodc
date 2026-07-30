@@ -96,34 +96,39 @@ def _handle_sigterm(signum, frame):
 
 
 def check_spread_tolerance(market_slug, outcome, amount, side):
-    """Risk 1 (spread/liquidity) pre-trade check. Calls `bullpen polymarket
-    preview` for a fresh read of the CURRENT book (independent of the
-    possibly-stale price the tracker feed reported for the source trade) and
+    """Risk 1 (spread/liquidity) pre-trade check. Reads a fresh CLOB order
+    book (independent of the possibly-stale price the tracker feed reported
+    for the source trade) via polymarket_simulator.simulate_fill() and
     rejects the copy if the relative spread (spread / price) exceeds
-    config.SPREAD_TOLERANCE, or if preview itself flags a liquidity warning.
+    config.SPREAD_TOLERANCE, or if the visible book couldn't fill the
+    requested size.
 
-    NOTE: preview's `spread` field is an ABSOLUTE price-tick spread (e.g.
-    0.01), not a fraction of price -- dividing by price is required to get a
-    comparable relative number across outcomes trading near $0.05 vs near
-    $0.95. Verified empirically: a thin long-shot market and a liquid ~50/50
-    market can report the identical absolute spread while differing by 10x+
-    in relative terms.
+    NOTE: simulate_fill's `spread` field is an ABSOLUTE price-tick spread
+    (e.g. 0.01), not a fraction of price -- dividing by price is required to
+    get a comparable relative number across outcomes trading near $0.05 vs
+    near $0.95. Verified empirically: a thin long-shot market and a liquid
+    ~50/50 market can report the identical absolute spread while differing
+    by 10x+ in relative terms.
 
-    Fails safe: if preview itself errors (network/timeout/parse), this
+    Fails safe: if the book read itself errors (network/timeout/parse), this
     returns not-ok rather than skipping the check -- we'd rather miss a copy
     than fire one blind into an unknown book.
 
     OUTPUT: (ok, reason, executable_price) — executable_price is the fresh
-    preview price this call already fetched, returned so callers (e.g.
+    price this call already fetched, returned so callers (e.g.
     check_slippage_ceiling, added 2026-07-19) can reuse it instead of
-    making a second preview call for the same market/outcome/amount. None
+    making a second book read for the same market/outcome/amount. None
     when ok is False (no reliable price was read).
+
+    CUTOVER 2026-07-31: replaced `bullpen polymarket preview` with a direct
+    CLOB order-book read (polymarket_simulator.simulate_fill) — the same
+    swap already made for paper-mode shortfall measurement on 2026-07-22,
+    now applied to this live pre-trade gate too. Execution (buy/sell) is
+    unaffected — still goes through bullpen (SAFETY.md §6): Gamma/CLOB are
+    read-only public data, neither can place or sign an order.
     """
     try:
-        preview = run_bullpen_json([
-            "polymarket", "preview", market_slug, outcome, str(amount),
-            "--side", "buy" if side == "BUY" else "sell",
-        ], retries=config.FEED_FETCH_RETRIES, retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS)
+        preview = polymarket_simulator.simulate_fill(market_slug, outcome, side, amount)
     except Exception as e:
         return False, f"preview unavailable: {e}", None
 
@@ -139,8 +144,8 @@ def check_spread_tolerance(market_slug, outcome, amount, side):
             f"{config.SPREAD_TOLERANCE:.0%} (price={price}, abs_spread={spread})"
         ), None
 
-    if preview.get("warning"):
-        return False, f"liquidity warning from preview: {preview['warning']}"
+    if preview.get("insufficient_liquidity"):
+        return False, f"insufficient book depth to fill {amount}", None
 
     return True, None, price
 

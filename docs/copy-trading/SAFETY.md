@@ -3280,3 +3280,49 @@ itself was never permanently blinded (the next successful sweep still
 catches a real breach), but its reaction time was worse than the
 documented ~5-minute cadence on any cycle this fired. Needs a `bot.py`
 restart to take effect.
+
+---
+
+## 49. `check_spread_tolerance()` migrated off bullpen (Rule 4 technical detail)
+
+**`bot.py`, `check_spread_tolerance()`** — the live-order spread/liquidity
+gate (RISK_MANAGEMENT.md Rule 4) called `bullpen polymarket preview` for
+every live BUY/SELL; this was the last bullpen dependency in the live
+order-decision path for market *data* (order execution itself is
+unaffected, see below). Swapped for `polymarket_simulator.simulate_fill()`
+— a direct, no-auth read of `clob.polymarket.com/book`, the same function
+already proven in `measure_paper_shortfall()` since the 2026-07-22 cutover
+(see `polymarket_simulator.py`'s own module docstring).
+
+**Scoped deliberately, not a general "remove bullpen" pass**: prompted by
+a request to migrate "every bullpen CLI call" to Gamma. Investigation
+(dependency map, reported to Joey before any code changed) found: (1)
+market/event resolution + end-date + closeout-sweep metadata reads were
+already migrated to Gamma on 2026-07-28 (`b204a48`); (2) this spread/
+liquidity check was the one remaining live, active, unmigrated *read*
+call site — but it needs order-book depth, which lives on the CLOB API
+(`clob.polymarket.com/book`), not Gamma (`gamma-api.polymarket.com`,
+metadata-only, no order book at all); (3) roughly ten other call sites
+(buy, sell, limit-sell, cancel, poll-order, closeout) are order
+**execution**, not data, and stay on bullpen by design — Gamma/CLOB are
+read-only public APIs with no order-placement or wallet-signing
+capability, so "removing bullpen" there would mean building real key
+custody into this app, directly contradicting §6's core premise. Joey
+confirmed this narrower scope (spread check only) before implementation.
+
+**Also fixed in passing**: the pre-migration branch for the liquidity-
+warning case returned a bare 2-tuple (`return False, reason`) instead of
+the function's actual 3-tuple contract (`ok, reason, executable_price`) —
+every real call site unpacks three values, so this branch would have
+raised `ValueError` on unpack the one time it actually fired. Never
+observed in production (would need a live order hitting exactly this
+branch), caught while rewriting the surrounding code, not from an
+incident.
+
+**Tests**: no prior test exercised `check_spread_tolerance()`'s internals
+directly (existing tests only mocked the function as a black box at
+higher-level call sites) — added `TestCheckSpreadTolerance` (5 new tests:
+pass case, relative-vs-absolute-spread rejection, simulate_fill exception
+fail-safe, empty book, insufficient-liquidity 3-tuple regression guard).
+435 Python tests passing (was 430). **Needs a `bot.py` restart to take
+effect** — not yet live as of this entry.

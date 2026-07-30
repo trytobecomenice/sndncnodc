@@ -537,6 +537,63 @@ class TestComputeShortfall(unittest.TestCase):
         self.assertEqual(usd, 0.0)
 
 
+class TestCheckSpreadTolerance(unittest.TestCase):
+    """Since the 2026-07-31 CLOB cutover, check_spread_tolerance() calls
+    polymarket_simulator.simulate_fill() instead of `bullpen polymarket
+    preview` — mocked at that call site rather than bot.run_bullpen_json."""
+
+    def setUp(self):
+        self._saved_tolerance = config.SPREAD_TOLERANCE
+        config.SPREAD_TOLERANCE = 0.10
+
+    def tearDown(self):
+        config.SPREAD_TOLERANCE = self._saved_tolerance
+
+    def test_tight_spread_passes_and_returns_executable_price(self):
+        fake_preview = {"price": 0.40, "spread": 0.02}  # relative spread 5%
+        with patch("bot.polymarket_simulator.simulate_fill", return_value=fake_preview):
+            ok, reason, price = bot.check_spread_tolerance("some-market", "Yes", 100, "BUY")
+        self.assertTrue(ok)
+        self.assertIsNone(reason)
+        self.assertEqual(price, 0.40)
+
+    def test_wide_relative_spread_rejected_even_with_identical_absolute_spread(self):
+        # Same absolute spread (0.02) as the passing case above, but near a
+        # $0.05 longshot price the relative spread is 40%, well over tolerance.
+        fake_preview = {"price": 0.05, "spread": 0.02}
+        with patch("bot.polymarket_simulator.simulate_fill", return_value=fake_preview):
+            ok, reason, price = bot.check_spread_tolerance("some-market", "Yes", 100, "BUY")
+        self.assertFalse(ok)
+        self.assertIn("relative spread", reason)
+        self.assertIsNone(price)
+
+    def test_simulate_fill_exception_fails_safe(self):
+        with patch("bot.polymarket_simulator.simulate_fill", side_effect=RuntimeError("book fetch failed")):
+            ok, reason, price = bot.check_spread_tolerance("some-market", "Yes", 100, "BUY")
+        self.assertFalse(ok)
+        self.assertIn("preview unavailable", reason)
+        self.assertIsNone(price)
+
+    def test_empty_book_rejected_not_a_crash(self):
+        with patch("bot.polymarket_simulator.simulate_fill", return_value={}):
+            ok, reason, price = bot.check_spread_tolerance("some-market", "Yes", 100, "BUY")
+        self.assertFalse(ok)
+        self.assertIsNone(price)
+
+    def test_insufficient_liquidity_rejected_with_three_element_return(self):
+        # Regression guard: the pre-migration bullpen branch for this case
+        # returned only a 2-tuple (missing the executable_price slot), which
+        # would have raised on unpack at every real call site.
+        fake_preview = {"price": 0.40, "spread": 0.01, "insufficient_liquidity": True}
+        with patch("bot.polymarket_simulator.simulate_fill", return_value=fake_preview):
+            result = bot.check_spread_tolerance("some-market", "Yes", 100, "BUY")
+        self.assertEqual(len(result), 3)
+        ok, reason, price = result
+        self.assertFalse(ok)
+        self.assertIn("insufficient book depth", reason)
+        self.assertIsNone(price)
+
+
 class TestMeasurePaperShortfall(unittest.TestCase):
     """Since the 2026-07-22 order-book-simulator cutover, measure_paper_shortfall()
     calls polymarket_simulator.simulate_fill() instead of bullpen — mocked at that
