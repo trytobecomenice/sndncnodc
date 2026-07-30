@@ -884,6 +884,39 @@ approach has no equivalent "separate registration list to keep in sync" failure 
 reads directly from `config.py`'s address list, so this exact class of silent, structural gap
 cannot recur once cut over, only patched around (as done here) while still on `bullpen`.
 
+**Addendum 2026-07-31 — `bot_seen_trade` dedup made per-wallet, not global.** Found while
+investigating an unrelated question ("why are so many paper trades hitting `preview_unavailable`
+on the new CLOB spread check"). Root-caused, not guessed: those failures were real CLOB 404s for
+markets confirmed (via Gamma with `&closed=true`) to have already resolved WEEKS earlier — and
+every failure was `detected_by='polling'`, clustered in tight bursts within SECONDS of a `bot.py`
+restart. Traced to the actual bug: `seen_trade_ids` was capped GLOBALLY at 2000 across all wallets
+combined (`SEEN_TRADE_ID_CAP`, both in the in-memory `deque(maxlen=2000)` and the persisted
+`bot_seen_trade` table). `config.DIRECT_API_PER_WALLET_LIMIT` always returns each wallet's most
+recent 20 trades regardless of how long ago they happened — so a wallet that's gone quiet keeps
+having the SAME old trade_ids show up in the feed forever. Within one continuous run this was
+harmless (the in-memory `seen_set` only ever grew), but a busy wallet's volume could push those old
+trade_ids out of the persisted top-2000, and the NEXT restart would rebuild `seen_set` from just
+that truncated snapshot — silently un-deduping the quiet wallet's old trades, which then looked
+brand new and got "copied" again. One tracked wallet's month-old FIFA World Cup group-stage trades
+accounted for 64 of these phantom paper_buy attempts in a single session with two restarts.
+
+**Fixed**: replaced the single global cap with a per-wallet one
+(`config.SEEN_TRADE_IDS_PER_WALLET_CAP = 100`, 5x headroom over
+`DIRECT_API_PER_WALLET_LIMIT`) — each wallet's own dedup history is now bounded independently, so
+no wallet's volume can ever evict another's. Required a schema change: `bot_seen_trade` gained a
+nullable `wallet_address` column (migration `0018_spooky_ender_wiggin.sql`; nullable because
+existing rows have no wallet baked into `trade_id` to backfill from — they're grouped into one
+capped `__unknown__`/legacy bucket instead of left to grow forever). `bot.py`'s new
+`_mark_trade_seen()` helper keeps the flat `seen_set` lookup every poll already used in sync with
+each wallet's own bounded deque, replacing the single global one. A real tie-breaking bug was also
+caught and fixed while writing tests for this: the per-wallet prune/load SQL queries needed a
+`rowid DESC` tiebreaker alongside `seen_at DESC`, since `_now_ts()` is second-granularity and a
+burst of trades from one wallet easily lands in the same second — without it, SQLite's `ROW_NUMBER()`
+tie order is unspecified and could keep arbitrary old rows over newer ones. 454 Python tests
+passing (was 446; +4 `test_db_seen_trade.py`, +4 `TestMarkTradeSeen`). Docs: this addendum;
+`SAFETY.md` §51. **Needs a `bot.py` restart AND the new migration applied (`pnpm run db:migrate`)
+to take effect** — not yet live as of this entry.
+
 ---
 
 ## 15. Confidence-weighted position sizing

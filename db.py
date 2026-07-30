@@ -49,7 +49,14 @@ import config
 # mode.
 logger = logging.getLogger("copybot.db")
 
-SEEN_TRADE_ID_CAP = 2000  # mirrors the old deque(maxlen=2000) in bot.py
+# bot_seen_trade dedup cap is now PER WALLET (config.SEEN_TRADE_IDS_PER_WALLET_CAP,
+# 2026-07-31) — see that constant's docstring for why the old flat global cap
+# was a real bug (a busy wallet's volume could evict a quiet wallet's older
+# trade_ids, which then resurfaced as "new" on the next bot.py restart).
+# Rows with no wallet_address (pre-2026-07-31 legacy data, unattributable —
+# trade_id has no wallet baked in) are grouped into one '__unknown__' bucket
+# and capped the same way, so they can't grow unbounded either.
+_UNKNOWN_WALLET_BUCKET = "__unknown__"
 
 # wallet_profile.wallet_address is stored lowercase (normalized so it stays
 # consistent with the TS scoring layer, which writes lowercase — see
@@ -107,14 +114,25 @@ def load_state():
     """
     conn = _connect()
     try:
+        # rowid DESC breaks ties within the same seen_at second (_now_ts() is
+        # second-granularity; a burst of trades from one wallet can easily
+        # land in the same second) -- without it, ROW_NUMBER()'s tie order is
+        # unspecified, which could keep arbitrary old rows over newer ones.
         cur = conn.execute(
-            "SELECT trade_id FROM bot_seen_trade ORDER BY seen_at DESC LIMIT ?",
-            (SEEN_TRADE_ID_CAP,),
+            "SELECT trade_id, wallet_address, seen_at FROM ("
+            "  SELECT trade_id, wallet_address, seen_at,"
+            "         ROW_NUMBER() OVER ("
+            "           PARTITION BY COALESCE(wallet_address, ?) ORDER BY seen_at DESC, rowid DESC"
+            "         ) AS rn"
+            "  FROM bot_seen_trade"
+            ") WHERE rn <= ? ORDER BY wallet_address, seen_at ASC",
+            (_UNKNOWN_WALLET_BUCKET, config.SEEN_TRADE_IDS_PER_WALLET_CAP),
         )
-        # DESC-then-reverse so the returned list is oldest-first, matching the
-        # order a deque(maxlen=2000) would have held it in.
-        seen_trade_ids = [row["trade_id"] for row in cur.fetchall()]
-        seen_trade_ids.reverse()
+        # Per-wallet-partitioned top-N (2026-07-31), oldest-first within each
+        # wallet — matches the order a per-wallet deque(maxlen=...) should
+        # hold them in. See config.SEEN_TRADE_IDS_PER_WALLET_CAP's docstring.
+        seen_trade_ids = [{"trade_id": row["trade_id"], "wallet_address": row["wallet_address"]}
+                          for row in cur.fetchall()]
 
         positions = {}
         cur = conn.execute(
@@ -217,15 +235,24 @@ def save_state(state):
     """
     conn = _connect()
     try:
-        for tid in state.get("seen_trade_ids", []):
+        for entry in state.get("seen_trade_ids", []):
             conn.execute(
-                "INSERT OR IGNORE INTO bot_seen_trade (trade_id, seen_at) VALUES (?, ?)",
-                (tid, _now_ts()),
+                "INSERT OR IGNORE INTO bot_seen_trade (trade_id, wallet_address, seen_at) VALUES (?, ?, ?)",
+                (entry["trade_id"], entry.get("wallet_address"), _now_ts()),
             )
+        # Per-wallet-partitioned prune (2026-07-31) — see config.SEEN_TRADE_IDS_PER_WALLET_CAP.
+        # rowid DESC tiebreaker: same reasoning as load_state()'s query above.
         conn.execute(
-            "DELETE FROM bot_seen_trade WHERE trade_id NOT IN "
-            "(SELECT trade_id FROM bot_seen_trade ORDER BY seen_at DESC LIMIT ?)",
-            (SEEN_TRADE_ID_CAP,),
+            "DELETE FROM bot_seen_trade WHERE trade_id NOT IN ("
+            "  SELECT trade_id FROM ("
+            "    SELECT trade_id,"
+            "           ROW_NUMBER() OVER ("
+            "             PARTITION BY COALESCE(wallet_address, ?) ORDER BY seen_at DESC, rowid DESC"
+            "           ) AS rn"
+            "    FROM bot_seen_trade"
+            "  ) WHERE rn <= ?"
+            ")",
+            (_UNKNOWN_WALLET_BUCKET, config.SEEN_TRADE_IDS_PER_WALLET_CAP),
         )
 
         # source_positions is small and fully owned here — wholesale replace

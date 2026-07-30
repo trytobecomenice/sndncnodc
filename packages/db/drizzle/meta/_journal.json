@@ -127,6 +127,13 @@
       "when": 1785176202803,
       "tag": "0017_magical_turbo",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1785431332021,
+      "tag": "0018_spooky_ender_wiggin",
+      "breakpoints": true
     }
   ]
 }

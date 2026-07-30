@@ -527,6 +527,19 @@ POLL_INTERVAL_SECONDS = 30
 # a 30s cadence.
 DIRECT_API_PER_WALLET_LIMIT = 20
 
+# How many recently-seen trade_ids to remember PER WALLET for dedup (2026-07-
+# 31, replacing a single GLOBAL 2000-trade_id cap across all wallets
+# combined). The old global cap let one busy wallet's volume evict a quiet
+# wallet's older trade_ids; since DIRECT_API_PER_WALLET_LIMIT above always
+# returns each wallet's most recent N trades regardless of how long ago they
+# happened, an evicted-but-still-fetched trade_id would get treated as brand
+# new on the next bot.py restart — confirmed live: two restarts in one
+# session each triggered a burst of "new" copies of month-old,
+# already-resolved-market trades from quiet wallets. 100 is 5x headroom over
+# DIRECT_API_PER_WALLET_LIMIT (20) — comfortably more than one wallet could
+# ever need to never re-see its own already-processed trades.
+SEEN_TRADE_IDS_PER_WALLET_CAP = 100
+
 # Seconds between recovery-check attempts once the bot has HALTED on a
 # bullpen authentication failure (exit code 2 — see BullpenAuthError in
 # bullpen_client.py). Deliberately much slower than POLL_INTERVAL_SECONDS:

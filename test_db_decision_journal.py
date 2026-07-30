@@ -59,7 +59,7 @@ class _TempDbTestCase(unittest.TestCase):
             "is_active INTEGER NOT NULL DEFAULT 0, thresholds_json TEXT NOT NULL, "
             "description TEXT, created_at INTEGER)"
         )
-        conn.execute("CREATE TABLE bot_seen_trade (trade_id TEXT PRIMARY KEY, seen_at INTEGER)")
+        conn.execute("CREATE TABLE bot_seen_trade (trade_id TEXT PRIMARY KEY, seen_at INTEGER, wallet_address TEXT)")
         conn.execute("CREATE TABLE bot_source_position (key TEXT PRIMARY KEY, shares REAL)")
         # save_state() also upserts wallet_profile for every wallet in
         # config.TRACKED_TRADERS (real config, not test-controlled) — needed

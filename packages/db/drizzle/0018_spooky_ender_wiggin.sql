@@ -1,0 +1,1 @@
+ALTER TABLE `bot_seen_trade` ADD `wallet_address` text;

@@ -38,7 +38,7 @@ class _TempDbTestCase(unittest.TestCase):
             "CREATE TABLE bot_source_position (key TEXT PRIMARY KEY, shares REAL NOT NULL, "
             "cost_basis_usd REAL NOT NULL DEFAULT 0)"
         )
-        conn.execute("CREATE TABLE bot_seen_trade (trade_id TEXT PRIMARY KEY, seen_at INTEGER)")
+        conn.execute("CREATE TABLE bot_seen_trade (trade_id TEXT PRIMARY KEY, seen_at INTEGER, wallet_address TEXT)")
         conn.execute(
             "CREATE TABLE paper_trade (id TEXT PRIMARY KEY, strategy TEXT NOT NULL DEFAULT "
             "'bot_filtered', wallet_address TEXT NOT NULL, market_slug TEXT NOT NULL, "

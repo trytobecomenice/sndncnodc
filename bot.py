@@ -2957,6 +2957,28 @@ def fetch_feed_with_auth_recovery():
         return None
 
 
+_UNKNOWN_WALLET_KEY = "__unknown__"
+
+
+def _mark_trade_seen(seen_by_wallet, seen_set, wallet_address, trade_id):
+    """Records trade_id as seen for wallet_address, keeping seen_set (the
+    flat `tid not in seen_set` lookup the main loop already used) in sync
+    with each wallet's OWN bounded deque (config.SEEN_TRADE_IDS_PER_WALLET_CAP)
+    instead of one shared global cap — see that constant's docstring for the
+    bug this replaces: a busy wallet's volume evicting a quiet wallet's older
+    trade_ids from a single shared cap, silently un-deduping them the next
+    time bot.py restarts. wallet_address=None (pre-2026-07-31 legacy rows
+    with no attribution) is grouped into one _UNKNOWN_WALLET_KEY bucket so it
+    can't grow unbounded either.
+    """
+    wallet_key = (wallet_address or "").lower() or _UNKNOWN_WALLET_KEY
+    dq = seen_by_wallet.setdefault(wallet_key, deque(maxlen=config.SEEN_TRADE_IDS_PER_WALLET_CAP))
+    if len(dq) == dq.maxlen:
+        seen_set.discard(dq[0])
+    dq.append(trade_id)
+    seen_set.add(trade_id)
+
+
 def main():
     # get_tracked_traders() is where config.TRACKED_TRADERS_SOURCE actually
     # takes effect (see config.py and db.py's docstring on it). Fetched once
@@ -3039,8 +3061,19 @@ def main():
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
     state = load_state()
-    seen_ids = deque(state["seen_trade_ids"], maxlen=2000)
-    seen_set = set(seen_ids)
+    # Per-wallet dedup (2026-07-31, replacing a single global
+    # deque(maxlen=2000)) — see config.SEEN_TRADE_IDS_PER_WALLET_CAP's
+    # docstring for the bug this fixes: a busy wallet's volume evicting a
+    # quiet wallet's older trade_ids from a single shared cap, which then
+    # resurfaced as "new" copies of month-old trades on the next restart.
+    # seen_set stays the flat, fast `tid not in seen_set` lookup every poll
+    # already used — _mark_trade_seen() keeps it in sync with each wallet's
+    # own bounded deque instead of one global one.
+    seen_trade_ids_by_wallet = {}
+    seen_set = set()
+    for entry in state["seen_trade_ids"]:
+        _mark_trade_seen(seen_trade_ids_by_wallet, seen_set,
+                          entry.get("wallet_address"), entry["trade_id"])
     positions = state["positions"]
     source_positions = state["source_positions"]
     source_cost_basis = state["source_cost_basis"]
@@ -3053,7 +3086,11 @@ def main():
     shadow_positions = load_shadow_positions()
 
     def persist():
-        save_state({"seen_trade_ids": list(seen_ids), "positions": positions,
+        seen_flat = [
+            {"trade_id": tid, "wallet_address": (wallet if wallet != _UNKNOWN_WALLET_KEY else None)}
+            for wallet, dq in seen_trade_ids_by_wallet.items() for tid in dq
+        ]
+        save_state({"seen_trade_ids": seen_flat, "positions": positions,
                     "source_positions": source_positions, "source_cost_basis": source_cost_basis,
                     "trader_performance": trader_performance, "muted_traders": muted_traders})
         save_shadow_positions(shadow_positions)
@@ -3071,8 +3108,7 @@ def main():
             for t in trades:
                 tid = t.get("trade_id")
                 if tid:
-                    seen_ids.append(tid)
-                    seen_set.add(tid)
+                    _mark_trade_seen(seen_trade_ids_by_wallet, seen_set, t.get("user_address"), tid)
             append_log({"timestamp": now_iso(), "event_type": "bootstrap",
                         "note": f"baseline-skipped {len(trades)} pre-existing trades; "
                                 f"only trades after this point will be copied"})
@@ -3126,8 +3162,7 @@ def main():
                 trade["detected_by"] = "polling"
                 tid = trade.get("trade_id")
                 if tid:
-                    seen_ids.append(tid)
-                    seen_set.add(tid)
+                    _mark_trade_seen(seen_trade_ids_by_wallet, seen_set, trade.get("user_address"), tid)
                 # Persist the seen-mark BEFORE the trade can execute: if we
                 # crash mid-order, restart must treat this trade as already
                 # handled (an unknown-outcome order gets reconciled manually

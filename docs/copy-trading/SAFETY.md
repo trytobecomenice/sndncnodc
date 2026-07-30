@@ -3368,3 +3368,65 @@ absolute-spread setup as `TestCheckSpreadTolerance`, insufficient-liquidity
 rejection, preview-failure fail-safe, empty-book fail-safe). 446 Python
 tests passing (was 441). **Needs a `bot.py` restart to take effect** — not
 yet live as of this entry.
+
+---
+
+## 51. Per-wallet `bot_seen_trade` dedup (Rule 14 addendum, 2026-07-31)
+
+**Trigger**: investigating why most paper trades were hitting
+`preview_unavailable` (§50's context) surfaced a real, unrelated bug —
+confirmed via Gamma (`&closed=true`) that the failing CLOB reads were for
+markets that resolved WEEKS ago, all `detected_by='polling'`, clustered in
+tight bursts within seconds of a `bot.py` restart.
+
+**Root cause**: `bot_seen_trade` dedup was capped GLOBALLY at 2000 trade_ids
+across ALL tracked wallets combined (`SEEN_TRADE_ID_CAP`, both the in-memory
+`deque(maxlen=2000)` in `bot.py` and the persisted table's own prune query
+in `db.py`). `config.DIRECT_API_PER_WALLET_LIMIT` always returns each
+wallet's most recent 20 trades no matter how old — so a quiet wallet's old
+trade_ids sit in the feed response forever. Within one continuous run this
+never mattered (the in-memory `seen_set` only grew, nothing evicted it) —
+but a busy wallet's volume could push a quiet wallet's trade_ids out of the
+PERSISTED top-2000, and the next restart rebuilds `seen_set` from just that
+truncated snapshot. One tracked wallet's month-old FIFA World Cup
+group-stage trades alone accounted for 64 phantom `paper_buy` re-copies
+across two restarts in a single session.
+
+**Fix, in order**:
+1. `packages/db/src/schema.ts` / migration `0018_spooky_ender_wiggin.sql` —
+   `bot_seen_trade` gains a nullable `wallet_address` column (nullable:
+   existing rows can't be backfilled, `trade_id` is `tx_hash:asset:side:
+   timestamp` with no wallet baked in — grouped into a capped
+   `__unknown__` bucket instead of left unbounded).
+2. `config.SEEN_TRADE_IDS_PER_WALLET_CAP = 100` (5x headroom over
+   `DIRECT_API_PER_WALLET_LIMIT`) replaces the old global 2000 cap.
+3. `db.py`'s `load_state()`/`save_state()` — the flat trade_id list became
+   a list of `{"trade_id", "wallet_address"}` dicts; both the load query
+   and the prune `DELETE` are now `ROW_NUMBER() OVER (PARTITION BY
+   COALESCE(wallet_address, '__unknown__') ORDER BY seen_at DESC, rowid
+   DESC)`, capped per partition instead of one global `ORDER BY seen_at
+   DESC LIMIT 2000`.
+4. `bot.py`'s new `_mark_trade_seen(seen_by_wallet, seen_set,
+   wallet_address, trade_id)` replaces the two `seen_ids.append()`/
+   `seen_set.add()` call sites (bootstrap + main loop) — keeps the flat
+   `seen_set` (the actual `tid not in seen_set` check every poll uses) in
+   sync with each wallet's own bounded `deque`, evicting from `seen_set`
+   exactly when a wallet's own deque evicts, not on any global schedule.
+
+**Bug caught while writing tests, not shipped separately**: the first
+version of the partitioned SQL had no tiebreaker for equal `seen_at`
+values. `_now_ts()` is second-granularity, and a burst of trades from one
+wallet lands in the same second easily (a unit test with 10 rapid inserts
+reproduced it immediately) — without `rowid DESC` alongside `seen_at DESC`,
+SQLite's `ROW_NUMBER()` tie order is unspecified, and the test showed it
+keeping the OLDEST three rows instead of the newest three. Fixed in both
+the load and prune queries before this shipped, not after.
+
+**Tests**: `test_db_seen_trade.py` (4 new tests — busy-wallet-doesn't-evict-
+quiet-wallet, per-wallet independent capping, `__unknown__` bucket capping,
+wallet_address round-trip) and `TestMarkTradeSeen` in
+`test_bot_risk_checks.py` (4 new tests — cross-wallet isolation, own-wallet
+eviction order, case normalization, `None`-wallet bucketing). 454 Python
+tests passing (was 446). **Needs BOTH a `bot.py` restart AND `pnpm run
+db:migrate` applied wherever this deploys** — not yet live as of this
+entry.

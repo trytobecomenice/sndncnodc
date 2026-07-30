@@ -14,6 +14,52 @@ import bot
 import config
 
 
+class TestMarkTradeSeen(unittest.TestCase):
+    """_mark_trade_seen() (2026-07-31) — per-wallet dedup, replacing a single
+    global deque(maxlen=2000). Confirmed live: the old design let one busy
+    wallet's volume evict a quiet wallet's older trade_ids, which then
+    resurfaced as "new" copies of month-old trades on the next bot.py
+    restart. seen_set must stay in sync with each wallet's own bounded
+    deque, not just grow forever or share one global bound."""
+
+    def setUp(self):
+        self._saved_cap = config.SEEN_TRADE_IDS_PER_WALLET_CAP
+        config.SEEN_TRADE_IDS_PER_WALLET_CAP = 3
+
+    def tearDown(self):
+        config.SEEN_TRADE_IDS_PER_WALLET_CAP = self._saved_cap
+
+    def test_a_busy_wallet_does_not_evict_a_quiet_wallets_entry_from_seen_set(self):
+        seen_by_wallet, seen_set = {}, set()
+        bot._mark_trade_seen(seen_by_wallet, seen_set, "0xQuiet", "quiet-trade-1")
+        for i in range(10):
+            bot._mark_trade_seen(seen_by_wallet, seen_set, "0xBusy", f"busy-{i}")
+        self.assertIn("quiet-trade-1", seen_set)
+
+    def test_own_wallets_oldest_entry_evicted_once_its_own_cap_is_exceeded(self):
+        seen_by_wallet, seen_set = {}, set()
+        for i in range(4):  # cap is 3 -- the 4th push evicts the 1st
+            bot._mark_trade_seen(seen_by_wallet, seen_set, "0xTrader", f"t{i}")
+        self.assertNotIn("t0", seen_set)
+        self.assertIn("t1", seen_set)
+        self.assertIn("t2", seen_set)
+        self.assertIn("t3", seen_set)
+
+    def test_wallet_address_is_case_normalized(self):
+        seen_by_wallet, seen_set = {}, set()
+        bot._mark_trade_seen(seen_by_wallet, seen_set, "0xABC", "t1")
+        bot._mark_trade_seen(seen_by_wallet, seen_set, "0xabc", "t2")
+        # Same wallet under different casing must share one bucket/cap, not
+        # two separate ones that could each independently reach the cap.
+        self.assertEqual(len(seen_by_wallet), 1)
+
+    def test_none_wallet_address_falls_into_the_shared_unknown_bucket(self):
+        seen_by_wallet, seen_set = {}, set()
+        bot._mark_trade_seen(seen_by_wallet, seen_set, None, "legacy-1")
+        self.assertIn(bot._UNKNOWN_WALLET_KEY, seen_by_wallet)
+        self.assertIn("legacy-1", seen_set)
+
+
 class TestSlippageCeiling(unittest.TestCase):
     def setUp(self):
         self._saved_tolerance = config.SLIPPAGE_TOLERANCE

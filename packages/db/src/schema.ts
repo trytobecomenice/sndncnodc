@@ -334,6 +334,17 @@ export const botEventLog = sqliteTable("bot_event_log", {
 export const botSeenTrade = sqliteTable("bot_seen_trade", {
   tradeId: text("trade_id").primaryKey(),
   seenAt: timestampCol("seen_at"),
+  // Added 2026-07-31: the old global-cap dedup (top 2000 trade_ids across ALL
+  // wallets combined) let one busy wallet's trade volume evict an inactive
+  // wallet's older trade_ids from the cap. Since DIRECT_API_PER_WALLET_LIMIT
+  // (bot.py/config.py) always returns each wallet's most recent N trades
+  // regardless of how long ago they happened, an evicted-but-still-fetched
+  // trade_id from a quiet wallet would get treated as brand new on the very
+  // next bot.py restart -- confirmed live: two restarts in one session each
+  // triggered a burst of "new" copies of month-old, already-resolved-market
+  // trades. Nullable because existing rows have no wallet attribution to
+  // backfill (trade_id is tx_hash:asset:side:timestamp, not wallet-keyed).
+  walletAddress: text("wallet_address"),
 });
 
 export const botSourcePosition = sqliteTable("bot_source_position", {
