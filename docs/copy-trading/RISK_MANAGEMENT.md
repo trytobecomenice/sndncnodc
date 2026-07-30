@@ -132,15 +132,32 @@ matters.
 live BUY/SELL, no bullpen subprocess involved. Fails **closed**: if the read itself errors
 (network/timeout/parse failure), the function returns not-ok rather than skipping the check — the
 deliberate trade-off is missing a real copy over firing blind into an unknown book. Only runs in
-`LIVE_MODE`; paper fills never see this check, so paper P&L can look better than a live run would
-have, on exactly the trades this would have blocked.
+`LIVE_MODE`; paper trades are never rejected by this gate — but as of 2026-07-31, every paper trade
+now carries an explicit `would_have_passed_spread_gate` flag recording what this SAME check would
+have decided against the SAME book read (see the 2026-07-31 addendum below), so paper P&L looking
+better than a live run would have is now a measurable, filterable fact rather than an untracked
+caveat.
 
 **CUTOVER 2026-07-31:** migrated off `bullpen polymarket preview` onto a direct CLOB read, the
-same swap already made for paper-mode shortfall measurement on 2026-07-22 (§2026-07-22 note
-below/`polymarket_simulator.py`). This was the last live-order-flow bullpen dependency for market
+same swap already made for paper-mode shortfall measurement on 2026-07-22
+(`polymarket_simulator.py`). This was the last live-order-flow bullpen dependency for market
 *data* — order EXECUTION (buy/sell/limit/cancel/closeout) is unaffected and stays on bullpen by
 design (`SAFETY.md` §6: private keys never live in this app; Gamma/CLOB are read-only public APIs
 with no order-placement or signing capability, so they cannot replace bullpen there).
+
+**Addendum 2026-07-31 — `would_have_passed_spread_gate`:** prompted by a direct challenge that
+paper trading was "meaningless" if it didn't track real spread/liquidity data. It already did —
+`measure_paper_shortfall()` (paper-mode-only) has read the same real CLOB book via
+`simulate_fill()` and logged real spread/slippage/fees on every paper trade since 2026-07-22 — but
+had no explicit pass/fail verdict recorded alongside that data. Rather than making paper mode
+actually GATE trades (which would silently narrow future paper stats to only "already passed"
+trades and break comparability with all prior paper history), the spread-gate verdict logic was
+factored out into a shared `_evaluate_spread_gate()` helper used by both `check_spread_tolerance()`
+(enforced, LIVE_MODE) and `measure_paper_shortfall()` (recorded only, on every return path —
+including preview failures and empty-book cases, which count as "would not have passed"). This
+lets paper stats be segmented after the fact into "live-equivalent" performance without changing
+what gets recorded today. 446 Python tests passing (was 441; +5 new
+`TestMeasurePaperShortfallSpreadGateFlag`).
 
 **Why it exists:** added 2026-07-15 as the first defense against the core risk of copy trading —
 a copy can fill at a much worse price than the source trader's own fill if the book has moved or

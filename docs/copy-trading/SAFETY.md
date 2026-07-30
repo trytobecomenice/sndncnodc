@@ -3326,3 +3326,45 @@ pass case, relative-vs-absolute-spread rejection, simulate_fill exception
 fail-safe, empty book, insufficient-liquidity 3-tuple regression guard).
 435 Python tests passing (was 430). **Needs a `bot.py` restart to take
 effect** — not yet live as of this entry.
+
+---
+
+## 50. `would_have_passed_spread_gate` on every paper trade (Rule 4 addendum)
+
+**Trigger**: a direct challenge that paper trading was "meaningless" since
+`check_spread_tolerance()` (the live spread/liquidity gate) is skipped in
+paper mode. The premise was wrong in a specific, checkable way —
+`measure_paper_shortfall()` (paper-only) already reads the same real CLOB
+book via `simulate_fill()` and has logged real spread/slippage/fees on
+every paper trade since 2026-07-22 (`TestMeasurePaperShortfall`). What was
+actually missing was an explicit recorded verdict on whether that same book
+read would have PASSED the live gate — not the underlying data.
+
+**Why not just gate paper trades too**: considered and explicitly declined.
+Making paper mode reject trades the same way live does would silently
+narrow all FUTURE paper stats to only "already passed" trades, breaking
+comparability with every paper trade recorded before the change — the same
+kind of discontinuity the existing "measurement only, never enforced"
+design in `measure_paper_shortfall()` was built to avoid in the first
+place. Flagged this trade-off to Joey (AskUserQuestion) before writing any
+code; she chose the additive flag over gating.
+
+**What shipped**: `check_spread_tolerance()`'s verdict logic (relative
+spread vs. `config.SPREAD_TOLERANCE`, plus the insufficient-liquidity case)
+was factored out into a shared `_evaluate_spread_gate(price, spread,
+insufficient_liquidity)` helper, used by BOTH `check_spread_tolerance()`
+(enforced) and `measure_paper_shortfall()` (recorded only) — so the two can
+never silently drift onto different definitions of "would this book have
+passed." `measure_paper_shortfall()` now sets `would_have_passed_spread_gate`
+(bool) on every return path, including the `preview_unavailable` and
+`no_executable_price` failure branches (both count as "would not have
+passed," matching `check_spread_tolerance()`'s own fail-closed behavior) —
+plus a `spread_gate_reason` string whenever the flag is `False`. Nothing
+about the paper fill price, position ledger, or PnL changed.
+
+**Tests**: added `TestMeasurePaperShortfallSpreadGateFlag` (5 new tests:
+tight-spread pass, wide-relative-spread rejection using the same identical-
+absolute-spread setup as `TestCheckSpreadTolerance`, insufficient-liquidity
+rejection, preview-failure fail-safe, empty-book fail-safe). 446 Python
+tests passing (was 441). **Needs a `bot.py` restart to take effect** — not
+yet live as of this entry.

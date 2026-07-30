@@ -647,6 +647,56 @@ class TestMeasurePaperShortfall(unittest.TestCase):
         self.assertEqual(result["shares_filled"], 50.0)
 
 
+class TestMeasurePaperShortfallSpreadGateFlag(unittest.TestCase):
+    """would_have_passed_spread_gate (2026-07-31) — measure_paper_shortfall()
+    now computes, but never enforces, the SAME verdict check_spread_tolerance()
+    would have made against the same book read (via the shared
+    _evaluate_spread_gate()), on every return path. Requested directly:
+    paper mode already tracked real spread/slippage data (measure_paper_
+    shortfall since 2026-07-22) but had no explicit "would a live copy have
+    been allowed" signal recorded alongside it."""
+
+    def setUp(self):
+        self._saved_tolerance = config.SPREAD_TOLERANCE
+        config.SPREAD_TOLERANCE = 0.05
+
+    def tearDown(self):
+        config.SPREAD_TOLERANCE = self._saved_tolerance
+
+    def test_tight_spread_and_sufficient_liquidity_would_have_passed(self):
+        fake_preview = {"price": 0.40, "spread": 0.01}  # 2.5% relative
+        with patch("bot.polymarket_simulator.simulate_fill", return_value=fake_preview):
+            result = bot.measure_paper_shortfall("some-market", "Yes", "BUY", 100, 0.40, trade_usd=100.0)
+        self.assertTrue(result["would_have_passed_spread_gate"])
+        self.assertNotIn("spread_gate_reason", result)
+
+    def test_wide_relative_spread_would_not_have_passed(self):
+        fake_preview = {"price": 0.05, "spread": 0.02}  # 40% relative, same absolute spread as above
+        with patch("bot.polymarket_simulator.simulate_fill", return_value=fake_preview):
+            result = bot.measure_paper_shortfall("some-market", "Yes", "BUY", 100, 0.05, trade_usd=100.0)
+        self.assertFalse(result["would_have_passed_spread_gate"])
+        self.assertIn("relative spread", result["spread_gate_reason"])
+
+    def test_insufficient_liquidity_would_not_have_passed_even_with_tight_spread(self):
+        fake_preview = {"price": 0.40, "spread": 0.01, "insufficient_liquidity": True, "shares_filled": 50.0}
+        with patch("bot.polymarket_simulator.simulate_fill", return_value=fake_preview):
+            result = bot.measure_paper_shortfall("some-market", "Yes", "BUY", 100, 0.40, trade_usd=100.0)
+        self.assertFalse(result["would_have_passed_spread_gate"])
+        self.assertIn("insufficient book depth", result["spread_gate_reason"])
+
+    def test_preview_failure_would_not_have_passed(self):
+        with patch("bot.polymarket_simulator.simulate_fill", side_effect=RuntimeError("simulation unavailable")):
+            result = bot.measure_paper_shortfall("some-market", "Yes", "BUY", 100, 0.40, trade_usd=100.0)
+        self.assertFalse(result["would_have_passed_spread_gate"])
+        self.assertIn("preview unavailable", result["spread_gate_reason"])
+
+    def test_empty_book_would_not_have_passed(self):
+        with patch("bot.polymarket_simulator.simulate_fill", return_value={}):
+            result = bot.measure_paper_shortfall("some-market", "Yes", "BUY", 100, 0.40, trade_usd=100.0)
+        self.assertFalse(result["would_have_passed_spread_gate"])
+        self.assertIn("spread_gate_reason", result)
+
+
 class TestGetMarketPrices(unittest.TestCase):
     """get_market_prices() — migrated 2026-07-22 off `bullpen polymarket price`
     onto polymarket_simulator.fetch_order_book_for_outcome() (TTP monitoring)."""
@@ -1414,6 +1464,153 @@ class TestExecuteBuyFakIntegration(unittest.TestCase):
         self.assertEqual(positions, {})
         event = mock_log.call_args_list[0].args[0]
         self.assertEqual(event["event_type"], "failed_trade")
+
+
+class TestLiveBuyRealSpreadCheckWiring(unittest.TestCase):
+    """Simulated-live-order coverage for the 2026-07-31 CLOB cutover
+    (RISK_MANAGEMENT.md Rule 4 / SAFETY.md §49): every other LIVE_MODE test
+    in this file mocks check_spread_tolerance() itself as a black box, which
+    would pass even if the real simulate_fill wiring were completely broken.
+    These tests mock only polymarket_simulator.simulate_fill and exercise
+    the REAL check_spread_tolerance() through _execute_buy()'s plain
+    (non-FAK) live-buy branch — config.ENABLE_ENTRY_SLIPPAGE_CEILING_FAK
+    default is False, so this is the path a real live order actually takes
+    today, unlike the FAK path TestExecuteBuyFakIntegration covers."""
+
+    def setUp(self):
+        self._saved_live_mode = config.LIVE_MODE
+        self._saved_fak_flag = config.ENABLE_ENTRY_SLIPPAGE_CEILING_FAK
+        self._saved_tolerance = config.SPREAD_TOLERANCE
+        config.LIVE_MODE = True
+        config.ENABLE_ENTRY_SLIPPAGE_CEILING_FAK = False
+        config.SPREAD_TOLERANCE = 0.05
+
+    def tearDown(self):
+        config.LIVE_MODE = self._saved_live_mode
+        config.ENABLE_ENTRY_SLIPPAGE_CEILING_FAK = self._saved_fak_flag
+        config.SPREAD_TOLERANCE = self._saved_tolerance
+
+    def _base_event(self):
+        return {"timestamp": "t", "trader_address": "0xTrader", "trader_nickname": "nick",
+                "market_slug": "some-market", "outcome": "Yes", "side": "BUY", "mode": "live"}
+
+    def _run(self, book_preview):
+        positions = {}
+        risk_state = {"market_to_event": {"some-market": "some-event"}, "kill_switch": None}
+        with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
+             patch("bot.polymarket_simulator.simulate_fill", return_value=book_preview), \
+             patch("bot.check_slippage_ceiling", return_value=(True, None)), \
+             patch("bot.run_bullpen_json", return_value={"status": "MATCHED", "transaction_hashes": ["0xabc"], "price": 0.50}) as mock_run, \
+             patch("bot.append_log") as mock_log:
+            result = bot._execute_buy(
+                self._base_event(), "0xTrader|some-market|Yes", "0xTrader", "some-market", "Yes",
+                0.50, 10.0, "some-event", {}, positions, risk_state,
+            )
+        return result, mock_run, mock_log
+
+    def test_wide_book_spread_blocks_the_live_buy_before_any_order_is_placed(self):
+        # price=0.50, spread=0.10 -> relative spread 20%, well over the 5% tolerance.
+        book_preview = {"price": 0.50, "spread": 0.10}
+        result, mock_run, mock_log = self._run(book_preview)
+        self.assertIsNone(result)
+        mock_run.assert_not_called()
+        event = mock_log.call_args_list[0].args[0]
+        self.assertEqual(event["event_type"], "skip_wide_spread")
+
+    def test_tight_book_spread_lets_the_real_order_through(self):
+        # price=0.50, spread=0.01 -> relative spread 2%, within the 5% tolerance.
+        book_preview = {"price": 0.50, "spread": 0.01}
+        result, mock_run, mock_log = self._run(book_preview)
+        self.assertIsNotNone(result)
+        mock_run.assert_called_once()
+        args = mock_run.call_args.args[0]
+        self.assertIn("buy", args)
+
+    def test_insufficient_book_depth_blocks_the_live_buy(self):
+        book_preview = {"price": 0.50, "spread": 0.01, "insufficient_liquidity": True}
+        result, mock_run, mock_log = self._run(book_preview)
+        self.assertIsNone(result)
+        mock_run.assert_not_called()
+        event = mock_log.call_args_list[0].args[0]
+        self.assertEqual(event["event_type"], "skip_wide_spread")
+
+    def test_book_fetch_failure_fails_safe_and_blocks_the_live_buy(self):
+        positions = {}
+        risk_state = {"market_to_event": {"some-market": "some-event"}, "kill_switch": None}
+        with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
+             patch("bot.polymarket_simulator.simulate_fill", side_effect=RuntimeError("clob timeout")), \
+             patch("bot.run_bullpen_json") as mock_run, \
+             patch("bot.append_log") as mock_log:
+            result = bot._execute_buy(
+                self._base_event(), "0xTrader|some-market|Yes", "0xTrader", "some-market", "Yes",
+                0.50, 10.0, "some-event", {}, positions, risk_state,
+            )
+        self.assertIsNone(result)
+        mock_run.assert_not_called()
+        event = mock_log.call_args_list[0].args[0]
+        self.assertEqual(event["event_type"], "skip_wide_spread")
+        self.assertIn("preview unavailable", event["reason"])
+
+
+class TestLiveSellRealSpreadCheckWiring(unittest.TestCase):
+    """Same simulated-live-order coverage as TestLiveBuyRealSpreadCheckWiring,
+    for process_trade()'s live SELL branch (the proportional whale-mirroring
+    exit, distinct from close_position_trailing_tp's own SELL call site)."""
+
+    def setUp(self):
+        self._saved_live_mode = config.LIVE_MODE
+        self._saved_tolerance = config.SPREAD_TOLERANCE
+        config.LIVE_MODE = True
+        config.SPREAD_TOLERANCE = 0.05
+
+    def tearDown(self):
+        config.LIVE_MODE = self._saved_live_mode
+        config.SPREAD_TOLERANCE = self._saved_tolerance
+
+    def _kwargs(self, positions, source_positions, source_cost_basis):
+        trade = {
+            "user_address": "0xTrader", "market_slug": "some-market", "outcome": "Yes",
+            "side": "SELL", "price": 0.50, "size_usd": 5.0, "trade_id": "polling-tid-1",
+            "timestamp": "t", "market_title": "", "detected_by": "polling",
+        }
+        return dict(
+            trade=trade, positions=positions, source_positions=source_positions,
+            source_cost_basis=source_cost_basis, trader_performance={}, muted_traders={},
+            tracked_by_lower={"0xtrader": ("0xTrader", "nick")},
+            risk_state={"market_to_event": {"some-market": "some-event"},
+                        "market_to_category": {"some-market": "crypto"}, "kill_switch": None},
+            wallet_scores={},
+        )
+
+    def _positions(self):
+        key = "0xtrader|some-market|Yes"
+        return ({key: {"shares": 20.0, "cost_basis_usd": 8.0, "avg_entry_price": 0.4,
+                        "buy_count": 1, "peak_profit_pct": 0.0}},
+                {key: 20.0}, {key: 8.0})
+
+    def test_wide_book_spread_blocks_the_live_sell_before_any_order_is_placed(self):
+        positions, source_positions, source_cost_basis = self._positions()
+        book_preview = {"price": 0.50, "spread": 0.10}  # 20% relative, over tolerance
+        with patch("bot.polymarket_simulator.simulate_fill", return_value=book_preview), \
+             patch("bot.run_bullpen_json") as mock_run, \
+             patch("bot.append_log") as mock_log:
+            bot.process_trade(**self._kwargs(positions, source_positions, source_cost_basis))
+        mock_run.assert_not_called()
+        logged_types = [c.args[0]["event_type"] for c in mock_log.call_args_list]
+        self.assertIn("skip_wide_spread", logged_types)
+        # position must remain untouched -- a blocked live sell must not be booked.
+        self.assertEqual(positions["0xtrader|some-market|Yes"]["shares"], 20.0)
+
+    def test_tight_book_spread_lets_the_real_sell_order_through(self):
+        positions, source_positions, source_cost_basis = self._positions()
+        book_preview = {"price": 0.50, "spread": 0.01}  # 2% relative, within tolerance
+        with patch("bot.polymarket_simulator.simulate_fill", return_value=book_preview), \
+             patch("bot.run_bullpen_json", return_value={"status": "MATCHED", "transaction_hashes": ["0xabc"], "price": 0.50}) as mock_run, \
+             patch("bot.append_log"):
+            bot.process_trade(**self._kwargs(positions, source_positions, source_cost_basis))
+        mock_run.assert_called_once()
+        args = mock_run.call_args.args[0]
+        self.assertIn("sell", args)
 
 
 class TestProcessTradeDualTrackReconciliation(unittest.TestCase):

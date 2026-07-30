@@ -95,20 +95,46 @@ def _handle_sigterm(signum, frame):
     logger.info("SIGTERM received — finishing current work, saving state, then exiting.")
 
 
+def _evaluate_spread_gate(price, spread, insufficient_liquidity):
+    """Shared Risk 1 (spread/liquidity) verdict logic, factored out
+    2026-07-31 so the LIVE gate (check_spread_tolerance) and the PAPER
+    retroactive flag (measure_paper_shortfall's would_have_passed_spread_gate)
+    can never silently drift apart — both must agree on exactly what a live
+    order would have been allowed to do against the same book read.
+
+    NOTE: `spread` is an ABSOLUTE price-tick spread (e.g. 0.01), not a
+    fraction of price -- dividing by price is required to get a comparable
+    relative number across outcomes trading near $0.05 vs near $0.95.
+    Verified empirically: a thin long-shot market and a liquid ~50/50 market
+    can report the identical absolute spread while differing by 10x+ in
+    relative terms.
+
+    Returns (ok, reason) — reason is None when ok is True.
+    """
+    if not price or price <= 0 or spread is None:
+        return False, f"preview missing price/spread (price={price}, spread={spread})"
+
+    relative_spread = spread / price
+    if relative_spread > config.SPREAD_TOLERANCE:
+        return False, (
+            f"relative spread {relative_spread:.1%} exceeds tolerance "
+            f"{config.SPREAD_TOLERANCE:.0%} (price={price}, abs_spread={spread})"
+        )
+
+    if insufficient_liquidity:
+        return False, "insufficient book depth to fill the requested amount"
+
+    return True, None
+
+
 def check_spread_tolerance(market_slug, outcome, amount, side):
     """Risk 1 (spread/liquidity) pre-trade check. Reads a fresh CLOB order
     book (independent of the possibly-stale price the tracker feed reported
     for the source trade) via polymarket_simulator.simulate_fill() and
     rejects the copy if the relative spread (spread / price) exceeds
     config.SPREAD_TOLERANCE, or if the visible book couldn't fill the
-    requested size.
-
-    NOTE: simulate_fill's `spread` field is an ABSOLUTE price-tick spread
-    (e.g. 0.01), not a fraction of price -- dividing by price is required to
-    get a comparable relative number across outcomes trading near $0.05 vs
-    near $0.95. Verified empirically: a thin long-shot market and a liquid
-    ~50/50 market can report the identical absolute spread while differing
-    by 10x+ in relative terms.
+    requested size — see _evaluate_spread_gate() for the shared verdict
+    logic.
 
     Fails safe: if the book read itself errors (network/timeout/parse), this
     returns not-ok rather than skipping the check -- we'd rather miss a copy
@@ -133,21 +159,8 @@ def check_spread_tolerance(market_slug, outcome, amount, side):
         return False, f"preview unavailable: {e}", None
 
     price = preview.get("price")
-    spread = preview.get("spread")
-    if not price or price <= 0 or spread is None:
-        return False, f"preview missing price/spread: {preview}", None
-
-    relative_spread = spread / price
-    if relative_spread > config.SPREAD_TOLERANCE:
-        return False, (
-            f"relative spread {relative_spread:.1%} exceeds tolerance "
-            f"{config.SPREAD_TOLERANCE:.0%} (price={price}, abs_spread={spread})"
-        ), None
-
-    if preview.get("insufficient_liquidity"):
-        return False, f"insufficient book depth to fill {amount}", None
-
-    return True, None, price
+    ok, reason = _evaluate_spread_gate(price, preview.get("spread"), preview.get("insufficient_liquidity"))
+    return ok, reason, (price if ok else None)
 
 
 def check_slippage_ceiling(source_price, executable_price, side):
@@ -431,6 +444,15 @@ def measure_paper_shortfall(market_slug, outcome, side, preview_amount, source_p
     previews for the spread check and records the true fill price, which IS
     the executable price.)
 
+    `would_have_passed_spread_gate` (added 2026-07-31, on every return path
+    below): the SAME verdict check_spread_tolerance() would have made
+    against this exact book read (via the shared _evaluate_spread_gate()),
+    computed but NOT enforced — a paper trade is never skipped or altered
+    because of it. Lets paper stats be filtered/segmented after the fact
+    into "would live have taken this copy" without narrowing what gets
+    recorded now, which would break comparability with pre-2026-07-31 paper
+    history the same way actually gating paper trades would have.
+
     Fails soft: any simulation error returns a status field instead of
     raising — losing one measurement must never block or delay a copy
     beyond the simulation call itself. preview_amount follows the same
@@ -439,11 +461,20 @@ def measure_paper_shortfall(market_slug, outcome, side, preview_amount, source_p
     try:
         preview = polymarket_simulator.simulate_fill(market_slug, outcome, side, preview_amount)
     except Exception as e:
-        return {"shortfall_status": "preview_unavailable", "shortfall_error": str(e)}
+        return {"shortfall_status": "preview_unavailable", "shortfall_error": str(e),
+                "would_have_passed_spread_gate": False,
+                "spread_gate_reason": f"preview unavailable: {e}"}
 
     executable_price = preview.get("price")
+    would_pass, gate_reason = _evaluate_spread_gate(
+        executable_price, preview.get("spread"), preview.get("insufficient_liquidity"))
+
     if not executable_price or executable_price <= 0:
-        return {"shortfall_status": "no_executable_price", "shortfall_raw_preview": preview}
+        result = {"shortfall_status": "no_executable_price", "shortfall_raw_preview": preview,
+                  "would_have_passed_spread_gate": would_pass}
+        if not would_pass:
+            result["spread_gate_reason"] = gate_reason
+        return result
 
     pct, usd = compute_shortfall(side, source_price, executable_price,
                                  trade_usd=trade_usd, shares=shares)
@@ -468,7 +499,10 @@ def measure_paper_shortfall(market_slug, outcome, side, preview_amount, source_p
         "trading_fee_usd": trading_fee_usd,
         "network_fee_usd": network_fee_usd,
         "total_cost_usd": total_cost_usd,
+        "would_have_passed_spread_gate": would_pass,
     }
+    if not would_pass:
+        result["spread_gate_reason"] = gate_reason
     # Added 2026-07-22 (order-book simulator cutover): the book didn't have enough visible depth
     # to fill preview_amount in full — executable_price/fees above are still real, just for a
     # smaller fill than requested. Surfaced so this isn't silently indistinguishable from a
