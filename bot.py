@@ -2242,7 +2242,17 @@ def compute_wallet_ev_t_statistic(returns):
     return mean / stderr
 
 
-def _execute_shadow_buy(base_event, key, market_slug, outcome, price, shadow_positions):
+def _shadow_wallet_cost_basis_usd(trader, shadow_positions):
+    """Sum of cost_basis_usd across every shadow_positions entry belonging
+    to `trader` -- keys are position_key(trader, market_slug, outcome), so
+    matching the "trader|" prefix (already lowercased by position_key) is
+    enough, no separate per-trader index needed for a dict this small."""
+    prefix = trader.lower() + "|"
+    return sum(pos["cost_basis_usd"] for k, pos in shadow_positions.items() if k.startswith(prefix))
+
+
+def _execute_shadow_buy(base_event, key, trader, market_slug, outcome, price, shadow_positions,
+                         wallet_ev_stats=None):
     """Shadow Rehab (2026-07-27, Rule 37): books a hypothetical copy of a
     MUTED wallet's real buy into an isolated ledger
     (paper_trade.strategy="shadow_rehab" once persisted via
@@ -2265,7 +2275,24 @@ def _execute_shadow_buy(base_event, key, market_slug, outcome, price, shadow_pos
     fill-fidelity bar Rule 32 established for real paper trades -- an
     unrealistically-optimistic shadow simulation would make rehab
     decisions on fantasy numbers.
+
+    Aggregate cap (2026-08-01): a muted wallet with no other limiter kept
+    accumulating shadow positions forever (one observed case: 258 open
+    positions, ~$121k phantom cost basis, 2,364 buys) -- pure noise/storage
+    growth, since sweep_shadow_rehab()'s reinstatement test only ever reads
+    the most recent config.MUTE_EV_MIN_SAMPLES CLOSED returns regardless of
+    how large the ledger gets. Reuses risk_manager.wallet_exposure_cap_usd()
+    -- the SAME formula that would apply to this wallet if it were actually
+    live -- as the ceiling on total shadow cost basis; once reached, new
+    shadow buys are simply skipped (existing open shadow positions are left
+    alone to resolve naturally) until they close and free up room.
     """
+    cap = risk_manager.wallet_exposure_cap_usd(trader, wallet_ev_stats)
+    if cap is not None and _shadow_wallet_cost_basis_usd(trader, shadow_positions) >= cap:
+        append_log({**base_event, "event_type": "skip_shadow_rehab_wallet_cap",
+                    "reason": f"shadow cost basis at/above wallet cap ${cap:.2f}"})
+        return
+
     trade_usd = config.SHADOW_REHAB_TRADE_USD
     our_shares = trade_usd / price
     actual_cost_usd = trade_usd
@@ -2796,7 +2823,8 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
             # muted wallet's recovery could ever be observed again (see
             # sweep_shadow_rehab()'s docstring for why).
             if config.ENABLE_SHADOW_REHAB and shadow_positions is not None:
-                _execute_shadow_buy(dict(base_event), key, market_slug, outcome, price, shadow_positions)
+                _execute_shadow_buy(dict(base_event), key, trader, market_slug, outcome, price,
+                                     shadow_positions, wallet_ev_stats=wallet_ev_stats)
             return
 
         # Risk 3 (duplicate exposure) guard. Applies in BOTH paper and live

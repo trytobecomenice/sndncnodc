@@ -3912,3 +3912,33 @@ before timing out.
 `TestStartShadowPatientExit`/`TestSweepShadowPatientExits`/
 `TestClosePositionTrailingTpShadowWiring` in `test_bot_risk_checks.py` (new, +9). 542 Python tests
 passing (was 526).
+
+## 62. Shadow Rehab aggregate cap (Rule 37 addendum, 2026-08-01)
+
+**Trigger**: Joey flagged, while reviewing item 4 of the post-kill-switch-fix roadmap, that Shadow
+Rehab (Rule 37) had no upper bound at all — one muted wallet had accumulated 258 open shadow
+positions, ~$121k phantom cost basis, and 2,364 buys. Confirmed via
+`sweep_shadow_rehab()`/`get_shadow_rehab_returns(key, limit=config.MUTE_EV_MIN_SAMPLES)` that the
+reinstatement decision itself only ever reads the most recent `MUTE_EV_MIN_SAMPLES` CLOSED returns
+— the unbounded growth was pure noise/storage cost, not feeding anything the rehab test actually
+used. Joey confirmed via `AskUserQuestion`: add a cap using the same formula real wallets already
+get, rather than leaving it unbounded.
+
+**What ships**: `_execute_shadow_buy()` now checks
+`risk_manager.wallet_exposure_cap_usd(trader, wallet_ev_stats)` — the exact formula (VIP override →
+`compute_wallet_ev_cap_usd()` EV-shrinkage → flat `MAX_WALLET_EXPOSURE_USD` default) already applied
+to this wallet's real exposure — against a new helper, `_shadow_wallet_cost_basis_usd()`, which sums
+`cost_basis_usd` across every `shadow_positions` entry whose key starts with `trader.lower() + "|"`.
+At or above cap, the buy is skipped (`skip_shadow_rehab_wallet_cap` event) and existing open shadow
+positions are left alone to resolve naturally, freeing room once they close. `wallet_ev_stats` (already
+fetched once at `main()` startup, same object real BUYs already use) is threaded through
+`process_trade()`'s existing muted-wallet branch into `_execute_shadow_buy()`, a new parameter.
+
+**Property specifically tested**: the cap check sums across ALL of a trader's shadow positions, not
+just the one market/outcome being bought into, and is scoped per-wallet (another wallet's huge shadow
+balance doesn't block this one) —
+`TestExecuteShadowBuy.test_cap_check_sums_across_all_of_this_traders_shadow_positions` constructs a
+mixed `shadow_positions` dict with a second wallet at $999,999 cost basis to confirm it's ignored.
+
+**Tests**: `TestExecuteShadowBuy` +3 in `test_bot_risk_checks.py` (at-cap skip, under-cap proceeds,
+cross-market summation). 545 Python tests passing (was 542).

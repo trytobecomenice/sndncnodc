@@ -3186,6 +3186,24 @@ cross-trader duplicate-position guard — both manage OUR portfolio's real
 capital allocation, which doesn't apply to an isolated simulation;
 multiple shadow buys into the same market simply average up freely.
 
+**2026-08-01 addendum — aggregate cap.** No other limiter meant a
+sufficiently-active muted wallet just accumulated shadow positions forever
+(one observed case before this fix: 258 open positions, ~$121k phantom
+cost basis, 2,364 buys) — pure noise and unbounded storage growth, since
+`sweep_shadow_rehab()`'s reinstatement test only ever reads the most
+recent `config.MUTE_EV_MIN_SAMPLES` CLOSED returns regardless of how large
+the ledger gets, so nothing about the rehab decision itself needed the
+unbounded size. `_execute_shadow_buy()` now checks
+`risk_manager.wallet_exposure_cap_usd(trader, wallet_ev_stats)` — the SAME
+formula (VIP override → EV-shrunk automatic cap → flat default) that would
+apply to this wallet if it were live — against the sum of its existing
+shadow `cost_basis_usd` across every market/outcome; at or above cap, the
+new buy is skipped (`skip_shadow_rehab_wallet_cap`) and existing open
+shadow positions are simply left to resolve naturally, freeing room for
+new ones once they close. A wallet whose real measured EV is very negative
+therefore gets a small shadow cap too — consistent with, not separate
+from, how the bot already treats that wallet's real exposure.
+
 **Pool-refill proposal script** (`propose_pool_refill.py`): reads
 `bot_risk_state["tracked_traders"]` (the real, live list bot.py publishes
 at every startup — the same source the dashboard now reads, Rule 36) and

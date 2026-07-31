@@ -1476,7 +1476,7 @@ class TestExecuteShadowBuy(unittest.TestCase):
                      "trading_fee_usd": 0.10, "network_fee_usd": 0.02}
         with patch("bot.measure_paper_shortfall", return_value=shortfall), \
              patch("bot.append_log") as mock_log:
-            bot._execute_shadow_buy(self._base_event(), "0xtrader|some-market|Yes",
+            bot._execute_shadow_buy(self._base_event(), "0xtrader|some-market|Yes", "0xtrader",
                                      "some-market", "Yes", 0.5, shadow_positions)
         pos = shadow_positions["0xtrader|some-market|Yes"]
         self.assertAlmostEqual(pos["shares"], config.SHADOW_REHAB_TRADE_USD / 0.55)
@@ -1489,7 +1489,7 @@ class TestExecuteShadowBuy(unittest.TestCase):
         shortfall = {"shortfall_status": "preview_unavailable", "shortfall_error": "boom"}
         with patch("bot.measure_paper_shortfall", return_value=shortfall), \
              patch("bot.append_log"):
-            bot._execute_shadow_buy(self._base_event(), "0xtrader|some-market|Yes",
+            bot._execute_shadow_buy(self._base_event(), "0xtrader|some-market|Yes", "0xtrader",
                                      "some-market", "Yes", 0.5, shadow_positions)
         pos = shadow_positions["0xtrader|some-market|Yes"]
         self.assertAlmostEqual(pos["shares"], config.SHADOW_REHAB_TRADE_USD / 0.5)
@@ -1502,11 +1502,55 @@ class TestExecuteShadowBuy(unittest.TestCase):
         with patch("bot.measure_paper_shortfall", return_value={"shortfall_status": "preview_unavailable"}), \
              patch("bot.append_log"):
             for _ in range(5):
-                bot._execute_shadow_buy(self._base_event(), "0xtrader|some-market|Yes",
+                bot._execute_shadow_buy(self._base_event(), "0xtrader|some-market|Yes", "0xtrader",
                                          "some-market", "Yes", 0.5, shadow_positions)
         pos = shadow_positions["0xtrader|some-market|Yes"]
         self.assertEqual(pos["buy_count"], 5)
         self.assertAlmostEqual(pos["cost_basis_usd"], 5 * config.SHADOW_REHAB_TRADE_USD)
+
+    def test_wallet_at_or_above_cap_skips_new_shadow_buy(self):
+        shadow_positions = {"0xtrader|other-market|Yes": {"shares": 1000.0,
+                                                            "cost_basis_usd": 999999.0,
+                                                            "avg_entry_price": 0.5, "buy_count": 1}}
+        with patch("bot.risk_manager.wallet_exposure_cap_usd", return_value=500.0), \
+             patch("bot.measure_paper_shortfall") as mock_shortfall, \
+             patch("bot.append_log") as mock_log:
+            bot._execute_shadow_buy(self._base_event(), "0xtrader|some-market|Yes", "0xtrader",
+                                     "some-market", "Yes", 0.5, shadow_positions)
+        mock_shortfall.assert_not_called()
+        self.assertNotIn("0xtrader|some-market|Yes", shadow_positions)
+        event = mock_log.call_args_list[0].args[0]
+        self.assertEqual(event["event_type"], "skip_shadow_rehab_wallet_cap")
+
+    def test_wallet_well_under_cap_buys_normally(self):
+        shadow_positions = {}
+        with patch("bot.risk_manager.wallet_exposure_cap_usd", return_value=500.0), \
+             patch("bot.measure_paper_shortfall", return_value={"shortfall_status": "preview_unavailable"}), \
+             patch("bot.append_log") as mock_log:
+            bot._execute_shadow_buy(self._base_event(), "0xtrader|some-market|Yes", "0xtrader",
+                                     "some-market", "Yes", 0.5, shadow_positions)
+        self.assertIn("0xtrader|some-market|Yes", shadow_positions)
+        event = mock_log.call_args_list[0].args[0]
+        self.assertEqual(event["event_type"], "shadow_rehab_buy")
+
+    def test_cap_check_sums_across_all_of_this_traders_shadow_positions(self):
+        shadow_positions = {
+            "0xtrader|market-a|Yes": {"shares": 100.0, "cost_basis_usd": 300.0,
+                                       "avg_entry_price": 0.5, "buy_count": 1},
+            "0xtrader|market-b|No": {"shares": 100.0, "cost_basis_usd": 250.0,
+                                      "avg_entry_price": 0.5, "buy_count": 1},
+            "0xother|market-a|Yes": {"shares": 100.0, "cost_basis_usd": 999999.0,
+                                      "avg_entry_price": 0.5, "buy_count": 1},
+        }
+        with patch("bot.risk_manager.wallet_exposure_cap_usd", return_value=500.0), \
+             patch("bot.measure_paper_shortfall") as mock_shortfall, \
+             patch("bot.append_log") as mock_log:
+            bot._execute_shadow_buy(self._base_event(), "0xtrader|market-c|Yes", "0xtrader",
+                                     "market-c", "Yes", 0.5, shadow_positions)
+        # 300 + 250 = 550 >= 500 cap -- blocked, regardless of 0xother's huge balance
+        mock_shortfall.assert_not_called()
+        self.assertEqual(mock_log.call_args_list[0].args[0]["event_type"],
+                          "skip_shadow_rehab_wallet_cap")
 
 
 class TestExecuteBuyFakIntegration(unittest.TestCase):
