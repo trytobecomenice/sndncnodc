@@ -3602,9 +3602,11 @@ observability layer can't itself destabilize the box it's monitoring.
    - Daily PnL summary, piggybacked onto `maybe_snapshot_daily_portfolio()`'s existing
      once-per-UTC-day trigger rather than a second schedule.
 5. `monitoring/docker-compose.yml` + `monitoring/prometheus.yml` + Grafana datasource
-   auto-provisioning (`monitoring/grafana-provisioning/`) — Prometheus v3.13.2, Grafana OSS v13.1.1
-   (both version-verified live via GitHub releases before pinning, not guessed). Both ports bound
-   to `127.0.0.1` only — no new EC2 security-group rule, Grafana accessed via
+   auto-provisioning (`monitoring/grafana-provisioning/`) — Prometheus v3.13.2 (GitHub release
+   version, confirmed as the real published Docker Hub tag too). Grafana OSS 13.0.2, NOT the
+   newer v13.1.1 GitHub release — confirmed live against Docker Hub's own tag list that 13.1.1's
+   image hadn't been published there yet at deploy time (image publishing lags the GitHub release).
+   Both ports bound to `127.0.0.1` only — no new EC2 security-group rule, Grafana accessed via
    `ssh -L 3001:localhost:3000 <host>` per Joey's explicit choice, same posture as every other
    access path since the 2026-07-29 leaked-key incident.
 

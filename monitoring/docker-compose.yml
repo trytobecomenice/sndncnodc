@@ -37,7 +37,11 @@ services:
       - "127.0.0.1:9090:9090"
 
   grafana:
-    image: grafana/grafana-oss:13.1.1
+    # 13.0.2, not the newer v13.1.1 GitHub release (2026-07-21) -- confirmed
+    # live against Docker Hub's own tag list 2026-07-31 that 13.1.1's image
+    # hadn't been published there yet, image publishing lags the GitHub
+    # release itself. Worth bumping once a matching tag actually exists.
+    image: grafana/grafana-oss:13.0.2
     container_name: copybot-grafana
     restart: unless-stopped
     mem_limit: 200m
