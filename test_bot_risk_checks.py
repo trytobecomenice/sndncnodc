@@ -1460,6 +1460,78 @@ class TestExecuteBuyExtraction(unittest.TestCase):
         self.assertAlmostEqual(pos["shares"], 20.0)  # 10 usd / source price 0.5, unchanged
         self.assertAlmostEqual(pos["cost_basis_usd"], 10.0)
 
+    def test_liquidity_gate_off_by_default_still_falls_back_to_source_price(self):
+        # config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE defaults False --
+        # unpatched here on purpose, confirming the real default preserves
+        # today's behavior.
+        positions = {}
+        risk_state = {"market_to_event": {"some-market": "some-event"}, "kill_switch": None}
+        shortfall = {"shortfall_status": "preview_unavailable", "shortfall_error": "404"}
+        with patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
+             patch("bot.measure_paper_shortfall", return_value=shortfall), \
+             patch("bot.append_log", return_value="journal-id-1"):
+            result = bot._execute_buy(
+                self._base_event(), "0xTrader|some-market|Yes", "0xTrader", "some-market", "Yes",
+                0.5, 10.0, "some-event", {}, positions, risk_state,
+            )
+        self.assertEqual(result, "journal-id-1")
+        self.assertIn("0xTrader|some-market|Yes", positions)
+
+    def test_liquidity_gate_on_skips_a_trade_with_no_readable_orderbook(self):
+        positions = {}
+        risk_state = {"market_to_event": {"some-market": "some-event"}, "kill_switch": None}
+        shortfall = {"shortfall_status": "preview_unavailable",
+                     "shortfall_error": "HTTP 404: No orderbook exists for the requested token"}
+        with patch.object(config, "ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE", True), \
+             patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
+             patch("bot.measure_paper_shortfall", return_value=shortfall), \
+             patch("bot.append_log") as mock_log:
+            result = bot._execute_buy(
+                self._base_event(), "0xTrader|some-market|Yes", "0xTrader", "some-market", "Yes",
+                0.5, 10.0, "some-event", {}, positions, risk_state,
+            )
+        self.assertIsNone(result)
+        self.assertEqual(positions, {})
+        event = mock_log.call_args_list[0].args[0]
+        self.assertEqual(event["event_type"], "skip_no_orderbook_liquidity")
+        self.assertIn("404", event["reason"])
+
+    def test_liquidity_gate_on_still_allows_a_real_book_read(self):
+        positions = {}
+        risk_state = {"market_to_event": {"some-market": "some-event"}, "kill_switch": None}
+        shortfall = {"shortfall_status": "ok", "executable_price": 0.55}
+        with patch.object(config, "ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE", True), \
+             patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
+             patch("bot.measure_paper_shortfall", return_value=shortfall), \
+             patch("bot.append_log", return_value="journal-id-1"):
+            result = bot._execute_buy(
+                self._base_event(), "0xTrader|some-market|Yes", "0xTrader", "some-market", "Yes",
+                0.5, 10.0, "some-event", {}, positions, risk_state,
+            )
+        self.assertEqual(result, "journal-id-1")
+        self.assertIn("0xTrader|some-market|Yes", positions)
+
+    def test_liquidity_gate_only_applies_in_paper_mode(self):
+        # LIVE_MODE never reaches measure_paper_shortfall() at all (its own
+        # check_spread_tolerance() gate already runs first) -- confirm the
+        # liquidity gate flag has no effect on that branch.
+        positions = {}
+        risk_state = {"market_to_event": {"some-market": "some-event"}, "kill_switch": None}
+        with patch.object(config, "LIVE_MODE", True), \
+             patch.object(config, "ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE", True), \
+             patch("bot.risk_manager.check_buy", return_value=(True, None, None)), \
+             patch("bot.check_spread_tolerance", return_value=(True, None, 0.5)), \
+             patch("bot.check_slippage_ceiling", return_value=(True, None)), \
+             patch("bot.measure_paper_shortfall") as mock_shortfall, \
+             patch("bot.run_bullpen_json",
+                   return_value={"status": "MATCHED", "price": 0.5, "transaction_hashes": ["0xabc"]}), \
+             patch("bot.append_log", return_value="journal-id-1"):
+            bot._execute_buy(
+                self._base_event(), "0xTrader|some-market|Yes", "0xTrader", "some-market", "Yes",
+                0.5, 10.0, "some-event", {}, positions, risk_state,
+            )
+        mock_shortfall.assert_not_called()
+
 
 class TestExecuteShadowBuy(unittest.TestCase):
     """_execute_shadow_buy() — Shadow Rehab (2026-07-27, Rule 37). Books a

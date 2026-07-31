@@ -4002,3 +4002,52 @@ bucket accumulate real outcomes first.
 `TestClosePositionTrailingTpCloseReason` (+2), `TestCheckTrailingTakeProfitTimeDecayLossCutWiring`
 (+6) in `test_bot_risk_checks.py`; `test_load_state_positions_carry_opened_at` (+1) in
 `test_db_pending_execution.py`. 564 Python tests passing (was 545).
+
+## 64. Orderbook Liquidity Entry Gate — closing a paper/live inconsistency (Rule 26/31 addendum, 2026-08-01)
+
+**Trigger**: same session, immediately after Sec.63. Joey pushed for a deeper root-cause on the
+non-strict-7 losses with three specific hypotheses: hedging behavior, market-microstructure cost, and
+a common/unique feature that could directly skip bad trades. Checked all three against real data.
+
+**Hedging**: not deeply investigated — would require pulling each source wallet's FULL external trade
+history via a live API, materially heavier than what the other two hypotheses needed. Flagged as a
+real, open gap rather than silently skipped, in case worth returning to.
+
+**Market microstructure**: `measure_paper_shortfall()` already logs `shortfall_status`/
+`executable_price` on every BUY (`bot_event_log.payload_json`) — no new instrumentation needed to
+check this. Median slippage on the 136 buys with a genuinely readable book is +3.46% (real, but
+modest); the naively-computed MEAN (32.8%) turned out to be a red herring from percentage math on
+near-zero longshot prices (a $0.002→$0.07 move reads as "3494% slippage" for what's actually a
+two-tick move) — the same distortion `EQUITY_MARK_MIN_ENTRY_PRICE`/`PER_TRADE_ENTRY_PRICE_FLOOR`
+already exist to guard against elsewhere in this codebase. Caught before it became the (wrong)
+headline finding.
+
+**Common/unique skip feature — the actual finding.** Grouped ALL 373 non-strict-7 closed trades by
+`shortfall_status` at entry: trades where the CLOB orderbook genuinely couldn't be read at buy time
+(296 trades) account for **-$194.93 of the total -$211.10 net loss (92.3%)**; trades with a real
+readable book (76 trades) were roughly breakeven (-$16.18). Checked the actual error behind the
+failures: 746 of 786 historical `preview_unavailable` events are the identical cause — CLOB `HTTP 404:
+No orderbook exists for the requested token` — a mechanical, unambiguous signal from the exchange
+itself, not a flaky fetch. The single largest losing wallet (`0x5b4ec9c0...`, -$360) had **100%
+(72/72)** of its copies land in exactly this bucket.
+
+**What ships**: `config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE` (default `False`, confirmed via
+`AskUserQuestion`). `_execute_buy()`'s paper-mode branch (the shared buy path both `process_trade()`
+and Rule 29's dip-and-rebound sweep funnel through) now checks this flag right after `measure_paper_
+shortfall()` returns: when on and `shortfall_status != "ok"`, the trade is skipped outright
+(`skip_no_orderbook_liquidity` event, same shape as every other `skip_*` gate) instead of silently
+falling back to the source price and opening a position anyway. `LIVE_MODE`'s branch is untouched —
+it already has this exact protection via `check_spread_tolerance()`, confirmed unaffected by a
+dedicated test (`measure_paper_shortfall` never even gets called on that path).
+
+**Why this is closing a gap, not adding a new risk control**: `check_spread_tolerance()` already
+means `LIVE_MODE` would refuse these exact entries today (`would_have_passed_spread_gate=False` on
+this path) — paper mode was the one side quietly out of sync, still copying trades live trading would
+never take, which is exactly why the paper P&L looked worse than a real deployment's would.
+
+**Default `False`, deliberately** — same "let its own skip-event bucket accumulate real data before
+enabling" discipline as Sec.63's Time-Decay Loss Cut.
+
+**Tests**: `TestExecuteBuyExtraction` +4 in `test_bot_risk_checks.py` (default-off preserves current
+behavior, on-skips-with-no-book, on-still-allows-a-real-book-read, LIVE_MODE branch unaffected). 568
+Python tests passing (was 564).

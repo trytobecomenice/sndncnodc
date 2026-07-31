@@ -2721,6 +2721,20 @@ def _execute_buy(base_event, key, trader, market_slug, outcome, price, trade_usd
             trade_usd=trade_usd,
         )
         base_event.update(shortfall)
+
+        # Orderbook Liquidity Entry Gate (2026-08-01, opt-in, default
+        # False) -- see config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE's own
+        # docstring for the real-data root cause. Closes a paper/live
+        # inconsistency: LIVE_MODE's check_spread_tolerance() above already
+        # refuses an entry with no readable book, but paper mode has been
+        # quietly falling back to the source price and taking the trade
+        # anyway. Skips (never silently discounts) so this bucket's own
+        # close_reason data stays as unambiguous as every other skip event.
+        if config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE and shortfall.get("shortfall_status") != "ok":
+            append_log({**base_event, "event_type": "skip_no_orderbook_liquidity",
+                        "reason": shortfall.get("shortfall_error") or shortfall.get("shortfall_status")})
+            return None
+
         if shortfall.get("shortfall_status") == "ok":
             our_shares = trade_usd / shortfall["executable_price"]
             actual_cost_usd = trade_usd + shortfall.get("trading_fee_usd", 0.0) \

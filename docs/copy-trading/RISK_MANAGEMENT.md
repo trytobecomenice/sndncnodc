@@ -2814,6 +2814,44 @@ from it (Time-Decay Loss Cut).**
 > its own close-reason bucket accumulate real outcomes, same "prove it before trusting it" discipline
 > as every other opt-in flag in this file.
 
+**Addendum 2026-08-01 — the SAME session, Joey pushed further: three concrete hypotheses for WHY
+(hedging, market microstructure, a directly skip-able common feature), checked against real data,
+and one answered the strongest.**
+
+> **Hedging** — not deeply pursued. Checking it properly needs each source wallet's FULL external
+> trade history (every market they touch, not just the ones we copied), a heavier live-API
+> investigation. Deprioritized once a much stronger, already-logged signal turned up on the other
+> two questions — flagged honestly as a real gap, not silently dropped, in case it's worth returning
+> to later.
+>
+> **Market microstructure** — checked directly via `measure_paper_shortfall()`'s own historical
+> `shortfall_status`/`executable_price` fields, already logged on every BUY (`bot_event_log.
+> payload_json`), no new instrumentation needed. Median entry slippage, on the minority of buys where
+> a live book WAS readable, is a real +3.46% (we pay more than the source's reported price) — genuine
+> cost, but the mean (32.8%) is a red herring dominated by percentage math on near-zero longshot
+> prices (e.g. $0.002 → $0.07 reads as "3494% slippage" for a two-tick move), the same distortion
+> `EQUITY_MARK_MIN_ENTRY_PRICE`/`PER_TRADE_ENTRY_PRICE_FLOOR` already guard against elsewhere.
+>
+> **Common/unique skip feature — found, and it's large.** Grouping ALL 373 non-strict-7 closed trades
+> by `shortfall_status` at entry (not by `close_reason` this time) splits the ENTIRE portfolio
+> cleanly: trades where the book genuinely couldn't be read (`shortfall_status != "ok"`, 296 trades)
+> account for **-$194.93 of the total -$211.10 net loss (92.3%)** — trades where a real book WAS
+> readable (76 trades) are roughly breakeven (-$16.18). Drilling into WHY the book read fails: 746 of
+> 786 `preview_unavailable` events across the full history are the SAME underlying cause — a direct
+> CLOB `HTTP 404: No orderbook exists for the requested token` — the exchange itself confirming no
+> one is making a market there, not a flaky fetch or transient network issue. The single biggest
+> losing wallet (`0x5b4ec9c0...`, -$360) had **100% (72/72)** of its copies land in this bucket.
+>
+> **The gap this exposes**: `LIVE_MODE`'s own `check_spread_tolerance()` would already refuse an
+> entry with no readable book — but `measure_paper_shortfall()` is deliberately "MEASUREMENT ONLY"
+> (Rule 32, kept that way so historical paper stats stay comparable across time), so paper mode has
+> been quietly COPYING trades that live mode would never actually take. **Mechanism**: `config.
+> ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE` (default `False`, confirmed with Joey via `AskUserQuestion`)
+> — when on, `_execute_buy()`'s paper-mode branch skips the trade outright
+> (`skip_no_orderbook_liquidity`) instead of falling back to the source price, closing the paper/live
+> inconsistency directly. Default off so this flag's own skip-event bucket can accumulate real data
+> before deciding to enable it, same discipline as Time-Decay Loss Cut just above.
+
 ---
 
 ## 32. Paper accounting grounded in real fillable prices, not the whale's own fill (2026-07-26)

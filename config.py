@@ -953,6 +953,35 @@ ENABLE_TIME_DECAY_LOSS_CUT = False
 TIME_DECAY_LOSS_CUT_PEAK_FLOOR_PCT = 0.05
 TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION = 0.20
 
+# Orderbook Liquidity Entry Gate (2026-08-01) — a follow-up to Time-Decay
+# Loss Cut's own investigation, same item-5 root-cause chase. Joey asked
+# directly whether these losses trace to hedging behavior, market
+# microstructure cost, or a common/unique skip-able feature — checked all
+# three against real data before proposing anything. Hedging wasn't deeply
+# pursued (would need each wallet's full external trade history) because a
+# far stronger, ALREADY-LOGGED signal turned up first: every paper BUY
+# already calls measure_paper_shortfall() to try reading a live CLOB
+# orderbook, and 92.3% of the entire non-strict-7 portfolio's net loss
+# (-$194.93 of -$211.10) sits in the bucket where that read failed
+# (shortfall_status != "ok") — 746 of those 786 failures were a direct CLOB
+# 404, "No orderbook exists for the requested token," not a flaky fetch.
+# The single biggest losing wallet had 100% (72/72) of its copies land in
+# this bucket. Trades that DID get a real book read were roughly breakeven
+# (-$16.18 across 76 trades).
+#
+# The gap this closes: LIVE_MODE's own check_spread_tolerance() would
+# already refuse an entry with no readable book (would_have_passed_
+# spread_gate=False on this exact path) — but measure_paper_shortfall() is
+# explicitly "MEASUREMENT ONLY, by design" (kept that way so historical
+# paper stats stay comparable), so paper mode has been quietly copying
+# trades live mode would already reject.
+#
+# Default False, deliberately — confirmed with Joey via AskUserQuestion:
+# let this flag's own skip_no_orderbook_liquidity bucket accumulate real
+# data before deciding whether to actually enable it, same "prove it
+# before enabling" discipline as Time-Decay Loss Cut just above.
+ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE = False
+
 # Kill switch: portfolio equity is defined as PAPER_BANKROLL_USD + realized
 # PnL + unrealized PnL (unrealized comes from the trailing-TP sweep's price
 # fetches, so equity refreshes every TRAILING_TP_CHECK_INTERVAL_SECONDS ~5
