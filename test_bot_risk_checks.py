@@ -999,6 +999,17 @@ class TestProcessTradeScoreSnapshot(unittest.TestCase):
     compute_trade_size_usd()'s own tier logic, and that the returned
     decision_journal id lands on the position as last_decision_journal_id."""
 
+    def setUp(self):
+        # Unrelated to what this class tests -- an empty measure_paper_
+        # shortfall mock (shortfall_status != "ok") would otherwise get
+        # skipped by the liquidity gate (default True as of 2026-08-01)
+        # before ever reaching the score-snapshot logic under test here.
+        self._saved_gate = config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE
+        config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE = False
+
+    def tearDown(self):
+        config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE = self._saved_gate
+
     def _base_kwargs(self, wallet_score_entry):
         return dict(
             trade={
@@ -1124,11 +1135,18 @@ class TestDepthAwareTradeSizing(unittest.TestCase):
     instead of hitting the network."""
 
     def setUp(self):
-        self._saved = (config.ENABLE_DEPTH_AWARE_TRADE_SIZING, config.TRADE_SIZE_DEPTH_FRACTION)
+        self._saved = (config.ENABLE_DEPTH_AWARE_TRADE_SIZING, config.TRADE_SIZE_DEPTH_FRACTION,
+                        config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE)
         config.TRADE_SIZE_DEPTH_FRACTION = 0.05
+        # Unrelated to what this class tests -- these mocks return an empty
+        # shortfall (shortfall_status != "ok"), which the liquidity gate
+        # (default True as of 2026-08-01) would otherwise skip before ever
+        # reaching the depth-cap logic under test here.
+        config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE = False
 
     def tearDown(self):
-        config.ENABLE_DEPTH_AWARE_TRADE_SIZING, config.TRADE_SIZE_DEPTH_FRACTION = self._saved
+        (config.ENABLE_DEPTH_AWARE_TRADE_SIZING, config.TRADE_SIZE_DEPTH_FRACTION,
+         config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE) = self._saved
 
     def _base_kwargs(self):
         # composite_win_rate=0.9 vs price=0.5 -> a large positive Kelly
@@ -1361,6 +1379,19 @@ class TestExecuteBuyExtraction(unittest.TestCase):
     this exercises it directly, independent of process_trade, so a future
     change to either caller can't silently stop covering it."""
 
+    def setUp(self):
+        # config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE defaults True as of
+        # 2026-08-01 -- most tests in this class use an unmeasurable/empty
+        # shortfall (shortfall_status != "ok") as their baseline setup for
+        # UNRELATED behavior, which the gate would otherwise skip. Off here
+        # by default; the liquidity-gate-specific tests below patch it back
+        # on individually.
+        self._saved_gate = config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE
+        config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE = False
+
+    def tearDown(self):
+        config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE = self._saved_gate
+
     def _base_event(self):
         return {"timestamp": "t", "trader_address": "0xTrader", "trader_nickname": "nick",
                 "market_slug": "some-market", "outcome": "Yes", "side": "BUY",
@@ -1460,10 +1491,12 @@ class TestExecuteBuyExtraction(unittest.TestCase):
         self.assertAlmostEqual(pos["shares"], 20.0)  # 10 usd / source price 0.5, unchanged
         self.assertAlmostEqual(pos["cost_basis_usd"], 10.0)
 
-    def test_liquidity_gate_off_by_default_still_falls_back_to_source_price(self):
-        # config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE defaults False --
-        # unpatched here on purpose, confirming the real default preserves
-        # today's behavior.
+    def test_liquidity_gate_off_still_falls_back_to_source_price(self):
+        # config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE is False via this
+        # class's own setUp() -- confirms the pre-2026-08-01 fallback
+        # behavior is unchanged when the gate is off (the real default
+        # flipped to True the same day this flag was built, once Joey
+        # reviewed the finding -- see config.py's own comment).
         positions = {}
         risk_state = {"market_to_event": {"some-market": "some-event"}, "kill_switch": None}
         shortfall = {"shortfall_status": "preview_unavailable", "shortfall_error": "404"}

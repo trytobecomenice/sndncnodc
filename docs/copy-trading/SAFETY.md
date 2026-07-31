@@ -4098,3 +4098,32 @@ intentional actions already documented elsewhere in this file, not unexplained d
 **Tests**: `TestForceIpv4Dns` +3 in `test_telegram_alerts.py` (getaddrinfo patched to AF_INET-only,
 restored even on exception, send_telegram_alert() actually uses the scope around request/getresponse
 and not just construction). 571 Python tests passing (was 568).
+
+## 66. Orderbook Liquidity Entry Gate flipped ON (Rule 26/31 addendum, 2026-08-01)
+
+**Trigger**: Sec.64 shipped the gate default-off, deliberately, pending its own real-data validation
+window — same discipline as every other opt-in flag in this codebase. Joey reviewed the finding
+directly and asked to flip it on immediately rather than wait, given how the evidence was built: not
+a live sample slowly accumulating confidence, but a full reconstruction of 373 already-closed
+historical trades where 92.3% of net loss traces to a single mechanical cause (a CLOB 404 the
+exchange itself returns for a token nobody is market-making). That bar is different from — and
+stronger than — the "let it run and prove itself" reasoning used for Time-Decay Loss Cut (Sec.63),
+which stays off.
+
+**What changed**: `config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE = True` (was `False`). No code change
+beyond the flag itself and its docstring — the mechanism was already fully built and tested in Sec.64.
+
+**Real, stated cost**: paper trade volume will drop noticeably — 296 of the last 373 non-strict-7
+closes entered via exactly the bucket this gate now skips. Traded off deliberately: fewer signals
+copied, against not deploying paper capital into markets already shown to have no exit liquidity
+either.
+
+**Test fallout from the default flip**: three unrelated test classes
+(`TestDepthAwareTradeSizing`, `TestExecuteBuyExtraction`, `TestProcessTradeScoreSnapshot`) used an
+empty/unmeasurable `measure_paper_shortfall()` mock (`shortfall_status != "ok"`) as their baseline
+setup for testing OTHER behavior (depth-aware sizing, ledger writes, score-breakdown snapshots) — the
+gate defaulting True now skips those mocked buys before the logic under test ever runs. Fixed by
+adding `config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE = False` to each class's own `setUp()`/
+`tearDown()`, scoped to exactly the classes affected — the liquidity-gate-specific tests in
+`TestExecuteBuyExtraction` (Sec.64) still patch it back on individually where they need to. 571
+Python tests passing, unchanged in count (this was a fix to existing tests, not new coverage).

@@ -2846,11 +2846,18 @@ and one answered the strongest.**
 > entry with no readable book — but `measure_paper_shortfall()` is deliberately "MEASUREMENT ONLY"
 > (Rule 32, kept that way so historical paper stats stay comparable across time), so paper mode has
 > been quietly COPYING trades that live mode would never actually take. **Mechanism**: `config.
-> ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE` (default `False`, confirmed with Joey via `AskUserQuestion`)
-> — when on, `_execute_buy()`'s paper-mode branch skips the trade outright
-> (`skip_no_orderbook_liquidity`) instead of falling back to the source price, closing the paper/live
-> inconsistency directly. Default off so this flag's own skip-event bucket can accumulate real data
-> before deciding to enable it, same discipline as Time-Decay Loss Cut just above.
+> ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE` — when on, `_execute_buy()`'s paper-mode branch skips the
+> trade outright (`skip_no_orderbook_liquidity`) instead of falling back to the source price, closing
+> the paper/live inconsistency directly.
+
+**Addendum 2026-08-01, same day — flipped ON.** Unlike Time-Decay Loss Cut just above (a genuinely
+new exit rationale riding on zero track record), Joey reviewed this finding and chose not to wait for
+a further validation window: the 92.3%-of-losses signal is a RECONSTRUCTION of 373 already-closed
+historical trades tracing to a mechanical, unambiguous cause (a CLOB 404 the exchange itself returns),
+not a soft correlation earned from a small live sample. Real, stated-plainly cost: paper trade volume
+drops noticeably (296 of the last 373 non-strict-7 closes entered via exactly this bucket) — fewer
+copies tracked, in exchange for not deploying paper capital into markets with provably no exit
+liquidity either.
 
 ---
 

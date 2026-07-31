@@ -976,11 +976,18 @@ TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION = 0.20
 # paper stats stay comparable), so paper mode has been quietly copying
 # trades live mode would already reject.
 #
-# Default False, deliberately — confirmed with Joey via AskUserQuestion:
-# let this flag's own skip_no_orderbook_liquidity bucket accumulate real
-# data before deciding whether to actually enable it, same "prove it
-# before enabling" discipline as Time-Decay Loss Cut just above.
-ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE = False
+# Flipped ON 2026-08-01, same day, after Joey reviewed the finding above.
+# Unlike Time-Decay Loss Cut (a genuinely new exit rationale with zero
+# track record), this isn't a hypothesis riding on a small sample — it's a
+# RECONSTRUCTION of 373 already-closed historical trades, where the
+# 92.3%-of-losses signal traces to a mechanical, unambiguous cause (a CLOB
+# 404 the exchange itself returns), not a soft correlation. Flipped on
+# without a further wait-and-watch period for that reason. Real cost,
+# stated plainly: paper trade VOLUME will drop noticeably (296 of the last
+# 373 non-strict-7 closes entered via this exact bucket) — fewer copies
+# tracked in exchange for not deploying paper capital into markets with
+# provably no exit liquidity either.
+ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE = True
 
 # Kill switch: portfolio equity is defined as PAPER_BANKROLL_USD + realized
 # PnL + unrealized PnL (unrealized comes from the trailing-TP sweep's price
