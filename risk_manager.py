@@ -102,29 +102,78 @@ def wallet_exposure_usd(positions, wallet_address):
     return total
 
 
-def wallet_exposure_cap_usd(wallet_address):
-    """The per-wallet exposure cap that actually applies to `wallet_address`
-    -- config.VIP_WALLET_EXPOSURE_CAP_USD (2026-07-26, manually curated
-    override for proven, high-EV, high-volume wallets, e.g. strict-7 and
-    political-whale-1) takes precedence over the flat
-    config.MAX_WALLET_EXPOSURE_USD when the wallet has an entry. Matched
-    case-insensitively, same reasoning as wallet_exposure_usd() -- a VIP
-    override keyed to one casing must not silently fail to apply just
-    because this specific call arrived in the other casing.
+def compute_wallet_ev_cap_usd(ev_pct, trade_count, base_cap=None, scale=None,
+                               min_cap=None, max_cap=None, pseudo_count=None,
+                               ev_clip=None):
+    """Automatic EV-scaled per-wallet exposure cap (2026-07-31) — see
+    config.WALLET_EV_CAP_SCALE's docstring for the full rationale
+    (replaces config.VIP_WALLET_EXPOSURE_CAP_USD's manual, one-time
+    curation, found stale by 5 days the next time anyone checked it).
 
-    Deliberately a manual, address-keyed dict rather than a scored/
-    automatic tier: with the EV-based circuit breaker (Rule 35) and Shadow
-    Rehab still new, there isn't yet a trustworthy automatic signal to key
-    a bigger capital allocation off -- a human decision for now, same
-    status as TRACKED_TRADERS membership itself.
+    shrunk_ev = (trade_count * clip(ev_pct, +/-ev_clip) + pseudo_count * 0)
+    / (trade_count + pseudo_count) — the same Beta-Binomial shrinkage SHAPE
+    as bot.compute_shrunk_win_rate() (Kelly sizing), shrinking toward 0 edge
+    (the "no evidence yet" null) rather than the market price this time,
+    since EV-per-dollar has no natural "implied probability" target the way
+    win_rate does. ev_pct is clipped BEFORE shrinking so a single extreme
+    trade (e.g. a $5 buy at a $0.002 entry resolving YES is a genuine
+    +2400% return) can't swing a wallet's whole cap off one data point.
+
+    cap = clamp(base_cap + scale * shrunk_ev * base_cap, min_cap, max_cap).
+    A wallet with no closed trades yet (trade_count in (None, 0) or
+    ev_pct is None) gets exactly base_cap — "no evidence" must mean "the
+    flat default", not a guess in either direction. Pure function, no DB —
+    bot.py fetches ev_pct/trade_count once via db.get_wallet_realized_ev_stats().
+    """
+    base_cap = base_cap if base_cap is not None else config.MAX_WALLET_EXPOSURE_USD
+    if ev_pct is None or not trade_count:
+        return base_cap
+    scale = scale if scale is not None else config.WALLET_EV_CAP_SCALE
+    min_cap = min_cap if min_cap is not None else config.WALLET_EV_CAP_MIN_USD
+    max_cap = max_cap if max_cap is not None else config.WALLET_EV_CAP_MAX_USD
+    pseudo_count = pseudo_count if pseudo_count is not None else config.KELLY_SHRINKAGE_PSEUDO_COUNT
+    ev_clip = ev_clip if ev_clip is not None else config.WALLET_EV_CAP_CLIP_PCT
+
+    clipped_ev = max(-ev_clip, min(ev_clip, ev_pct))
+    shrunk_ev = (trade_count * clipped_ev) / (trade_count + pseudo_count)
+    cap = base_cap + scale * shrunk_ev * base_cap
+    return max(min_cap, min(max_cap, cap))
+
+
+def wallet_exposure_cap_usd(wallet_address, ev_stats=None):
+    """The per-wallet exposure cap that actually applies to `wallet_address`.
+    Priority order (2026-07-31):
+      1. config.VIP_WALLET_EXPOSURE_CAP_USD — an explicit MANUAL override,
+         kept for a human to hard-set one wallet's cap regardless of the
+         formula (e.g. a wallet whose live EV shouldn't be trusted for some
+         out-of-band reason). Empty by default now — see that constant's
+         own comment for why this is no longer the primary mechanism.
+      2. compute_wallet_ev_cap_usd(), fed by `ev_stats` (bot.py's
+         db.get_wallet_realized_ev_stats(), fetched once at startup like
+         wallet_scores) — the automatic, evidence-based cap.
+      3. The flat config.MAX_WALLET_EXPOSURE_USD default, if `ev_stats` is
+         None or has no entry for this wallet (e.g. a freshly-tracked
+         wallet with zero closed trades yet).
+    Matched case-insensitively throughout — an override/ev_stats entry
+    keyed to one casing must not silently fail to apply just because this
+    specific call arrived in the other casing.
 
     Returns None if no wallet-level cap applies at all (mirrors
-    config.MAX_WALLET_EXPOSURE_USD's own None-disables convention).
+    config.MAX_WALLET_EXPOSURE_USD's own None-disables convention) — only
+    possible if wallet_address itself is None, since every other path
+    below always resolves to a real number.
     """
     if wallet_address is None:
         return config.MAX_WALLET_EXPOSURE_USD
-    override = config.VIP_WALLET_EXPOSURE_CAP_USD.get(wallet_address.lower())
-    return override if override is not None else config.MAX_WALLET_EXPOSURE_USD
+    wallet_lower = wallet_address.lower()
+    override = config.VIP_WALLET_EXPOSURE_CAP_USD.get(wallet_lower)
+    if override is not None:
+        return override
+    if ev_stats is not None:
+        stats = ev_stats.get(wallet_lower)
+        if stats is not None:
+            return compute_wallet_ev_cap_usd(stats.get("ev_pct"), stats.get("trade_count"))
+    return config.MAX_WALLET_EXPOSURE_USD
 
 
 def depth_capped_trade_size_usd(trade_size_usd, book_depth_usd, depth_fraction):
@@ -152,7 +201,8 @@ def depth_capped_trade_size_usd(trade_size_usd, book_depth_usd, depth_fraction):
     return min(trade_size_usd, book_depth_usd * depth_fraction)
 
 
-def check_buy(positions, market_to_event, event_slug, trade_usd, kill_switch, wallet_address=None):
+def check_buy(positions, market_to_event, event_slug, trade_usd, kill_switch, wallet_address=None,
+               wallet_ev_stats=None):
     """The pre-BUY risk gate. Returns (ok, skip_event_type, reason):
     (True, None, None) if the BUY may proceed, otherwise ok=False with the
     bot_event_log event_type to log and a human-readable reason.
@@ -162,15 +212,18 @@ def check_buy(positions, market_to_event, event_slug, trade_usd, kill_switch, wa
       2. total exposure ceiling
       3. per-event cap
       4. per-wallet cap (added 2026-07-24, Rule 26 — see
-         wallet_exposure_usd()'s docstring; 2026-07-26 addendum: this cap
-         can be individually raised per wallet via
-         config.VIP_WALLET_EXPOSURE_CAP_USD, see wallet_exposure_cap_usd())
+         wallet_exposure_usd()'s docstring; 2026-07-31: this cap is now
+         automatically EV-scaled per wallet via `wallet_ev_stats` — see
+         wallet_exposure_cap_usd()/compute_wallet_ev_cap_usd())
     Limits use strict 'would exceed' semantics: a BUY landing exactly ON a
     limit is allowed; the first dollar past it is not. Any limit set to
     None in config is disabled. wallet_address defaults to None (which,
     combined with config.MAX_WALLET_EXPOSURE_USD's own None-disables
     check below, means callers that don't pass it simply skip check 4 —
     no call site is forced to change just because this parameter exists).
+    wallet_ev_stats defaults to None (falls back to the flat default cap
+    for every wallet, same as omitting it entirely — existing callers that
+    don't have this data yet don't have to change either).
     """
     if kill_switch:
         reasons = kill_switch.get("reasons") if isinstance(kill_switch, dict) else None
@@ -197,7 +250,7 @@ def check_buy(positions, market_to_event, event_slug, trade_usd, kill_switch, wa
             )
 
     if wallet_address is not None:
-        wallet_cap = wallet_exposure_cap_usd(wallet_address)
+        wallet_cap = wallet_exposure_cap_usd(wallet_address, ev_stats=wallet_ev_stats)
         if wallet_cap is not None:
             current = wallet_exposure_usd(positions, wallet_address)
             if current + trade_usd > wallet_cap:

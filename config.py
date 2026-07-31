@@ -673,27 +673,48 @@ MAX_EVENT_EXPOSURE_USD = 30.0
 # risk_manager.wallet_exposure_usd().
 MAX_WALLET_EXPOSURE_USD = 50.0
 
-# VIP override, per wallet, of MAX_WALLET_EXPOSURE_USD above (2026-07-26,
-# Rule 35) -- proven, high-EV, high-volume wallets get a higher individual
-# cap so their edge isn't left underdeployed at the same flat $50 limit as
-# an unproven wallet. Manually curated, address-keyed (lowercase — see
-# risk_manager.wallet_exposure_cap_usd()), not automatic: with the
-# EV-based circuit breaker and Shadow Rehab (below) still new, there isn't
-# yet a trustworthy automatic signal to key a bigger allocation off, so
-# this is a human decision for now, same status as TRACKED_TRADERS
-# membership itself. MAX_TOTAL_EXPOSURE_USD (the portfolio-wide ceiling)
-# still applies on top regardless -- this only raises the per-wallet
-# sub-limit, never the total pot.
-VIP_WALLET_EXPOSURE_CAP_USD = {
-    # strict-7: 31 closed trades, +44.6% EV/dollar-staked, +$56.83 total
-    # P&L, 74% win rate -- highest-volume strong performer of any tracked
-    # wallet (2026-07-26 Rule 34 review).
-    "0x65018f9fc473f6e920b8929a375d39c26a461220": 150.0,
-    # political-whale-1: 4 closed trades, +183.9% EV/dollar-staked,
-    # +$36.52 total P&L, 75% win rate -- best EV of any tracked wallet,
-    # smaller sample than strict-7 so a more conservative cap.
-    "0x510904c9a58f5c5ad799a1b44947077564175e9c": 100.0,
-}
+# Manual override, per wallet, of MAX_WALLET_EXPOSURE_USD above (2026-07-26,
+# Rule 35). ROLE CHANGED 2026-07-31: this used to be the ONLY mechanism for
+# a wallet-specific cap (a hand-curated snapshot, address-keyed lowercase —
+# see risk_manager.wallet_exposure_cap_usd()) -- found stale by 5 days the
+# next time anyone looked at it: strict-7's real sample had grown from 31 to
+# 200 closed trades and its EV from +44.6% to +70.3%, yet its cap sat frozen
+# at the same $150 the whole time. Superseded by the automatic EV-scaled cap
+# below (compute_wallet_ev_cap_usd(), fed by db.get_wallet_realized_ev_stats())
+# for the common case; this dict is now ONLY for a human to hard-set a
+# specific wallet's cap regardless of what the formula would compute (e.g. a
+# wallet whose live EV shouldn't be trusted for some out-of-band reason) --
+# takes precedence over the formula when set. Empty by default now that the
+# formula is the real mechanism. MAX_TOTAL_EXPOSURE_USD (the portfolio-wide
+# ceiling) still applies on top regardless either way.
+VIP_WALLET_EXPOSURE_CAP_USD = {}
+
+# Automatic EV-scaled per-wallet exposure cap (2026-07-31) — replaces
+# VIP_WALLET_EXPOSURE_CAP_USD's manual curation as the default mechanism (see
+# that constant's updated comment for why). risk_manager.
+# compute_wallet_ev_cap_usd() computes, per wallet: shrunk_ev = (n *
+# clip(ev_pct, +/-WALLET_EV_CAP_CLIP_PCT) + KELLY_SHRINKAGE_PSEUDO_COUNT * 0)
+# / (n + KELLY_SHRINKAGE_PSEUDO_COUNT) -- the SAME Beta-Binomial shrinkage
+# shape bot.compute_shrunk_win_rate() already uses for Kelly sizing, shrunk
+# toward 0 edge (not the market price this time, since EV-per-dollar has no
+# natural "implied probability" target) — then cap = clamp(base +
+# WALLET_EV_CAP_SCALE * shrunk_ev * base, MIN, MAX). A wallet with NO closed
+# trades yet gets exactly the flat MAX_WALLET_EXPOSURE_USD base, not a guess.
+#
+# Investigated live 2026-07-31 (Joey's own question: "is our PnL too
+# concentrated in one wallet?"): confirmed yes — of $699.63 total realized
+# PnL across every tracked wallet, $907.65 came from ONE wallet
+# (strict-7) — without it the bot's entire track record would be net
+# NEGATIVE (-$208.02). Raising that one wallet's cap further (which the
+# formula does, since its EV is genuinely the strongest) increases
+# concentration in exactly the wallet the bot's whole track record already
+# depends on — WALLET_EV_CAP_MAX_USD is set as a fraction of the total
+# exposure ceiling specifically to bound how far any single wallet can go,
+# not left unbounded just because the formula likes it.
+WALLET_EV_CAP_SCALE = 1.0
+WALLET_EV_CAP_MIN_USD = 20.0
+WALLET_EV_CAP_MAX_USD = 0.15 * MAX_TOTAL_EXPOSURE_USD  # $187.50 at the current $1250 ceiling
+WALLET_EV_CAP_CLIP_PCT = 1.0  # clip a single wallet's ev_pct to +/-100% before shrinking
 
 # Depth-Aware Trade Sizing (added 2026-07-28) — clamps a SINGLE trade's own
 # size to a fraction of ITS market's visible order-book depth

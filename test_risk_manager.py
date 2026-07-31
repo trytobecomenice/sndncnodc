@@ -25,7 +25,9 @@ class ConfigPatchingTestCase(unittest.TestCase):
 
     PATCHED = ("MAX_TOTAL_EXPOSURE_USD", "MAX_EVENT_EXPOSURE_USD", "MAX_WALLET_EXPOSURE_USD",
                "PAPER_BANKROLL_USD", "EQUITY_FLOOR_USD", "MAX_DRAWDOWN_FROM_PEAK_USD",
-               "VIP_WALLET_EXPOSURE_CAP_USD", "EQUITY_MARK_MIN_ENTRY_PRICE")
+               "VIP_WALLET_EXPOSURE_CAP_USD", "EQUITY_MARK_MIN_ENTRY_PRICE",
+               "WALLET_EV_CAP_SCALE", "WALLET_EV_CAP_MIN_USD", "WALLET_EV_CAP_MAX_USD",
+               "WALLET_EV_CAP_CLIP_PCT", "KELLY_SHRINKAGE_PSEUDO_COUNT")
 
     def setUp(self):
         self._saved = {name: getattr(config, name) for name in self.PATCHED}
@@ -124,6 +126,126 @@ class TestVipWalletExposureCap(ConfigPatchingTestCase):
             positions, {}, "ev", 20.0, None, wallet_address="0xregular")
         self.assertFalse(ok)
         self.assertEqual(event_type, "skip_risk_wallet_cap")
+
+
+class TestComputeWalletEvCapUsd(ConfigPatchingTestCase):
+    """Automatic EV-scaled per-wallet exposure cap (2026-07-31) — replaces
+    config.VIP_WALLET_EXPOSURE_CAP_USD's manual, one-time curation, found
+    stale by 5 days the next time anyone checked it (a wallet's real sample
+    had grown 31->200 trades and its EV +44.6%->+70.3%, cap frozen at $150
+    the whole time). Investigated live the same night: of $699.63 total
+    realized PnL across every tracked wallet, $907.65 came from ONE wallet
+    -- without it the bot's whole track record would be net NEGATIVE
+    (-$208.02) -- which is exactly why WALLET_EV_CAP_MAX_USD exists as a
+    hard ceiling, not just "let the strongest wallet's cap grow unbounded."
+    """
+
+    def setUp(self):
+        super().setUp()
+        config.MAX_WALLET_EXPOSURE_USD = 50.0
+        config.WALLET_EV_CAP_SCALE = 1.0
+        config.WALLET_EV_CAP_MIN_USD = 20.0
+        config.WALLET_EV_CAP_MAX_USD = 200.0
+        config.WALLET_EV_CAP_CLIP_PCT = 1.0
+        config.KELLY_SHRINKAGE_PSEUDO_COUNT = 25
+
+    def test_no_trade_count_returns_flat_base_cap(self):
+        self.assertEqual(risk_manager.compute_wallet_ev_cap_usd(0.703, None), 50.0)
+
+    def test_zero_trade_count_returns_flat_base_cap(self):
+        self.assertEqual(risk_manager.compute_wallet_ev_cap_usd(0.703, 0), 50.0)
+
+    def test_none_ev_pct_returns_flat_base_cap(self):
+        self.assertEqual(risk_manager.compute_wallet_ev_cap_usd(None, 200), 50.0)
+
+    def test_strong_positive_ev_with_large_sample_raises_the_cap(self):
+        # Real data: n=200, ev=+70.3% -> shrunk_ev = 200*0.703/225 = 0.625
+        # -> cap = 50 + 1.0*0.625*50 = 81.25
+        cap = risk_manager.compute_wallet_ev_cap_usd(0.703, 200)
+        self.assertAlmostEqual(cap, 81.25, places=1)
+
+    def test_negative_ev_with_large_sample_lowers_the_cap_below_base(self):
+        # Real data: n=97, ev=-13.2% -> shrunk_ev = 97*-0.132/122 = -0.105
+        # -> cap = 50 + 1.0*-0.105*50 = 44.74
+        cap = risk_manager.compute_wallet_ev_cap_usd(-0.132, 97)
+        self.assertLess(cap, 50.0)
+        self.assertAlmostEqual(cap, 44.74, places=1)
+
+    def test_tiny_sample_barely_moves_the_cap_regardless_of_extreme_ev(self):
+        # Real data: n=1, ev=+1400% -- even fully un-clipped this would be
+        # a huge number; clipped to +/-100% first, then n=1 shrinks it to
+        # almost nothing: shrunk_ev = 1*1.0/26 = 0.0385 -> cap ~= 51.9.
+        cap = risk_manager.compute_wallet_ev_cap_usd(14.0, 1)
+        self.assertLess(cap, 55.0)
+        self.assertGreater(cap, 50.0)
+
+    def test_extreme_ev_is_clipped_before_shrinking(self):
+        # Without clipping, n=1 ev=1400% would shrink to 1*14/26=0.538 ->
+        # cap=76.9. With clipping to +/-100%, it's 1*1.0/26=0.0385 -> ~51.9.
+        # Confirms the clip actually applies, not just present in the signature.
+        clipped_cap = risk_manager.compute_wallet_ev_cap_usd(14.0, 1)
+        self.assertLess(clipped_cap, 60.0)
+
+    def test_extreme_negative_ev_with_large_sample_clamps_to_min_cap(self):
+        # Real data: n=40, ev=-100% (every closed trade a total loss) ->
+        # shrunk_ev = 40*-1.0/65 = -0.615 -> cap = 50-30.75=19.25, clamped
+        # up to the MIN_CAP floor of 20.
+        cap = risk_manager.compute_wallet_ev_cap_usd(-1.0, 40)
+        self.assertEqual(cap, 20.0)
+
+    def test_extreme_positive_ev_with_large_sample_clamps_to_max_cap(self):
+        config.WALLET_EV_CAP_MAX_USD = 60.0  # a tight ceiling for this test
+        cap = risk_manager.compute_wallet_ev_cap_usd(1.0, 1000)  # huge n, ev clipped to 100%
+        self.assertEqual(cap, 60.0)
+
+    def test_scale_zero_always_returns_the_flat_base_cap(self):
+        config.WALLET_EV_CAP_SCALE = 0.0
+        self.assertAlmostEqual(risk_manager.compute_wallet_ev_cap_usd(0.703, 200), 50.0)
+
+
+class TestWalletExposureCapUsdWithEvStats(ConfigPatchingTestCase):
+    """wallet_exposure_cap_usd()'s priority order (2026-07-31): manual VIP
+    override > automatic EV-scaled formula > flat default."""
+
+    def setUp(self):
+        super().setUp()
+        config.MAX_WALLET_EXPOSURE_USD = 50.0
+        config.VIP_WALLET_EXPOSURE_CAP_USD = {}
+        config.WALLET_EV_CAP_SCALE = 1.0
+        config.WALLET_EV_CAP_MIN_USD = 20.0
+        config.WALLET_EV_CAP_MAX_USD = 200.0
+        config.WALLET_EV_CAP_CLIP_PCT = 1.0
+
+    def test_no_ev_stats_at_all_falls_back_to_flat_cap(self):
+        self.assertEqual(risk_manager.wallet_exposure_cap_usd("0xabc"), 50.0)
+
+    def test_wallet_missing_from_ev_stats_falls_back_to_flat_cap(self):
+        ev_stats = {"0xother": {"ev_pct": 0.7, "trade_count": 200}}
+        self.assertEqual(risk_manager.wallet_exposure_cap_usd("0xabc", ev_stats=ev_stats), 50.0)
+
+    def test_wallet_in_ev_stats_gets_the_computed_formula_cap(self):
+        ev_stats = {"0xabc": {"ev_pct": 0.703, "trade_count": 200}}
+        cap = risk_manager.wallet_exposure_cap_usd("0xabc", ev_stats=ev_stats)
+        self.assertAlmostEqual(cap, 81.25, places=1)
+
+    def test_ev_stats_lookup_is_case_insensitive(self):
+        ev_stats = {"0xabc": {"ev_pct": 0.703, "trade_count": 200}}
+        cap = risk_manager.wallet_exposure_cap_usd("0xABC", ev_stats=ev_stats)
+        self.assertAlmostEqual(cap, 81.25, places=1)
+
+    def test_manual_vip_override_still_wins_over_the_formula(self):
+        config.VIP_WALLET_EXPOSURE_CAP_USD = {"0xabc": 999.0}
+        ev_stats = {"0xabc": {"ev_pct": 0.703, "trade_count": 200}}
+        self.assertEqual(risk_manager.wallet_exposure_cap_usd("0xabc", ev_stats=ev_stats), 999.0)
+
+    def test_check_buy_uses_the_ev_scaled_cap(self):
+        ev_stats = {"0xabc": {"ev_pct": 0.703, "trade_count": 200}}
+        positions = {"0xabc|m1|Yes": pos(70.0)}
+        # $70 existing + $10 new = $80, over the flat $50 but under the
+        # formula's ~$81.25 -- must be allowed.
+        ok, event_type, reason = risk_manager.check_buy(
+            positions, {}, "ev", 10.0, None, wallet_address="0xabc", wallet_ev_stats=ev_stats)
+        self.assertTrue(ok)
 
 
 class TestDepthCappedTradeSizeUsd(unittest.TestCase):

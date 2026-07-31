@@ -1279,7 +1279,7 @@ def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_
 
 
 def sweep_pending_executions(positions, source_positions, source_cost_basis,
-                              tracked_by_lower, risk_state, wallet_scores):
+                              tracked_by_lower, risk_state, wallet_scores, wallet_ev_stats=None):
     """Rule 29's TTL/rebound/whale-hold sweep (2026-07-24) — runs every poll
     cycle (see main()), one 'pending' row at a time, oldest first. For each:
 
@@ -1403,6 +1403,7 @@ def sweep_pending_executions(positions, source_positions, source_cost_basis,
             decision_journal_id = _execute_buy(
                 base_event, key, wallet_address, market_slug, outcome, current_price,
                 order["target_usd"], event_slug, score_breakdown, positions, risk_state,
+                wallet_ev_stats=wallet_ev_stats,
             )
             if decision_journal_id:
                 close_pending_execution(order["id"], "filled", filled_at=int(now))
@@ -1424,7 +1425,7 @@ def sweep_pending_executions(positions, source_positions, source_cost_basis,
 
 def sweep_live_whale_events(positions, source_positions, source_cost_basis, trader_performance,
                              muted_traders, tracked_by_lower, risk_state, wallet_scores,
-                             shadow_positions=None):
+                             shadow_positions=None, wallet_ev_stats=None):
     """Consumer sweep (2026-07-24) for wss_listener.py's/token_sync_worker.py's
     producer tables (live_whale_event / token_registry) — run every poll
     cycle, same "zero-latency, don't gate on an interval" reasoning as
@@ -1507,7 +1508,8 @@ def sweep_live_whale_events(positions, source_positions, source_cost_basis, trad
         try:
             _handle_matched_whale_event(event, positions, source_positions, source_cost_basis,
                                          trader_performance, muted_traders, tracked_by_lower,
-                                         risk_state, wallet_scores, shadow_positions=shadow_positions)
+                                         risk_state, wallet_scores, shadow_positions=shadow_positions,
+                                         wallet_ev_stats=wallet_ev_stats)
         finally:
             mark_whale_event_consumed(event["id"])
 
@@ -1542,7 +1544,7 @@ def sweep_live_whale_events(positions, source_positions, source_cost_basis, trad
             _handle_matched_whale_event(event_with_market, positions, source_positions,
                                          source_cost_basis, trader_performance, muted_traders,
                                          tracked_by_lower, risk_state, wallet_scores,
-                                         shadow_positions=shadow_positions)
+                                         shadow_positions=shadow_positions, wallet_ev_stats=wallet_ev_stats)
         finally:
             mark_whale_event_consumed(event["id"])
 
@@ -1753,7 +1755,8 @@ def sweep_pending_exit_orders(positions, trader_performance, muted_traders):
 
 def _handle_matched_whale_event(event, positions, source_positions, source_cost_basis,
                                  trader_performance, muted_traders, tracked_by_lower,
-                                 risk_state, wallet_scores, shadow_positions=None):
+                                 risk_state, wallet_scores, shadow_positions=None,
+                                 wallet_ev_stats=None):
     """Shared per-event handling once (market_slug, outcome) are known —
     used by both the fast INNER-JOIN path and the on-demand-fallback-
     resolved path in sweep_live_whale_events(). Deliberately does NOT mark
@@ -1823,7 +1826,8 @@ def _handle_matched_whale_event(event, positions, source_positions, source_cost_
     try:
         process_trade(trade, positions, source_positions, source_cost_basis,
                        trader_performance, muted_traders, tracked_by_lower,
-                       risk_state, wallet_scores, shadow_positions=shadow_positions)
+                       risk_state, wallet_scores, shadow_positions=shadow_positions,
+                       wallet_ev_stats=wallet_ev_stats)
     except Exception as e:
         append_log({"timestamp": now_iso(), "event_type": "error",
                     "source_trade_id": trade["trade_id"], "trader_address": trader_addr,
@@ -1842,6 +1846,7 @@ def _handle_matched_whale_event(event, positions, source_positions, source_cost_
 # below that used to read config.TRACKED_TRADERS directly.
 from db import (  # noqa: E402
     load_state, save_state, append_log, get_tracked_traders, get_wallet_composite_scores,
+    get_wallet_realized_ev_stats,
     get_risk_value, set_risk_value, clear_risk_value, load_market_events, save_market_event,
     load_market_categories, save_market_category, get_active_rule_set_version,
     realized_pnl_total, prune_event_log,
@@ -2268,7 +2273,8 @@ def check_circuit_breaker(trader, nickname, pnl_usd, cost_basis_usd, trader_perf
 
 
 def _execute_buy(base_event, key, trader, market_slug, outcome, price, trade_usd,
-                  event_slug, score_breakdown, positions, risk_state, price_source=None):
+                  event_slug, score_breakdown, positions, risk_state, price_source=None,
+                  wallet_ev_stats=None):
     """Risk-gate + execute + ledger-write for a BUY, extracted 2026-07-24
     (Rule 29) out of process_trade's immediate-copy path so it can ALSO be
     the fill path for sweep_pending_executions()'s dip-and-rebound orders —
@@ -2301,6 +2307,7 @@ def _execute_buy(base_event, key, trader, market_slug, outcome, price, trade_usd
     risk_ok, risk_event_type, risk_reason = risk_manager.check_buy(
         positions, risk_state["market_to_event"], event_slug,
         trade_usd, risk_state["kill_switch"], wallet_address=trader,
+        wallet_ev_stats=wallet_ev_stats,
     )
     if not risk_ok:
         append_log({**base_event, "event_type": risk_event_type, "reason": risk_reason})
@@ -2453,7 +2460,8 @@ def _execute_buy(base_event, key, trader, market_slug, outcome, price, trade_usd
 
 
 def process_trade(trade, positions, source_positions, source_cost_basis, trader_performance,
-                  muted_traders, tracked_by_lower, risk_state, wallet_scores, shadow_positions=None):
+                  muted_traders, tracked_by_lower, risk_state, wallet_scores, shadow_positions=None,
+                  wallet_ev_stats=None):
     trader = trade["user_address"]
     nickname = nickname_for(trader, tracked_by_lower)
     market_slug = trade.get("market_slug") or ""
@@ -2799,6 +2807,7 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
         decision_journal_id = _execute_buy(
             base_event, key, trader, market_slug, outcome, price, trade_usd,
             event_slug, score_breakdown, positions, risk_state, price_source=price_source,
+            wallet_ev_stats=wallet_ev_stats,
         )
         return
 
@@ -3162,6 +3171,12 @@ def main():
     # rescored mid-session keeps sizing off its old score until restart.
     wallet_scores = get_wallet_composite_scores()
 
+    # Automatic EV-scaled per-wallet exposure cap (2026-07-31, replacing
+    # config.VIP_WALLET_EXPOSURE_CAP_USD's manual curation as the default
+    # mechanism — see risk_manager.wallet_exposure_cap_usd()). Same fetch-
+    # once-at-startup convention as wallet_scores above.
+    wallet_ev_stats = get_wallet_realized_ev_stats()
+
     # ONE long-lived executor for the whole process (2026-07-22 cutover, Rule
     # 14) — created once here, passed into every fetch_direct_feed() call
     # below, NEVER recreated per-cycle. Recreating it every poll would
@@ -3368,7 +3383,8 @@ def main():
                 try:
                     process_trade(trade, positions, source_positions, source_cost_basis,
                                   trader_performance, muted_traders, tracked_by_lower,
-                                  risk_state, wallet_scores, shadow_positions=shadow_positions)
+                                  risk_state, wallet_scores, shadow_positions=shadow_positions,
+                                  wallet_ev_stats=wallet_ev_stats)
                 except Exception as e:
                     append_log({"timestamp": now_iso(), "event_type": "error",
                                 "source_trade_id": tid,
@@ -3388,7 +3404,8 @@ def main():
             if not SHUTDOWN_REQUESTED:
                 try:
                     sweep_pending_executions(positions, source_positions, source_cost_basis,
-                                              tracked_by_lower, risk_state, wallet_scores)
+                                              tracked_by_lower, risk_state, wallet_scores,
+                                              wallet_ev_stats=wallet_ev_stats)
                 except Exception as e:
                     append_log({"timestamp": now_iso(), "event_type": "error",
                                 "error": f"pending execution sweep failed: {e}"})
@@ -3407,7 +3424,8 @@ def main():
                 try:
                     sweep_live_whale_events(positions, source_positions, source_cost_basis,
                                              trader_performance, muted_traders, tracked_by_lower,
-                                             risk_state, wallet_scores, shadow_positions=shadow_positions)
+                                             risk_state, wallet_scores, shadow_positions=shadow_positions,
+                                             wallet_ev_stats=wallet_ev_stats)
                 except Exception as e:
                     append_log({"timestamp": now_iso(), "event_type": "error",
                                 "error": f"live whale event sweep failed: {e}"})

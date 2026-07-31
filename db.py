@@ -855,6 +855,43 @@ def get_wallet_composite_scores():
     return result
 
 
+def get_wallet_realized_ev_stats():
+    """Returns {wallet_address_lower: {"ev_pct": float, "trade_count": int}}
+    for every wallet with at least one CLOSED strategy='bot_filtered' trade
+    — this bot's own ACTUAL realized return per dollar staked (mean of
+    realized_pnl_usd/cost_basis_usd across closed trades), the same
+    definition apps/dashboard/app/overview/page.tsx's `evExpr` already
+    uses. Deliberately a different signal from get_wallet_composite_scores()'s
+    win_rate/trade_count (wallet_profile, the TS scorer's own separately-
+    computed on-chain performance): this is what OUR replication of the
+    wallet has actually earned, which can diverge from the wallet's own
+    raw on-chain track record (copy delay, our own sizing, etc.) — copy-
+    trading edge is about the copy, not just the source.
+
+    Used by risk_manager.wallet_exposure_cap_usd() (2026-07-31, automatic
+    EV-scaled per-wallet exposure cap, replacing config.
+    VIP_WALLET_EXPOSURE_CAP_USD's manual curation) — see that function's
+    docstring. Called once at bot.py startup, same restart-to-pick-up-
+    changes convention as get_wallet_composite_scores()/get_tracked_traders().
+    """
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT wallet_address, "
+            "avg(realized_pnl_usd / nullif(cost_basis_usd, 0)) AS ev_pct, "
+            "count(*) AS trade_count "
+            "FROM paper_trade WHERE status = 'closed' AND strategy = 'bot_filtered' "
+            "GROUP BY wallet_address"
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {
+        row["wallet_address"].lower(): {"ev_pct": row["ev_pct"], "trade_count": row["trade_count"]}
+        for row in rows
+    }
+
+
 def get_muted_wallets():
     """Every wallet_address currently circuit_breaker_muted=1, lowercased.
     Used by propose_pool_refill.py to compute the real "actively copying"

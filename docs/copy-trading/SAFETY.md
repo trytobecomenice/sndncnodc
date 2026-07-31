@@ -3770,3 +3770,54 @@ deploy+restart with both alerts, pull-failure alert without touching `bot.py`, t
 triggers a real `git reset --hard` and never calls `stop_bot()`/`start_bot()`, a successful deploy
 whose restart itself fails still alerts urgently and releases the watchdog pause). 499 Python
 tests passing (was 493).
+
+## 58. Automatic EV-scaled per-wallet exposure cap (Rule 26 addendum, 2026-07-31)
+
+**Trigger**: Joey asked whether `config.MAX_WALLET_EXPOSURE_USD` ($50 flat) should be raised —
+investigating first found `skip_risk_wallet_cap` had fired 41,943 times/24h (377 distinct
+signals), then found the existing 2026-07-26 VIP override mechanism
+(`config.VIP_WALLET_EXPOSURE_CAP_USD`) was stale by 5 days: strict-7's real sample had grown from
+31 to 200 closed trades and its EV from +44.6% to +70.3%, cap frozen at $150 the whole time. Joey
+then asked directly whether the bot's PnL was too concentrated in one wallet — investigated with
+real data: of $699.63 total realized PnL across every tracked wallet, **$907.65 came from ONE
+wallet (strict-7)** — without it the bot's entire track record would be net NEGATIVE (-$208.02).
+
+**Design tension, resolved explicitly, not glossed over**: a pure EV-maximizing formula would
+raise strict-7's cap further (its edge is genuinely the strongest measured), which directly
+increases concentration in the one wallet the whole track record already depends on. Joey's own
+call: build the EV formula, but bound `WALLET_EV_CAP_MAX_USD` as a fraction of the total exposure
+ceiling specifically so no wallet, however strong, can dominate past that fraction.
+
+**What ships**:
+1. `risk_manager.compute_wallet_ev_cap_usd(ev_pct, trade_count, ...)` (pure) — Beta-Binomial
+   shrinkage (`shrunk_ev = (n × clip(ev_pct, ±1.0) + 25 × 0) / (n + 25)`, same shape/pseudo-count
+   as `bot.compute_shrunk_win_rate()`, shrinking toward 0 edge instead of the market price since
+   EV-per-dollar has no natural probability target). `ev_pct` clipped to ±100% BEFORE shrinking so
+   one outlier trade (a $5 buy at $0.002 resolving YES is a real +2400% return) can't swing a
+   wallet's whole cap. `cap = clamp(50 + 1.0 × shrunk_ev × 50, $20, $187.50)` —
+   `WALLET_EV_CAP_MAX_USD = 0.15 × MAX_TOTAL_EXPOSURE_USD`, the direct answer to the concentration
+   finding: no wallet can be allocated more than 15% of the whole book by this formula alone.
+2. `db.get_wallet_realized_ev_stats()` (new) — this bot's own realized return per dollar staked
+   (`avg(realized_pnl_usd/cost_basis_usd)` over closed `bot_filtered` trades, same definition
+   `apps/dashboard`'s `evExpr` uses) — deliberately NOT `wallet_profile`'s separately-scored
+   win_rate (`get_wallet_composite_scores()`, the TS scorer's own on-chain figure): this measures
+   what OUR copy of the wallet actually earned, which can diverge from the wallet's raw track
+   record. Fetched once at `bot.py` startup (`wallet_ev_stats`), same restart-to-pick-up-changes
+   convention as `wallet_scores` — threaded through `process_trade()` /
+   `_handle_matched_whale_event()` / `sweep_pending_executions()` / `sweep_live_whale_events()` /
+   `_execute_buy()` down to `risk_manager.check_buy()`, mirroring exactly how `wallet_scores`
+   already flows through the same call chain.
+3. `risk_manager.wallet_exposure_cap_usd()`'s priority order: `VIP_WALLET_EXPOSURE_CAP_USD`
+   (manual override, now emptied by default) still wins first if a human explicitly sets an
+   entry — role changed from "the only mechanism" to "an exceptional override" — then the
+   automatic formula, then the flat `$50` default for a wallet with no closed trades yet.
+
+**Tests**: `TestComputeWalletEvCapUsd` (+9: no-evidence returns flat base, strong positive EV with
+real n=200/+70.3% data raises the cap to ~$81.25, negative EV with real n=97/-13.2% data lowers it
+to ~$44.74, a tiny-sample-but-extreme-EV wallet barely moves, extreme EV is confirmed clipped
+before shrinking not just accepted in the signature, extreme negative/positive EV clamp to
+min/max, scale=0 always returns the flat base), `TestWalletExposureCapUsdWithEvStats` (+6:
+priority order, case-insensitive lookup, `check_buy()` wiring), `test_db_wallet_ev_stats.py` (+6:
+mean EV/count computed correctly, lowercased keys, open positions and shadow_rehab trades
+excluded, zero-cost-basis doesn't crash on division, empty when no closed trades). 521 Python
+tests passing (was 499).

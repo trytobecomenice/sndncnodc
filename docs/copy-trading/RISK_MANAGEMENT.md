@@ -1803,6 +1803,57 @@ need to introduce a MAX_EXPOSURE_PER_WALLET setting" — after reconsidering an 
 concern (cross-category wallets) and choosing to allow multi-category tracking rather than
 restrict it, with this cap as the correct tool for bounding the resulting concentration instead.
 
+**Addendum 2026-07-31 — automatic EV-scaled cap replaces manual VIP curation.**
+
+> **Challenge:** the 2026-07-26 VIP override (`config.VIP_WALLET_EXPOSURE_CAP_USD`, a hand-curated
+> address-keyed dict — strict-7 at $150, political-whale-1 at $100) was found stale the very next
+> time anyone checked it, 5 days later: strict-7's real sample had grown from 31 to 200 closed
+> trades and its EV from +44.6% to +70.3%, yet its cap sat frozen the whole time. Separately,
+> investigating Joey's own question ("is our PnL too concentrated in one wallet?") found the answer
+> was yes: of $699.63 total realized PnL across every tracked wallet, **$907.65 came from strict-7
+> alone** — without it the bot's entire track record would be net NEGATIVE (-$208.02). Raising that
+> one wallet's cap further (which a pure EV-maximizing formula would do, since its edge is
+> genuinely the strongest) increases concentration in exactly the wallet the whole track record
+> already depends on.
+> **Mechanism:** a manually-curated snapshot can only ever be as fresh as the last time a human
+> remembered to update it — with no incentive/trigger to revisit, it just decays into staleness
+> silently, exactly like the 2026-07-25 total-exposure-ceiling bottleneck decayed before anyone
+> looked at the data. Something recomputed automatically, every restart, off live data closes that
+> gap structurally rather than relying on someone remembering.
+
+**Fixed**: `risk_manager.compute_wallet_ev_cap_usd(ev_pct, trade_count)` (pure) computes a per-wallet
+cap automatically: `shrunk_ev = (n × clip(ev_pct, ±config.WALLET_EV_CAP_CLIP_PCT) + k × 0) / (n + k)`
+— the same Beta-Binomial shrinkage SHAPE as `bot.compute_shrunk_win_rate()` (Half-Kelly sizing,
+Rule 25), shrinking toward 0 edge (the "no evidence yet" null) rather than the market price this
+time, since EV-per-dollar has no natural "implied probability" target the way win_rate does. Same
+`k=25` pseudo-count as Rule 25, not independently re-derived. `ev_pct` is clipped BEFORE shrinking
+so one extreme trade (a $5 buy at a $0.002 entry resolving YES is a genuine +2400% return) can't
+swing a wallet's whole cap off a single data point. Final cap = `clamp(base + scale × shrunk_ev ×
+base, min, max)` — `config.WALLET_EV_CAP_SCALE = 1.0` (moderate, matching this codebase's existing
+half-Kelly conservatism elsewhere), `WALLET_EV_CAP_MIN_USD = $20` (a proven-negative-EV wallet
+still gets some minimal room — dropping it entirely is a SEPARATE decision via the circuit
+breaker, Rule 35/36), `WALLET_EV_CAP_MAX_USD = 0.15 × MAX_TOTAL_EXPOSURE_USD` ($187.50 at the
+current $1250 ceiling) — **this ceiling is the direct answer to the concentration finding above**:
+expressed as a fraction of the total exposure ceiling specifically so no single wallet, however
+strong its measured edge, can ever be allocated more than 15% of the whole book by this formula
+alone.
+
+Data source: `db.get_wallet_realized_ev_stats()` (new) — this bot's own ACTUAL realized return per
+dollar staked (mean of `realized_pnl_usd/cost_basis_usd` across closed `strategy='bot_filtered'`
+trades), the SAME definition `apps/dashboard`'s `evExpr` already uses — deliberately NOT
+`wallet_profile`'s separately-scored win_rate (`get_wallet_composite_scores()`, the TS scorer's own
+on-chain performance figure): this is what OUR replication of the wallet has actually earned, which
+can diverge from the wallet's own raw track record. Fetched once at `bot.py` startup, same
+restart-to-pick-up-changes convention as `wallet_scores`.
+
+`config.VIP_WALLET_EXPOSURE_CAP_USD`'s role changes, not removed: still checked FIRST and still
+wins if a human explicitly sets an entry (e.g. a wallet whose live EV shouldn't be trusted for some
+out-of-band reason) — emptied out by default now that the formula is the everyday mechanism, not a
+one-time manual snapshot.
+
+521 Python tests passing (was 499; +16 `TestComputeWalletEvCapUsd`/`TestWalletExposureCapUsdWithEvStats`,
++6 `test_db_wallet_ev_stats.py`). Docs: this addendum; `SAFETY.md` §58.
+
 ---
 
 ## 27. TCA entry-price floor
