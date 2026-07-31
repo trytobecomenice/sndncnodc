@@ -4051,3 +4051,50 @@ enabling" discipline as Sec.63's Time-Decay Loss Cut.
 **Tests**: `TestExecuteBuyExtraction` +4 in `test_bot_risk_checks.py` (default-off preserves current
 behavior, on-skips-with-no-book, on-still-allows-a-real-book-read, LIVE_MODE branch unaffected). 568
 Python tests passing (was 564).
+
+## 65. Telegram alerts silently failing since Sec.54 — IPv6 has no route on this EC2 box (2026-08-01)
+
+**Trigger**: Joey noticed no Telegram notifications had ever arrived for any trade/alert and asked
+whether the EC2 box had actually been up continuously. Investigated `bot.out.log` directly rather
+than assuming — found every alert attempt from bot.py's own process failing, consistently, at every
+observed restart: `Telegram alert failed: no route` immediately followed (within ~2-3ms) by `Telegram
+alert failed: HTTP 401`. Since Sec.54 shipped 2026-07-31, it appears NO alert — including the
+kill-switch trigger, the single most safety-critical one this whole feature was built to surface —
+had ever actually reached Telegram, silently, because `send_telegram_alert()` is deliberately
+"fails silently, never raises" by design (so a notification bug could never take down the trading
+loop) — which meant its own failure had no notification either.
+
+**Root-caused, not guessed**: a fresh, standalone `python3 -c "telegram_alerts.send_telegram_alert(...)"`
+process on the SAME box, same code, same `.env`, succeeded immediately — ruling out an invalid token
+(confirmed separately too: `curl .../getMe` with the real token returned a valid bot identity) or a
+general network/DNS/firewall problem (general internet, and `curl` with no explicit IP version flag,
+both worked fine). Narrowed via `curl -6` vs `curl -4` against `api.telegram.org`: **`-6` fails
+outright, `-4` succeeds instantly**. `ip -6 route show` confirmed why — only link-local `fe80::/64`
+routes exist on this box, no global IPv6 route at all. `api.telegram.org` resolves to both an A and
+AAAA record; Python's `http.client` generally falls back to IPv4 when IPv6 fails, but evidently
+wasn't doing so reliably from inside bot.py's actual long-running process/thread context specifically
+(the standalone reproduction attempt succeeding suggests it usually recovers, just not always/fast
+enough) — the exact mechanism wasn't chased further once a clean, direct fix was available.
+
+**Fix**: `telegram_alerts._force_ipv4_dns()`, a new context manager that monkeypatches
+`socket.getaddrinfo` to request `socket.AF_INET`-only results, scoped narrowly around
+`send_telegram_alert()`'s actual `conn.request()`/`conn.getresponse()` call (NOT
+`HTTPSConnection`'s constructor, which does no DNS resolution at all — connect() happens lazily
+inside `request()`, a mistake caught and fixed in the same pass) and restored immediately after via
+`try/finally`, guarded by a module-level `threading.Lock` since bot.py can call this from more than
+one thread. Never a permanent, process-wide change to socket behavior — only in effect for the
+duration of one connection attempt.
+
+**Verified live**: manually confirmed the fix against the real Telegram API from the EC2 box before
+considering this done, not just unit-tested.
+
+**Separately, answered Joey's uptime question honestly**: the current EC2 instance has been up
+continuously since this session's t3.small resize (`ip -6 route`/`uptime` checked ~19:43 UTC, up
+3h19m at that point) — but NOT continuously for "the past few days" the way the question implied:
+at least two earlier deliberate stop/start events this week (the 2026-07-29 leaked-key rotation
+redeploy, and this session's own instance resize) each necessarily involved a stop. Both were
+intentional actions already documented elsewhere in this file, not unexplained downtime.
+
+**Tests**: `TestForceIpv4Dns` +3 in `test_telegram_alerts.py` (getaddrinfo patched to AF_INET-only,
+restored even on exception, send_telegram_alert() actually uses the scope around request/getresponse
+and not just construction). 571 Python tests passing (was 568).

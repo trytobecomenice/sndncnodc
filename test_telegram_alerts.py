@@ -4,6 +4,7 @@
 Run: python3 -m unittest test_telegram_alerts -v
 """
 
+import socket
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -67,6 +68,74 @@ class TestSendTelegramAlert(unittest.TestCase):
         with patch("telegram_alerts.http.client.HTTPSConnection", side_effect=OSError("no route")):
             result = telegram_alerts.send_telegram_alert("hi")  # must not raise
         self.assertFalse(result)
+
+
+class TestForceIpv4Dns(unittest.TestCase):
+    """2026-08-01 fix — every alert from bot.py's own long-running process
+    was silently failing on IPv6 (this EC2 box has no real IPv6 route),
+    while a fresh standalone process succeeded. _force_ipv4_dns() scopes a
+    socket.getaddrinfo monkeypatch to exactly one connection attempt."""
+
+    def setUp(self):
+        # Only needed by test_send_telegram_alert_uses_the_ipv4_forcing_scope
+        # below -- without a configured token/chat_id, send_telegram_alert()
+        # returns False before ever reaching the connection code.
+        self._saved_enabled = config.ENABLE_TELEGRAM_ALERTS
+        self._saved_token = telegram_alerts.TELEGRAM_BOT_TOKEN
+        self._saved_chat_id = telegram_alerts.TELEGRAM_CHAT_ID
+        config.ENABLE_TELEGRAM_ALERTS = True
+        telegram_alerts.TELEGRAM_BOT_TOKEN = "test-token"
+        telegram_alerts.TELEGRAM_CHAT_ID = "12345"
+
+    def tearDown(self):
+        config.ENABLE_TELEGRAM_ALERTS = self._saved_enabled
+        telegram_alerts.TELEGRAM_BOT_TOKEN = self._saved_token
+        telegram_alerts.TELEGRAM_CHAT_ID = self._saved_chat_id
+
+    def test_patches_getaddrinfo_to_request_af_inet_only(self):
+        seen_families = []
+        original = socket.getaddrinfo
+
+        def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            seen_families.append(family)
+            return []
+
+        with patch("socket.getaddrinfo", side_effect=fake_getaddrinfo):
+            with telegram_alerts._force_ipv4_dns():
+                socket.getaddrinfo("api.telegram.org", 443)
+        self.assertEqual(seen_families, [socket.AF_INET])
+        self.assertIs(socket.getaddrinfo, original)  # restored, not leaked globally
+
+    def test_restores_original_getaddrinfo_even_on_exception(self):
+        original = socket.getaddrinfo
+        with self.assertRaises(RuntimeError):
+            with telegram_alerts._force_ipv4_dns():
+                raise RuntimeError("boom")
+        self.assertIs(socket.getaddrinfo, original)
+
+    def test_send_telegram_alert_uses_the_ipv4_forcing_scope(self):
+        # Confirms send_telegram_alert() actually wraps its connect/request
+        # step in the patch, not just the object construction (a bug this
+        # fix's own first draft had -- HTTPSConnection's constructor
+        # doesn't resolve DNS at all, connect() does, lazily, inside
+        # request()).
+        mock_response = MagicMock(status=200)
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = mock_response
+        calls = []
+
+        class _RecordingContext:
+            def __enter__(self):
+                calls.append("enter")
+
+            def __exit__(self, *a):
+                calls.append("exit")
+
+        with patch("telegram_alerts.http.client.HTTPSConnection", return_value=mock_conn), \
+             patch("telegram_alerts._force_ipv4_dns", return_value=_RecordingContext()):
+            telegram_alerts.send_telegram_alert("hi")
+        self.assertEqual(calls, ["enter", "exit"])
+        mock_conn.request.assert_called_once()
 
 
 if __name__ == "__main__":
