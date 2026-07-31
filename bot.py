@@ -55,6 +55,8 @@ from bullpen_client import (
 )
 from polymarket_data_api import fetch_all_wallets_concurrent, make_persistent_executor
 import polymarket_simulator
+import telegram_alerts
+from prometheus_client import Gauge, start_http_server
 
 
 def now_iso():
@@ -80,6 +82,15 @@ _file_handler = RotatingFileHandler(
 _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logger.addHandler(_file_handler)
 logger.addHandler(logging.StreamHandler())
+
+# Phase 1 observability (2026-07-31) — copybot_events_total (per event_type)
+# lives in db.py, the one choke point every event already flows through;
+# these three are portfolio-level snapshots only main()'s kill-switch
+# evaluation block has the inputs for, so they're set there instead. See
+# docs/copy-trading/SAFETY.md Sec.54.
+METRIC_EQUITY_USD = Gauge("copybot_equity_usd", "Current portfolio equity (bankroll + realized + unrealized PnL)")
+METRIC_KILL_SWITCH_ACTIVE = Gauge("copybot_kill_switch_active", "1 if the drawdown kill switch is latched, else 0")
+METRIC_OPEN_POSITIONS = Gauge("copybot_open_positions", "Count of currently open bot_filtered positions")
 
 
 # Set by the SIGTERM handler (dashboard.py's stop button sends SIGTERM).
@@ -2122,12 +2133,13 @@ def maybe_snapshot_daily_portfolio(positions, prices_by_key, tracked_traders, mu
 
     breakdown = risk_manager.compute_equity_breakdown(positions, prices_by_key, realized_pnl_total())
     active_traders_followed = len(tracked_traders) - len(muted_traders)
+    realized_today = realized_pnl_today(now=now)
 
     record_daily_snapshot(
         total_equity=breakdown["total_equity"],
         total_cash=breakdown["total_cash"],
         total_unrealized_pnl=breakdown["total_unrealized_pnl"],
-        realized_pnl_today=realized_pnl_today(now=now),
+        realized_pnl_today=realized_today,
         active_traders_followed=active_traders_followed,
         now=now,
     )
@@ -2139,6 +2151,15 @@ def maybe_snapshot_daily_portfolio(positions, prices_by_key, tracked_traders, mu
         f"Daily portfolio snapshot recorded: equity=${breakdown['total_equity']:.2f}, "
         f"cash=${breakdown['total_cash']:.2f}, unrealized=${breakdown['total_unrealized_pnl']:.2f}, "
         f"active_traders_followed={active_traders_followed}"
+    )
+    # Phase 1 observability (2026-07-31) — piggybacks on this function's own
+    # once-per-UTC-day trigger rather than a second schedule (see
+    # config.py's note next to TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS).
+    telegram_alerts.send_telegram_alert(
+        f"\U0001F4CA Daily copybot summary — equity ${breakdown['total_equity']:.2f}, "
+        f"realized today ${realized_today:.2f}, "
+        f"unrealized ${breakdown['total_unrealized_pnl']:.2f}, "
+        f"{active_traders_followed} wallet(s) actively followed"
     )
 
 
@@ -3054,6 +3075,19 @@ def _mark_trade_seen(seen_by_wallet, seen_set, wallet_address, trade_id):
 
 
 def main():
+    # Phase 1 observability (2026-07-31) — exposes copybot_events_total
+    # (db.py) and the three gauges above on config.METRICS_PORT for
+    # Prometheus to scrape (monitoring/docker-compose.yml, same EC2 box,
+    # never a publicly-exposed port). Caught, not left to propagate: a
+    # port conflict here (e.g. the exact stray-duplicate-process failure
+    # mode from the 2026-07-29 outage) must degrade to "no metrics this
+    # run," never block real trading from starting at all.
+    try:
+        start_http_server(config.METRICS_PORT)
+    except OSError as e:
+        logger.warning(f"Prometheus metrics server failed to start on port "
+                        f"{config.METRICS_PORT}: {e} — continuing without it.")
+
     # get_tracked_traders() is where config.TRACKED_TRADERS_SOURCE actually
     # takes effect (see config.py and db.py's docstring on it). Fetched once
     # here, not per-poll: picking up a new scan:wallets run requires a
@@ -3130,6 +3164,7 @@ def main():
         # guard exists for in the first place.
         "resolved_markets": set(),
     }
+    METRIC_KILL_SWITCH_ACTIVE.set(1 if risk_state["kill_switch"] else 0)
 
     logger.info(f"Copybot starting — mode={'LIVE' if config.LIVE_MODE else 'PAPER'}, "
                 f"source={config.TRACKED_TRADERS_SOURCE}, "
@@ -3383,6 +3418,11 @@ def main():
                             positions, prices_by_key, realized_pnl_total())
                         new_hwm, triggers = risk_manager.evaluate_equity(
                             equity, risk_state["equity_hwm"])
+                        # Phase 1 observability (2026-07-31) — set on every
+                        # evaluation (not just when something changes) so
+                        # Grafana shows a continuous series, not gaps.
+                        METRIC_EQUITY_USD.set(equity)
+                        METRIC_OPEN_POSITIONS.set(len(positions))
                         if new_hwm != risk_state["equity_hwm"]:
                             risk_state["equity_hwm"] = new_hwm
                             set_risk_value("equity_hwm", new_hwm)
@@ -3391,6 +3431,7 @@ def main():
                                            "equity": equity, "hwm": new_hwm}
                             risk_state["kill_switch"] = kill_switch
                             set_risk_value("kill_switch", kill_switch)
+                            METRIC_KILL_SWITCH_ACTIVE.set(1)
                             append_log({"timestamp": now_iso(),
                                         "event_type": "risk_kill_switch_triggered",
                                         **kill_switch})

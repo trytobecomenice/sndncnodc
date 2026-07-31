@@ -1025,3 +1025,37 @@ POOL_REFILL_CANDIDATE_FETCH_MULTIPLIER = 4
 # 50 is a quick-look sample, not a full history -- enough to see a
 # repeated-quote pattern if one exists, not meant to be exhaustive.
 POOL_REFILL_ACTIVITY_SAMPLE_SIZE = 50
+
+# --- Phase 1 observability (2026-07-31): Prometheus metrics + Telegram
+# alerts -- see docs/copy-trading/SAFETY.md Sec.54. Built directly in
+# response to tonight's kill-switch incident, which was only found because
+# Joey happened to ask "how's the bot running" -- these should surface that
+# kind of thing without a manual SSH check.
+
+# bot.py exposes a Prometheus /metrics endpoint on this port (localhost
+# only -- see monitoring/docker-compose.yml, Prometheus/Grafana are the only
+# consumers, both on the same EC2 box; never exposed to the public internet,
+# same "no new open ports" posture as the rest of this deploy post-2026-07-29).
+METRICS_PORT = 9100
+
+# Telegram alerts no-op safely (never raise, never block the main loop) if
+# TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID aren't set in .env -- see
+# telegram_alerts.py. Both env vars already existed in .env.example
+# (added 2026-07-26 for a TS end-of-day report that was never actually
+# built) -- reused here, not re-invented.
+ENABLE_TELEGRAM_ALERTS = True
+
+# A single Python exception (event_type="error") sends an immediate
+# Telegram alert, but no more than one per this many seconds -- a burst of
+# the same underlying failure (e.g. a CLOB outage hitting every open
+# position in one sweep) must not flood Telegram the way it would flood a
+# human's phone. Suppressed-during-the-window errors are folded into the
+# next alert's count rather than silently dropped. 5 min matches the TTP
+# sweep cadence this codebase already treats as its "reaction time" unit
+# elsewhere (risk_manager.py's kill-switch equity refresh).
+TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS = 300
+
+# The daily Telegram PnL summary piggybacks on
+# maybe_snapshot_daily_portfolio()'s existing once-per-UTC-day trigger
+# (config.DAILY_SNAPSHOT_TRIGGER_HOUR_UTC above) rather than a second
+# schedule -- no new constant needed here.

@@ -3558,3 +3558,62 @@ normally — confirming this isn't a blanket "small positions don't count"
 rule; a legacy position missing `avg_entry_price` entirely falls back to
 normal marking rather than being silently excluded). 469 Python tests
 passing (was 465).
+
+## 54. Phase 1 observability — Prometheus metrics + Telegram alerts (2026-07-31)
+
+**Why**: tonight's entire kill-switch/equity incident (Sec.52-53) was only found because Joey asked
+"how's the bot running today" — nothing surfaced it automatically. Built directly in response, as
+Phase 1 of the 4-layer architecture roadmap she and Claude discussed the same session (plan file:
+`~/.claude/plans/async-questing-oasis.md`, also noted in memory under
+`career-positioning-and-quant-roadmap`).
+
+**Resource constraint, checked live before installing anything**: the EC2 box has only 908MB total
+RAM (already running `bot.py` + a Next.js dev server, 686MB swap already in use at the time of
+checking) — Docker wasn't installed. Both containers below are memory-capped
+(`mem_limit: 200m` each) and Prometheus retention is bounded (7 days / 256MB), specifically so this
+observability layer can't itself destabilize the box it's monitoring.
+
+**What ships**:
+1. **`copybot_events_total{event_type=...}`** (Prometheus Counter) — incremented once inside
+   `db.append_log()`, the single choke point every event this codebase logs already flows through
+   (paper_buy, paper_sell, every `skip_*` reason, error, etc.) — one instrumentation site covers
+   everything, not scattered counter calls at dozens of sites.
+2. **`copybot_equity_usd` / `copybot_kill_switch_active` / `copybot_open_positions`** (Gauges) — set
+   in `bot.py`'s existing kill-switch evaluation block (same ~5-min cadence as the kill switch
+   itself), plus `copybot_kill_switch_active` seeded from the persisted `bot_risk_state` value at
+   startup so a restart doesn't show a false "0" before the first sweep runs.
+3. `bot.py` exposes these on `config.METRICS_PORT = 9100` via `prometheus_client.start_http_server()`
+   — bound to localhost only (Docker's Prometheus reaches it via `host.docker.internal`, an
+   `extra_hosts: host-gateway` entry required on native Linux Docker Engine, unlike Docker Desktop
+   where it's automatic). A port-bind failure (e.g. the exact stray-duplicate-process failure mode
+   from the 2026-07-29 outage) is caught and logged, never allowed to block real trading from
+   starting.
+4. **`telegram_alerts.py`** (new module, stdlib `http.client` only — same zero-third-party-HTTP-
+   library convention as `polymarket_simulator.py`) — `send_telegram_alert(message)`, fails silently
+   (logs, never raises) if disabled or `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` aren't set. Both env
+   vars already existed in `.env.example` (added 2026-07-26 for a TS end-of-day report,
+   `packages/shared/src/telegram.ts`, that was never actually built) — reused here, not
+   re-invented; `.env.example`'s comment corrected to point at the real implementation.
+   - Immediate alert, never throttled, on `risk_kill_switch_triggered` — rare (latched until a
+     human clears it) and exactly what sat undiscovered for 17+ hours tonight.
+   - Throttled alert (`config.TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS = 300`, max one per 5 min) on
+     `event_type="error"` — a burst of the same underlying failure must not flood Telegram the way
+     it would flood a phone; suppressed-count folded into the next alert sent, not dropped.
+   - Daily PnL summary, piggybacked onto `maybe_snapshot_daily_portfolio()`'s existing
+     once-per-UTC-day trigger rather than a second schedule.
+5. `monitoring/docker-compose.yml` + `monitoring/prometheus.yml` + Grafana datasource
+   auto-provisioning (`monitoring/grafana-provisioning/`) — Prometheus v3.13.2, Grafana OSS v13.1.1
+   (both version-verified live via GitHub releases before pinning, not guessed). Both ports bound
+   to `127.0.0.1` only — no new EC2 security-group rule, Grafana accessed via
+   `ssh -L 3001:localhost:3000 <host>` per Joey's explicit choice, same posture as every other
+   access path since the 2026-07-29 leaked-key incident.
+
+**Tests**: `test_telegram_alerts.py` (+6: disabled/missing-token/missing-chat-id no-ops, 2xx
+success, non-2xx failure, network exception caught not raised), `test_db_telegram_alerts.py` (+5:
+counter increment, kill-switch immediate alert, error-alert throttle first/suppressed/folded-count
+behavior), plus `TestMaybeSnapshotDailyPortfolio` updated to mock the new Telegram call. 480 Python
+tests passing (was 469). **Deployed to EC2 as part of the same push as Sec.53's fix** — `docker
+compose -f monitoring/docker-compose.yml up -d` still needs to be run manually on the EC2 box
+(Docker itself needs installing first), and Joey needs to create her own Telegram bot via
+`@BotFather` and populate `.env` with the token/chat_id — neither of those two steps can be done
+from this session.

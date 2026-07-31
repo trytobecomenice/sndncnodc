@@ -1,0 +1,61 @@
+# Phase 1 observability (2026-07-31) — Prometheus + Grafana for bot.py's
+# /metrics endpoint (config.METRICS_PORT). See docs/copy-trading/SAFETY.md
+# Sec.54 for the full incident/rationale this responds to.
+#
+# Deliberately lightweight: the EC2 box this runs on has only 908MB total
+# RAM (confirmed live 2026-07-31, already running bot.py + a Next.js dev
+# server) — both containers are memory-capped, Prometheus retention is
+# bounded, and neither port is exposed beyond localhost. Joey accesses
+# Grafana via an SSH tunnel (`ssh -L 3001:localhost:3000 <host>`), not a
+# public port — no new inbound rule needed on the EC2 security group,
+# same "no new open ports" posture as the rest of this deploy since the
+# 2026-07-29 leaked-key incident.
+#
+# bot.py runs directly on the host (not in a container), so Prometheus
+# reaches it via host.docker.internal -- the extra_hosts entry below is
+# required for that to resolve on native Linux Docker Engine (it's a
+# freebie on Docker Desktop, but this box is plain Ubuntu + Docker Engine).
+#
+# Usage: docker compose -f monitoring/docker-compose.yml up -d
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.13.2
+    container_name: copybot-prometheus
+    restart: unless-stopped
+    mem_limit: 200m
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.size=256MB
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana-oss:13.1.1
+    container_name: copybot-grafana
+    restart: unless-stopped
+    mem_limit: 200m
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana-provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+    environment:
+      # Change this after first login (Settings -> change password) --
+      # this is just the initial admin password, not meant to stay.
+      - GF_SECURITY_ADMIN_PASSWORD=changeme
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+    ports:
+      - "127.0.0.1:3001:3000"
+
+volumes:
+  prometheus-data:
+  grafana-data:

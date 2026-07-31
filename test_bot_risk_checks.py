@@ -2830,7 +2830,8 @@ class TestMaybeSnapshotDailyPortfolio(unittest.TestCase):
              patch("bot.realized_pnl_total", return_value=999.0), \
              patch("bot.realized_pnl_today", return_value=42.0), \
              patch("bot.record_daily_snapshot") as mock_record, \
-             patch("bot.append_log"):
+             patch("bot.append_log"), \
+             patch("bot.telegram_alerts.send_telegram_alert") as mock_telegram:
             mock_dt.now.return_value = at_trigger
             tracked = {"0xa": "n1", "0xb": "n2", "0xc": "n3"}
             muted = {"0xb": {}}
@@ -2842,6 +2843,10 @@ class TestMaybeSnapshotDailyPortfolio(unittest.TestCase):
         self.assertAlmostEqual(call_kwargs["total_unrealized_pnl"], 50.0)
         self.assertAlmostEqual(call_kwargs["realized_pnl_today"], 42.0)
         self.assertEqual(call_kwargs["active_traders_followed"], 2)  # 3 tracked - 1 muted
+        # Phase 1 observability (2026-07-31) -- the daily Telegram summary
+        # piggybacks on this same trigger, real network call mocked out.
+        mock_telegram.assert_called_once()
+        self.assertIn("42.00", mock_telegram.call_args.args[0])  # realized today
 
     def test_a_failure_inside_does_not_propagate_uncaught(self):
         # The main-loop call site wraps this in its own try/except, but the

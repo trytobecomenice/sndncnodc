@@ -31,7 +31,29 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from prometheus_client import Counter
+
 import config
+import telegram_alerts
+
+# Phase 1 observability (2026-07-31) — one counter, labeled by event_type,
+# covers every event this codebase logs (paper_buy/paper_sell/every skip_*
+# reason/error/etc.) since append_log() is already the single choke point
+# every one of them flows through. Only bot.py actually calls
+# prometheus_client.start_http_server() to expose this for scraping —
+# defining it here means any OTHER script that imports db.py (dashboard
+# helpers, reset_kill_switch.py, standalone workers) gets a harmless,
+# never-scraped local counter, not a port conflict.
+_EVENTS_TOTAL = Counter(
+    "copybot_events_total", "Count of bot_event_log events by type", ["event_type"],
+)
+
+# Throttle state for the "error" event Telegram alert below — module-level
+# and in-memory on purpose (same convention as bot.py's
+# _closeout_fetch_failures): a restart resetting this to "send immediately"
+# is fine, unlike a real risk-state value that must survive restarts.
+_last_error_alert_ts = 0
+_errors_suppressed_since_last_alert = 0
 
 # Named logger, no handlers attached HERE (2026-07-22, disk-exhaustion
 # hardening — replaces append_log()'s old print()). Deliberately relies on
@@ -644,7 +666,39 @@ def append_log(event):
         conn.close()
 
     logger.info(f"[{event['timestamp']}] {event['event_type']}: {event.get('market_slug', '')} {event.get('outcome', '')}")
+    _EVENTS_TOTAL.labels(event_type=event.get("event_type") or "unknown").inc()
+
+    event_type = event.get("event_type")
+    if event_type == "risk_kill_switch_triggered":
+        # Always immediate, never throttled -- rare (latched until a human
+        # clears it) and exactly the kind of thing tonight's incident showed
+        # can otherwise sit undiscovered for hours.
+        telegram_alerts.send_telegram_alert(
+            f"\U0001F6A8 Kill switch TRIGGERED: {'; '.join(event.get('reasons', []))}"
+        )
+    elif event_type == "error":
+        _maybe_send_throttled_error_alert(event)
+
     return decision_journal_id
+
+
+def _maybe_send_throttled_error_alert(event):
+    """See config.TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS's docstring: at most
+    one Telegram alert per window for `event_type="error"` rows, folding
+    any suppressed-during-the-window count into the next alert sent rather
+    than dropping it silently.
+    """
+    global _last_error_alert_ts, _errors_suppressed_since_last_alert
+    now = time.time()
+    if now - _last_error_alert_ts < config.TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS:
+        _errors_suppressed_since_last_alert += 1
+        return
+    suffix = (f" ({_errors_suppressed_since_last_alert} more suppressed in the last "
+              f"{config.TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS}s)"
+              if _errors_suppressed_since_last_alert else "")
+    telegram_alerts.send_telegram_alert(f"⚠️ copybot error: {event.get('error', '?')}{suffix}")
+    _last_error_alert_ts = now
+    _errors_suppressed_since_last_alert = 0
 
 
 def prune_event_log(retention_days=None):

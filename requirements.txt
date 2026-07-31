@@ -1,4 +1,5 @@
-# bot.py and dashboard.py use only the Python standard library.
+# dashboard.py uses only the Python standard library. bot.py did too until
+# 2026-07-31 (see prometheus_client below).
 #
 # wss_listener.py (2026-07-24, real-time on-chain trade detection — see
 # RISK_MANAGEMENT.md Rule 29's roadmap note) is the one script with a real
@@ -9,6 +10,10 @@ python-dotenv==1.0.1
 # token_sync_worker.py (2026-07-24, populates token_registry from
 # Polymarket's Gamma API):
 aiohttp==3.14.3
+
+# bot.py (2026-07-31, Phase 1 observability — Prometheus /metrics endpoint,
+# see config.METRICS_PORT):
+prometheus_client==0.26.0
 
 # The other external dependency is the Bullpen CLI, which must be installed
 # and authenticated separately (not a pip package):

@@ -1,0 +1,10 @@
+# Scrape config for bot.py's /metrics endpoint (config.METRICS_PORT).
+# 30s matches bot.py's own POLL_INTERVAL_SECONDS -- no point scraping
+# faster than the metrics themselves can change.
+global:
+  scrape_interval: 30s
+
+scrape_configs:
+  - job_name: copybot
+    static_configs:
+      - targets: ["host.docker.internal:9100"]
