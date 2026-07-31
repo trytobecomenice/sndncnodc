@@ -34,11 +34,20 @@ human to reconcile") a first-class state instead of an exception path.
   `OMS_DB_PATH`/`OMS_ADDR`). Not started by anything in production yet —
   no systemd unit, no `watchdog.py`/`autodeploy.py` awareness.
 
-Later sessions add a Bullpen subprocess integration ported from
-`bullpen_client.py` (Session 4) and wire `bot.py` in as a client
-(Session 5). None of this is wired into `bot.py` or `LIVE_MODE` yet — see
-the roadmap doc's Phase 2 section for the full session-by-session plan and
-its paper-mode-first validation discipline.
+- `bullpen/` — ports `bullpen_client.py`'s subprocess-call contract
+  field-for-field (Session 4): `RunJSON` (retry policy, exit-code
+  handling, `TimeoutError`/`AuthError`), `RequireFilled`,
+  `ExtractFillPrice`, `ExtractFilledShares`, `ExtractOrderID`,
+  `ExtractOrderStatus`. The actual `bullpen` subprocess call is
+  never invoked by tests — `Runner.exec` is an injectable seam
+  (`realExec` for production, a fake for tests), so nothing here
+  depends on the real `bullpen` binary being installed. Still not
+  wired to a live call site.
+
+Session 5 wires `bot.py` in as a client (paper path only). None of this is
+wired into `bot.py` or `LIVE_MODE` yet — see the roadmap doc's Phase 2
+section for the full session-by-session plan and its paper-mode-first
+validation discipline.
 
 ## Development
 
