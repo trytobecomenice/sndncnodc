@@ -908,13 +908,18 @@ THETA_DECAY_TP_MIN_ACTIVATION_PCT = 0.15
 THETA_DECAY_TP_MAX_ACTIVATION_PCT = 0.50
 THETA_DECAY_TP_WINDOW_DAYS = 7
 
-# OPT-IN, default OFF — same reasoning as ENABLE_PATIENT_EXIT_PEGGING:
-# this changes a real, already-live trading behavior
-# (TRAILING_TP_ACTIVATION_PCT's role in check_trailing_take_profit), and
-# depends on a market end-date lookup that doesn't exist anywhere in this
-# codebase yet (see resolve_market_end_date() in bot.py) — not something
-# to silently switch on.
-ENABLE_THETA_DECAY_TP_ACTIVATION = False
+# Flipped ON 2026-07-31, after investigating why the bot loses money on
+# non-strict-7 wallets' held-to-resolution trades (RISK_MANAGEMENT.md Rule
+# 26's 2026-07-31 addendum): confirmed live that of 247 resolved-losing
+# trades, only 5 EVER reached even this feature's lowered 15% floor
+# (combined -$10.78) — the other 242 averaged just 2.8% peak profit,
+# never close to arming ANY exit mechanism. This feature genuinely helps
+# the narrow case it targets (a real, already-tested design), but is NOT
+# the fix for that -$271.70 problem — flagged honestly, not oversold, so
+# a future session doesn't mistake "this is on" for "the resolution-loss
+# problem is solved." That deeper question (is holding these wallets'
+# signals to resolution worth it at all) stays open.
+ENABLE_THETA_DECAY_TP_ACTIVATION = True
 
 # Kill switch: portfolio equity is defined as PAPER_BANKROLL_USD + realized
 # PnL + unrealized PnL (unrealized comes from the trailing-TP sweep's price

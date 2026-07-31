@@ -3821,3 +3821,15 @@ priority order, case-insensitive lookup, `check_buy()` wiring), `test_db_wallet_
 mean EV/count computed correctly, lowercased keys, open positions and shadow_rehab trades
 excluded, zero-cost-basis doesn't crash on division, empty when no closed trades). 521 Python
 tests passing (was 499).
+
+## 59. `ENABLE_THETA_DECAY_TP_ACTIVATION` flipped ON (Rule 31 addendum, 2026-07-31)
+
+Built 2026-07-26 (Priority 4), never enabled. Flipped on while investigating the Rule 26
+resolution-loss finding — but the real impact was checked live FIRST, not assumed:
+of 247 resolved-losing non-strict-7 trades, only 5 ever reached even this feature's lowered 15%
+floor (combined -$10.78 — a small fraction of the -$271.70 total). Turned on anyway (a real,
+already-tested, low-risk design that genuinely helps the narrow case it targets), but explicitly
+NOT presented as the fix for the larger problem — see RISK_MANAGEMENT.md Rule 31's addendum for
+the full honest accounting. No code changes, no new tests (existing `TestCheckTrailingTakeProfit`
+coverage already exercises both the enabled and disabled paths via explicit `patch.object` in
+each test, never relying on the module-level default) — 521 Python tests still passing.

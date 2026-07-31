@@ -2652,6 +2652,22 @@ performance stays visible without paying to copy it; worth a periodic
 manual check if reconsidering later. `strict-3`/`strict-6` stay dropped —
 nothing in the fuller history contradicts those original calls.
 
+**Addendum 2026-07-31 — theta-decay TP activation (Priority 4) flipped ON, impact bounded honestly.**
+
+> Investigating why the bot loses money on non-strict-7 wallets' held-to-resolution trades (Rule
+> 26's addendum) found `config.ENABLE_THETA_DECAY_TP_ACTIVATION` (built here, 2026-07-26, never
+> enabled) directly targets part of that problem — but checked the REAL impact before flipping it,
+> not just enabling on the theory that it should help: of 247 resolved-losing trades, only **5**
+> ever reached even this feature's lowered 15% floor (combined **-$10.78**) — the other 242
+> averaged just 2.8% peak profit, nowhere close to arming ANY exit mechanism, theta-decay or
+> otherwise. Flipped on anyway (real, already-tested design, genuinely helps the narrow case it
+> targets, zero reason to leave it off) — but documented honestly as NOT the fix for the -$271.70
+> problem, so a future session doesn't mistake "this is on" for "solved." The deeper question —
+> whether holding these wallets' signals to resolution has any real edge at all, versus the bot's
+> demonstrated positive edge coming almost entirely from mirroring the source wallet's own sell
+> (`close_reason='source_sell'`: 122 trades, +$51.54, +19.2% EV, the same session) — stays open,
+> not resolved by this change.
+
 ---
 
 ## 32. Paper accounting grounded in real fillable prices, not the whale's own fill (2026-07-26)
