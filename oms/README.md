@@ -25,11 +25,20 @@ human to reconcile") a first-class state instead of an exception path.
   to avoid `SQLITE_BUSY` under concurrent writers (caught live by this
   package's own race test before the fix).
 
-Later sessions add an HTTP service (Session 3) and a Bullpen subprocess
-integration ported from `bullpen_client.py` (Session 4). None of this is
-wired into `bot.py` or `LIVE_MODE` yet — see the roadmap doc's Phase 2
-section for the full session-by-session plan and its paper-mode-first
-validation discipline.
+- `httpserver/` — plain `net/http` service exposing the store (Session 3):
+  `POST /orders` (idempotent create, 201/200), `GET /orders/{id}`,
+  `POST /orders/{id}/cancel` (Pending → Invalidated via `order.Order`'s own
+  `Transition()`, 409 if the order's current state disallows it). No
+  framework, no gRPC — see the package doc for why.
+- `cmd/omsd/` — the runnable binary (`go run ./cmd/omsd`, env
+  `OMS_DB_PATH`/`OMS_ADDR`). Not started by anything in production yet —
+  no systemd unit, no `watchdog.py`/`autodeploy.py` awareness.
+
+Later sessions add a Bullpen subprocess integration ported from
+`bullpen_client.py` (Session 4) and wire `bot.py` in as a client
+(Session 5). None of this is wired into `bot.py` or `LIVE_MODE` yet — see
+the roadmap doc's Phase 2 section for the full session-by-session plan and
+its paper-mode-first validation discipline.
 
 ## Development
 

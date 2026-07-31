@@ -106,7 +106,10 @@ var ErrNotFound = errors.New("store: order not found")
 // Given the SAME idempotencyKey twice (e.g. a retried request after a
 // timeout whose first attempt actually succeeded), the SECOND call
 // returns the order created by the FIRST, never a duplicate row and never
-// an error.
+// an error. The returned bool is true only when THIS call actually
+// created the row — Session 3's HTTP layer uses it to answer 201 Created
+// vs 200 OK, the standard way a REST idempotent-creation endpoint
+// distinguishes "I made this" from "here's the one you already made".
 //
 // Race-safe by construction, not by locking: attempts the INSERT directly
 // (new orders start Pending, mirroring order.New()'s own starting state)
@@ -114,25 +117,25 @@ var ErrNotFound = errors.New("store: order not found")
 // won the race and returns THAT — correct even when two goroutines call
 // CreateOrder with the same key at the same instant, unlike a
 // check-then-insert pattern which has a race window between the two steps.
-func (s *Store) CreateOrder(idempotencyKey string) (*order.Order, error) {
+func (s *Store) CreateOrder(idempotencyKey string) (o *order.Order, created bool, err error) {
 	id := uuid.NewString()
-	_, err := s.db.Exec(
+	_, err = s.db.Exec(
 		"INSERT INTO oms_order (id, idempotency_key, status) VALUES (?, ?, ?)",
 		id, idempotencyKey, string(order.Pending),
 	)
 	if err == nil {
-		return &order.Order{ID: id, Status: order.Pending}, nil
+		return &order.Order{ID: id, Status: order.Pending}, true, nil
 	}
 	if !isUniqueViolation(err) {
-		return nil, fmt.Errorf("store: create order: %w", err)
+		return nil, false, fmt.Errorf("store: create order: %w", err)
 	}
 	// Lost the race (or this is a genuine repeat call) -- whichever row
 	// actually exists for this key is the correct answer, not an error.
 	existing, getErr := s.getByIdempotencyKey(idempotencyKey)
 	if getErr != nil {
-		return nil, fmt.Errorf("store: create order: insert conflicted but re-read failed: %w", getErr)
+		return nil, false, fmt.Errorf("store: create order: insert conflicted but re-read failed: %w", getErr)
 	}
-	return existing, nil
+	return existing, false, nil
 }
 
 // Get returns the order with the given internal ID, or ErrNotFound.

@@ -27,9 +27,12 @@ func openTemp(t *testing.T) *Store {
 
 func TestCreateOrder_NewKeyStartsPending(t *testing.T) {
 	s := openTemp(t)
-	o, err := s.CreateOrder("trade-1")
+	o, created, err := s.CreateOrder("trade-1")
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
+	}
+	if !created {
+		t.Fatal("created = false for a genuinely new idempotency key, want true")
 	}
 	if o.Status != order.Pending {
 		t.Fatalf("Status = %s, want %s", o.Status, order.Pending)
@@ -41,13 +44,19 @@ func TestCreateOrder_NewKeyStartsPending(t *testing.T) {
 
 func TestCreateOrder_RepeatedKeyReturnsTheSameOrderNeverADuplicate(t *testing.T) {
 	s := openTemp(t)
-	first, err := s.CreateOrder("trade-1")
+	first, firstCreated, err := s.CreateOrder("trade-1")
 	if err != nil {
 		t.Fatalf("first CreateOrder: %v", err)
 	}
-	second, err := s.CreateOrder("trade-1")
+	if !firstCreated {
+		t.Fatal("first call: created = false, want true")
+	}
+	second, secondCreated, err := s.CreateOrder("trade-1")
 	if err != nil {
 		t.Fatalf("second CreateOrder: %v", err)
+	}
+	if secondCreated {
+		t.Fatal("second call (repeated key): created = true, want false -- it returned an existing order")
 	}
 	if second.ID != first.ID {
 		t.Fatalf("second call returned a DIFFERENT order id (%s vs %s) -- idempotency broken", second.ID, first.ID)
@@ -64,11 +73,11 @@ func TestCreateOrder_RepeatedKeyReturnsTheSameOrderNeverADuplicate(t *testing.T)
 
 func TestCreateOrder_DifferentKeysCreateDifferentOrders(t *testing.T) {
 	s := openTemp(t)
-	a, err := s.CreateOrder("trade-1")
+	a, _, err := s.CreateOrder("trade-1")
 	if err != nil {
 		t.Fatalf("CreateOrder(trade-1): %v", err)
 	}
-	b, err := s.CreateOrder("trade-2")
+	b, _, err := s.CreateOrder("trade-2")
 	if err != nil {
 		t.Fatalf("CreateOrder(trade-2): %v", err)
 	}
@@ -80,18 +89,21 @@ func TestCreateOrder_DifferentKeysCreateDifferentOrders(t *testing.T) {
 func TestCreateOrder_ConcurrentSameKeyRaceNeverDuplicates(t *testing.T) {
 	// The property this whole package exists to guarantee: many goroutines
 	// racing to create an order with the SAME idempotency key must all
-	// end up agreeing on exactly one underlying order.
+	// end up agreeing on exactly one underlying order, and exactly ONE of
+	// them should observe created=true.
 	s := openTemp(t)
 	const n = 20
 	ids := make([]string, n)
+	createdFlags := make([]bool, n)
 	errs := make([]error, n)
 	var wg sync.WaitGroup
 	wg.Add(n)
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			defer wg.Done()
-			o, err := s.CreateOrder("race-key")
+			o, created, err := s.CreateOrder("race-key")
 			errs[i] = err
+			createdFlags[i] = created
 			if o != nil {
 				ids[i] = o.ID
 			}
@@ -109,6 +121,15 @@ func TestCreateOrder_ConcurrentSameKeyRaceNeverDuplicates(t *testing.T) {
 		if id != first {
 			t.Fatalf("goroutine %d got order id %s, goroutine 0 got %s -- duplicate orders under race", i, id, first)
 		}
+	}
+	createdCount := 0
+	for _, c := range createdFlags {
+		if c {
+			createdCount++
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created=true count = %d across %d racing goroutines, want exactly 1", createdCount, n)
 	}
 
 	var count int
@@ -130,7 +151,7 @@ func TestGet_ReturnsErrNotFoundForUnknownID(t *testing.T) {
 
 func TestGet_ReturnsTheCreatedOrder(t *testing.T) {
 	s := openTemp(t)
-	created, err := s.CreateOrder("trade-1")
+	created, _, err := s.CreateOrder("trade-1")
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -145,7 +166,7 @@ func TestGet_ReturnsTheCreatedOrder(t *testing.T) {
 
 func TestUpdateStatus_PersistsAndIsReadableViaGet(t *testing.T) {
 	s := openTemp(t)
-	created, err := s.CreateOrder("trade-1")
+	created, _, err := s.CreateOrder("trade-1")
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
 	}
@@ -180,7 +201,7 @@ func TestOpen_ReusesAnExistingDatabaseFileWithOtherTables(t *testing.T) {
 	if _, err := s1.db.Exec("CREATE TABLE some_other_table (id TEXT PRIMARY KEY)"); err != nil {
 		t.Fatalf("creating unrelated table: %v", err)
 	}
-	if _, err := s1.CreateOrder("trade-1"); err != nil {
+	if _, _, err := s1.CreateOrder("trade-1"); err != nil {
 		t.Fatalf("CreateOrder before reopen: %v", err)
 	}
 	s1.Close()
