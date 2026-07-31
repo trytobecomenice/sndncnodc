@@ -9,6 +9,7 @@ dashboard.out.log
 wss_listener.pid
 wss_listener.out.log
 watchdog.out.log
+watchdog.cron.log
 data/watchdog_paused
 *.pre-cutover-*
 .claude/settings.local.json
