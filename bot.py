@@ -834,6 +834,20 @@ def close_position_trailing_tp(key, trader, nickname, market_slug, outcome, posi
     proceeds_usd = shares_closed * effective_price
     pnl_usd = proceeds_usd - cost_basis_closed
 
+    # Paper-only comparison measurement (2026-08-01) -- fires alongside
+    # every real trailing-TP exit above, regardless of paper/live or
+    # whether the LIVE_MODE patient-peg path was taken, to measure what a
+    # resting peg would have captured against effective_price (the price
+    # the real exit actually got). Never touches positions/PnL; wrapped in
+    # try/except deliberately -- this is a best-effort measurement riding
+    # alongside the real, safety-critical exit below, and must never be
+    # able to block or crash it.
+    try:
+        start_shadow_patient_exit(key, trader, market_slug, outcome, shares_closed,
+                                   immediate_exit_price=effective_price, close_reason="trailing_tp")
+    except Exception as e:
+        logger.warning(f"start_shadow_patient_exit failed for {market_slug}/{outcome}: {e}")
+
     del positions[key]
 
     append_log({**base_event,
@@ -1697,6 +1711,90 @@ def start_patient_exit(key, trader, market_slug, outcome, shares, close_reason):
     return pending_id
 
 
+def start_shadow_patient_exit(key, trader, market_slug, outcome, shares, immediate_exit_price,
+                               close_reason):
+    """Paper-only comparison sibling of start_patient_exit() (2026-08-01,
+    item 2 of the post-kill-switch-fix roadmap) -- called unconditionally
+    from close_position_trailing_tp(), in BOTH paper and live mode,
+    alongside whatever exit actually happens. start_patient_exit() itself
+    stays LIVE_MODE-only (a real resting order has no paper analog), which
+    means its edge has never been measured while this bot only runs in
+    paper mode -- this function exists to close that gap: same P_init/
+    P_floor math, driven purely by direct market-data reads
+    (get_market_bid_ask), never a bullpen call, never touching `positions`.
+
+    Best-effort only: a failed price read here just means this one exit
+    isn't tracked for comparison, not a fallback path -- there's nothing to
+    fall back TO, since the real exit this shadows already happened by the
+    time this is called.
+    """
+    best_bid, best_ask, price_error = get_market_bid_ask(market_slug, outcome)
+    if best_bid is None:
+        return None
+
+    mid_price = (best_bid + best_ask) / 2
+    live_edge = compute_live_edge_pct()
+    floor_price = compute_slippage_floor_price(mid_price, live_edge)
+    init_price = best_ask  # same "join the touch on the ask side" as the real mechanism
+
+    return create_shadow_patient_exit(
+        wallet_address=trader, market_slug=market_slug, outcome=outcome, position_key=key,
+        shares=shares, init_price=init_price, floor_price=floor_price,
+        immediate_exit_price=immediate_exit_price, close_reason=close_reason,
+    )
+
+
+def sweep_shadow_patient_exits():
+    """Runs every poll cycle alongside sweep_pending_exit_orders() -- for
+    each open shadow_patient_exit row, decides whether a resting maker sell
+    at the current pegged price would have been crossed by now. A real
+    limit-sell fills when a buyer's bid reaches (or exceeds) our resting
+    ask; the direct market-data analog of that is simply best_bid >=
+    current pegged price, so that's the fill test here (no order book to
+    poll, since no order was ever placed).
+
+    Same guaranteed-termination discipline as the real sweep: past
+    config.ORDER_PEG_MAX_TOTAL_WAIT_SECONDS, this closes out at whatever
+    best_bid currently is (the realistic price an actual guaranteed-
+    fallback market sell would have obtained), never left open forever. If
+    the market itself becomes unreadable mid-simulation (resolved, no
+    book) the row is marked 'abandoned' with no resolved_price -- fabricating
+    a comparison price here would corrupt get_shadow_patient_exit_comparison_stats(),
+    so an unreadable market is dropped rather than guessed at.
+    """
+    now = time.time()
+    for row in get_shadow_patient_exits(status="pending"):
+        if SHUTDOWN_REQUESTED:
+            return
+
+        best_bid, best_ask, price_error = get_market_bid_ask(row["market_slug"], row["outcome"])
+        if best_bid is None:
+            close_shadow_patient_exit(row["id"], "abandoned", resolved_price=None)
+            continue
+
+        if best_bid >= row["current_price"]:
+            close_shadow_patient_exit(row["id"], "filled", resolved_price=row["current_price"])
+            continue
+
+        elapsed = now - row["created_at"]
+        if elapsed >= config.ORDER_PEG_MAX_TOTAL_WAIT_SECONDS:
+            close_shadow_patient_exit(row["id"], "fallback_timeout", resolved_price=best_bid)
+            continue
+
+        mid = (best_bid + best_ask) / 2
+        spread_ratio = (best_ask - best_bid) / mid if mid else None
+        reprice_interval = compute_reprice_interval_seconds(spread_ratio)
+
+        time_since_last_reprice = now - (row["last_repriced_at"] or row["created_at"])
+        if time_since_last_reprice < reprice_interval:
+            continue
+
+        new_price = compute_pegged_price(row["init_price"], row["floor_price"], elapsed,
+                                          reprice_interval)
+        if new_price != row["current_price"]:
+            update_shadow_patient_exit_price(row["id"], new_price)
+
+
 def _book_completed_exit(order, fill_price, positions, trader_performance, muted_traders,
                           event_type_suffix):
     """Shared ledger-closing helper for sweep_pending_exit_orders()'s two
@@ -1943,6 +2041,8 @@ from db import (  # noqa: E402
     get_unconsumed_whale_events_without_registry_match, upsert_token_registry_row,
     compute_live_edge_pct, create_pending_exit_order, get_pending_exit_orders,
     update_pending_exit_order_price, close_pending_exit_order,
+    create_shadow_patient_exit, get_shadow_patient_exits,
+    update_shadow_patient_exit_price, close_shadow_patient_exit,
     load_market_end_dates, save_market_end_date,
     load_shadow_positions, save_shadow_positions, get_shadow_rehab_returns,
     has_snapshot_for_today, record_daily_snapshot, realized_pnl_today,
@@ -3536,6 +3636,17 @@ def main():
                     append_log({"timestamp": now_iso(), "event_type": "error",
                                 "error": f"pending exit order sweep failed: {e}"})
                 persist()
+
+            # Shadow patient-exit sweep (2026-08-01) — paper-only comparison
+            # data, no `positions` touched, so no persist() needed after.
+            # Runs every cycle for the same reprice/timeout-promptness
+            # reasoning as the real sweep above.
+            if not SHUTDOWN_REQUESTED:
+                try:
+                    sweep_shadow_patient_exits()
+                except Exception as e:
+                    append_log({"timestamp": now_iso(), "event_type": "error",
+                                "error": f"shadow patient exit sweep failed: {e}"})
 
             # Shadow Rehab (2026-07-27, Rule 37) — cheap (one query per
             # currently-muted wallet), run every cycle rather than gated by

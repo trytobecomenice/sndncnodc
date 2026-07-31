@@ -2639,6 +2639,149 @@ class TestSweepPendingExitOrders(unittest.TestCase):
         self.assertGreaterEqual(new_price, 0.40)
 
 
+class TestStartShadowPatientExit(unittest.TestCase):
+    """Paper-only comparison sibling of start_patient_exit() -- must never
+    call bullpen, never touch positions, and must degrade to a no-op (not
+    an exception) when the market's price is unreadable."""
+
+    def test_creates_a_row_with_ask_as_init_price(self):
+        with patch("bot.get_market_bid_ask", return_value=(0.47, 0.50, None)), \
+             patch("bot.compute_live_edge_pct", return_value=0.05), \
+             patch("bot.create_shadow_patient_exit", return_value="row-1") as mock_create, \
+             patch("bot.run_bullpen_json") as mock_bullpen:
+            result = bot.start_shadow_patient_exit(
+                "0xTrader|m|Yes", "0xTrader", "m", "Yes", 10.0,
+                immediate_exit_price=0.46, close_reason="trailing_tp",
+            )
+        self.assertEqual(result, "row-1")
+        mock_bullpen.assert_not_called()
+        _, kwargs = mock_create.call_args
+        self.assertEqual(kwargs["init_price"], 0.50)  # best_ask, same as start_patient_exit
+        self.assertEqual(kwargs["immediate_exit_price"], 0.46)
+        self.assertLess(kwargs["floor_price"], 0.50)
+
+    def test_no_live_price_returns_none_without_error(self):
+        with patch("bot.get_market_bid_ask", return_value=(None, None, "stale")), \
+             patch("bot.create_shadow_patient_exit") as mock_create:
+            result = bot.start_shadow_patient_exit(
+                "0xTrader|m|Yes", "0xTrader", "m", "Yes", 10.0,
+                immediate_exit_price=0.46, close_reason="trailing_tp",
+            )
+        self.assertIsNone(result)
+        mock_create.assert_not_called()
+
+
+class TestSweepShadowPatientExits(unittest.TestCase):
+    """Mirrors TestSweepPendingExitOrders' terminal-state property, but for
+    the paper-only comparison sweep: no bullpen calls, no `positions`
+    argument, and every row must still reach a terminal state past its max
+    wait rather than resting forever."""
+
+    def _row(self, **overrides):
+        base = {
+            "id": "shadow1", "wallet_address": "0xTrader", "market_slug": "some-market",
+            "outcome": "Yes", "position_key": "0xTrader|some-market|Yes", "shares": 10.0,
+            "init_price": 0.50, "floor_price": 0.40, "current_price": 0.50,
+            "immediate_exit_price": 0.46, "close_reason": "trailing_tp",
+            "created_at": time.time() - 10, "last_repriced_at": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_bid_crossing_pegged_price_closes_as_filled(self):
+        row = self._row(current_price=0.48)
+        with patch("bot.get_shadow_patient_exits", return_value=[row]), \
+             patch("bot.get_market_bid_ask", return_value=(0.49, 0.51, None)), \
+             patch("bot.close_shadow_patient_exit") as mock_close, \
+             patch("bot.run_bullpen_json") as mock_bullpen:
+            bot.sweep_shadow_patient_exits()
+        mock_bullpen.assert_not_called()
+        mock_close.assert_called_once_with("shadow1", "filled", resolved_price=0.48)
+
+    def test_unreadable_market_is_abandoned_not_guessed_at(self):
+        row = self._row()
+        with patch("bot.get_shadow_patient_exits", return_value=[row]), \
+             patch("bot.get_market_bid_ask", return_value=(None, None, "no book")), \
+             patch("bot.close_shadow_patient_exit") as mock_close:
+            bot.sweep_shadow_patient_exits()
+        mock_close.assert_called_once_with("shadow1", "abandoned", resolved_price=None)
+
+    def test_unfilled_past_max_wait_closes_at_current_bid_not_left_pending(self):
+        old_row = self._row(created_at=time.time() - 99999, current_price=0.42)
+        with patch("bot.get_shadow_patient_exits", return_value=[old_row]), \
+             patch("bot.get_market_bid_ask", return_value=(0.38, 0.41, None)), \
+             patch("bot.close_shadow_patient_exit") as mock_close:
+            bot.sweep_shadow_patient_exits()
+        mock_close.assert_called_once_with("shadow1", "fallback_timeout", resolved_price=0.38)
+
+    def test_unfilled_within_wait_and_reprice_not_due_does_nothing(self):
+        row = self._row(created_at=time.time() - 10, last_repriced_at=time.time() - 5,
+                         current_price=0.50)
+        with patch("bot.get_shadow_patient_exits", return_value=[row]), \
+             patch("bot.get_market_bid_ask", return_value=(0.45, 0.48, None)), \
+             patch("bot.update_shadow_patient_exit_price") as mock_update, \
+             patch("bot.close_shadow_patient_exit") as mock_close:
+            bot.sweep_shadow_patient_exits()
+        mock_update.assert_not_called()
+        mock_close.assert_not_called()
+
+    def test_unfilled_and_reprice_due_decays_price_toward_floor(self):
+        row = self._row(created_at=time.time() - 40, last_repriced_at=time.time() - 35,
+                         init_price=0.50, floor_price=0.40, current_price=0.50)
+        with patch("bot.get_shadow_patient_exits", return_value=[row]), \
+             patch("bot.get_market_bid_ask", return_value=(0.44, 0.48, None)), \
+             patch("bot.compute_reprice_interval_seconds", return_value=30), \
+             patch("bot.update_shadow_patient_exit_price") as mock_update, \
+             patch("bot.close_shadow_patient_exit") as mock_close:
+            bot.sweep_shadow_patient_exits()
+        mock_close.assert_not_called()
+        mock_update.assert_called_once()
+        new_price = mock_update.call_args.args[1]
+        self.assertLess(new_price, 0.50)
+        self.assertGreaterEqual(new_price, 0.40)
+
+
+class TestClosePositionTrailingTpShadowWiring(unittest.TestCase):
+    """The real exit (close_position_trailing_tp) must fire the paper-only
+    shadow comparison alongside itself, using the SAME price the real exit
+    obtained -- and must never let the shadow call affect the real ledger
+    write (position deletion, pnl, circuit breaker)."""
+
+    def test_paper_mode_fires_shadow_with_trigger_price_and_still_closes_normally(self):
+        positions = {"0xTrader|m|Yes": {"shares": 10.0, "cost_basis_usd": 4.0}}
+        with patch.object(config, "LIVE_MODE", False), \
+             patch("bot.start_shadow_patient_exit", return_value="row-1") as mock_shadow, \
+             patch("bot.check_circuit_breaker"), \
+             patch("bot.append_log"):
+            bot.close_position_trailing_tp(
+                "0xTrader|m|Yes", "0xTrader", "Trader", "m", "Yes", positions,
+                current_price=0.55, peak_profit_pct=0.60, profit_pct=0.50,
+                trader_performance={}, muted_traders={},
+            )
+        self.assertNotIn("0xTrader|m|Yes", positions)
+        mock_shadow.assert_called_once()
+        args, kwargs = mock_shadow.call_args
+        self.assertEqual(args[:5], ("0xTrader|m|Yes", "0xTrader", "m", "Yes", 10.0))
+        self.assertEqual(kwargs["immediate_exit_price"], 0.55)
+        self.assertEqual(kwargs["close_reason"], "trailing_tp")
+
+    def test_shadow_call_failure_does_not_block_the_real_exit(self):
+        """A best-effort comparison measurement must never be able to break
+        the real, safety-critical exit path it rides alongside."""
+        positions = {"0xTrader|m|Yes": {"shares": 10.0, "cost_basis_usd": 4.0}}
+        with patch.object(config, "LIVE_MODE", False), \
+             patch("bot.start_shadow_patient_exit", side_effect=RuntimeError("boom")), \
+             patch("bot.check_circuit_breaker") as mock_breaker, \
+             patch("bot.append_log"):
+            bot.close_position_trailing_tp(
+                "0xTrader|m|Yes", "0xTrader", "Trader", "m", "Yes", positions,
+                current_price=0.55, peak_profit_pct=0.60, profit_pct=0.50,
+                trader_performance={}, muted_traders={},
+            )
+        self.assertNotIn("0xTrader|m|Yes", positions)  # real exit still completed
+        mock_breaker.assert_called_once()
+
+
 class TestComputeDaysRemaining(unittest.TestCase):
     def test_parses_a_future_date_correctly(self):
         now = datetime(2026, 7, 20, tzinfo=timezone.utc)

@@ -1565,3 +1565,96 @@ def close_pending_exit_order(order_id, status, filled_at=None):
         conn.commit()
     finally:
         conn.close()
+
+
+def create_shadow_patient_exit(wallet_address, market_slug, outcome, position_key, shares,
+                                init_price, floor_price, immediate_exit_price, close_reason):
+    """Paper-only comparison record (2026-08-01) -- see schema.ts's
+    shadowPatientExit for the full design. Never touches positions/PnL;
+    immediate_exit_price is the real price the bot's actual exit obtained
+    at the same trigger moment, recorded once here so the eventual
+    resolved_price can be compared against it."""
+    conn = _connect()
+    try:
+        row_id = _new_id()
+        conn.execute(
+            "INSERT INTO shadow_patient_exit (id, wallet_address, market_slug, outcome, "
+            "position_key, shares, init_price, floor_price, current_price, immediate_exit_price, "
+            "close_reason, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (row_id, wallet_address, market_slug, outcome, position_key, shares, init_price,
+             floor_price, init_price, immediate_exit_price, close_reason, _now_ts()),
+        )
+        conn.commit()
+        return row_id
+    finally:
+        conn.close()
+
+
+def get_shadow_patient_exits(status="pending"):
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT * FROM shadow_patient_exit WHERE status = ? ORDER BY created_at ASC", (status,)
+        )
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def update_shadow_patient_exit_price(row_id, current_price):
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE shadow_patient_exit SET current_price = ?, last_repriced_at = ? WHERE id = ?",
+            (current_price, _now_ts(), row_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def close_shadow_patient_exit(row_id, status, resolved_price=None):
+    """Terminal transition: 'filled' | 'fallback_timeout' | 'abandoned'.
+    resolved_price is None only for 'abandoned' (market became unreadable
+    mid-simulation, e.g. resolved -- nothing meaningful to compare)."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE shadow_patient_exit SET status = ?, resolved_price = ?, resolved_at = ? WHERE id = ?",
+            (status, resolved_price, _now_ts(), row_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_shadow_patient_exit_comparison_stats(min_samples=None):
+    """Aggregate comparison across all TERMINAL (filled or fallback_timeout)
+    shadow rows -- 'abandoned' rows are excluded since they never produced a
+    real comparison price. Returns None until min_samples closed rows exist
+    (default config.KELLY_SHRINKAGE_PSEUDO_COUNT-style caution: don't draw a
+    conclusion from a handful of samples). avg_uplift_pct > 0 means the
+    simulated patient peg would, on average, have captured a better price
+    than the bot's real immediate exit did."""
+    min_samples = min_samples if min_samples is not None else 20
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT resolved_price, immediate_exit_price, status FROM shadow_patient_exit "
+            "WHERE status IN ('filled', 'fallback_timeout') AND resolved_price IS NOT NULL"
+        )
+        rows = cur.fetchall()
+        if len(rows) < min_samples:
+            return None
+        uplifts = [(r["resolved_price"] - r["immediate_exit_price"]) / r["immediate_exit_price"]
+                   for r in rows if r["immediate_exit_price"]]
+        fill_count = sum(1 for r in rows if r["status"] == "filled")
+        return {
+            "sample_count": len(rows),
+            "fill_count": fill_count,
+            "fill_rate": fill_count / len(rows),
+            "avg_uplift_pct": sum(uplifts) / len(uplifts) if uplifts else None,
+        }
+    finally:
+        conn.close()

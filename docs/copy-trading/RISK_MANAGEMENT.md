@@ -2635,6 +2635,53 @@ Polymarket books, or a market order gives away edge to slippage.
   patient order, and extending it wasn't attempted this round; a real,
   deliberate scope limit, not an oversight.
 
+### 2a. Paper-mode validation of patient exit pegging (2026-08-01 addendum)
+
+**Challenge:** `start_patient_exit()`/`sweep_pending_exit_orders()` above
+are `LIVE_MODE`-only by construction — a real resting limit order has no
+paper-mode analog — but this bot has only ever run in paper mode. Its edge
+has never actually been measured; `config.ENABLE_PATIENT_EXIT_PEGGING`
+would be flipped on real capital purely on the strength of the design
+argument, with zero real data behind it.
+
+- **Mechanism: `start_shadow_patient_exit()`/`sweep_shadow_patient_exits()`,
+  a comparison-only sibling.** Fires unconditionally from
+  `close_position_trailing_tp()` — both paper AND live mode, right
+  alongside whatever exit actually happens — using the exact same
+  `P_init`/`P_floor`/decay math as the real mechanism (`best_ask` as
+  `init_price`, `compute_slippage_floor_price()` off
+  `db.compute_live_edge_pct()`), but driven purely by direct market-data
+  reads (`get_market_bid_ask()`). It never places a bullpen order and never
+  touches `positions` — a new `shadow_patient_exit` table (`packages/db`)
+  records the simulation independently, alongside the `immediate_exit_price`
+  the real exit actually obtained at the same trigger moment, so the two
+  can be compared later.
+- **Fill/timeout semantics have no real order book to poll against**, so
+  they're approximated directly: "filled" once the live `best_bid` reaches
+  or exceeds the current pegged price (the direct analog of a buyer's bid
+  crossing our resting ask); past `config.ORDER_PEG_MAX_TOTAL_WAIT_SECONDS`
+  unfilled, closed at whatever `best_bid` currently is — the same
+  guaranteed-termination discipline as the real mechanism (Rule 6/11: never
+  left resting indefinitely), just with "market sell" approximated as "the
+  current bid" since no real sell is ever placed.
+- **A genuinely unreadable market (resolved, no book) is marked
+  `abandoned` with no `resolved_price`** rather than fabricating a
+  comparison number — an abandoned row would corrupt the aggregate uplift
+  calculation if it were guessed at instead of excluded.
+- **Best-effort by design, never allowed to affect the real exit**: both
+  the create call in `close_position_trailing_tp()` and the sweep in
+  `main()` are wrapped in `try/except` — a bug in this purely-observational
+  feature must never be able to block or crash the real, safety-critical
+  exit it rides alongside.
+- **Reads via `db.get_shadow_patient_exit_comparison_stats()`**: withholds
+  a verdict (`None`) below 20 closed samples, same "don't conclude from a
+  handful of samples" discipline as `db.compute_live_edge_pct()`'s own
+  `min_samples` gate. Once enough samples exist, `avg_uplift_pct > 0` means
+  the simulated peg would, on average, have captured a better price than
+  the bot's real immediate exit — the actual answer to "is
+  `ENABLE_PATIENT_EXIT_PEGGING` worth turning on for real," backed by data
+  instead of only the design argument above.
+
 ### 3. The "static 50% TP activation misses early spikes" problem
 
 **Challenge:** real evidence from the 2026-07-25 sizing report — four

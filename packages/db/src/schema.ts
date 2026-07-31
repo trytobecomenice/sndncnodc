@@ -544,6 +544,46 @@ export const pendingExitOrder = sqliteTable(
   (t) => [index("pending_exit_order_status_idx").on(t.status)]
 );
 
+// Shadow (paper-only, comparison-only) validation of the patient-exit-peg
+// idea from pending_exit_order above — added 2026-08-01 because that
+// mechanism is LIVE_MODE-only by construction (a real resting limit order
+// has no meaning in paper mode) and this bot currently only runs in paper
+// mode, so its actual edge has never been measured. This table records,
+// for EVERY trailing-TP exit (paper AND live), what a patient resting-peg
+// exit would THEORETICALLY have captured — same P_init/P_floor/decay math
+// as pending_exit_order, but driven purely by direct market-data reads
+// (bot.get_market_bid_ask), never a bullpen order. It never touches
+// `positions` or any real risk/PnL accounting; it exists solely to compare
+// resolvedPrice against immediateExitPrice (the price the bot's real,
+// already-executing exit actually got) over enough samples to answer
+// "would pegging have been worth building for real." See
+// bot.sweep_shadow_patient_exits() for the full design.
+export const shadowPatientExit = sqliteTable(
+  "shadow_patient_exit",
+  {
+    id: id(),
+    walletAddress: text("wallet_address").notNull(),
+    marketSlug: text("market_slug").notNull(),
+    outcome: text("outcome").notNull(),
+    positionKey: text("position_key").notNull(),
+    shares: real("shares").notNull(),
+    initPrice: real("init_price").notNull(),
+    floorPrice: real("floor_price").notNull(),
+    currentPrice: real("current_price").notNull(),
+    // The real price the bot's actual (immediate) exit obtained at the same
+    // trigger moment -- the baseline this simulation is measured against.
+    immediateExitPrice: real("immediate_exit_price").notNull(),
+    closeReason: text("close_reason").notNull(),
+    // pending | filled | fallback_timeout | abandoned
+    status: text("status").notNull().default("pending"),
+    resolvedPrice: real("resolved_price"),
+    createdAt: timestampCol("created_at"),
+    lastRepricedAt: integer("last_repriced_at", { mode: "timestamp" }),
+    resolvedAt: integer("resolved_at", { mode: "timestamp" }),
+  },
+  (t) => [index("shadow_patient_exit_status_idx").on(t.status)]
+);
+
 // Portfolio-level risk state, owned exclusively by bot.py's risk layer
 // (risk_manager.py, via db.py) — same ownership rule as the other bot_*
 // plumbing tables: TS owns the DDL, only bot.py reads/writes rows. Known

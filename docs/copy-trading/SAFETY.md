@@ -3872,3 +3872,43 @@ un-mocked connection object). Fixed via an explicit `setUp()`/`tearDown()` patch
 `False` for this whole test class. Lesson for future sessions: flipping a feature's default means
 every OTHER test touching that code path needs re-auditing, not just tests about the feature
 itself.
+
+## 61. Shadow patient-exit — paper-mode validation of Rule 31's patient exit pegging (2026-08-01)
+
+**Trigger**: Rule 31/Sec.53's `start_patient_exit()`/`sweep_pending_exit_orders()` are
+`LIVE_MODE`-only by construction (a real resting limit order has no paper-mode analog), but this
+bot has only ever run in paper mode — `config.ENABLE_PATIENT_EXIT_PEGGING` has never been validated
+against real data, only a design argument. Joey's own next-steps list (item 2) asked for a
+paper-mode way to measure whether it's actually worth turning on.
+
+**What ships**: `start_shadow_patient_exit()`/`sweep_shadow_patient_exits()` — a comparison-only
+sibling of the real mechanism, new `shadow_patient_exit` table (`packages/db`, migration
+`0020_glossy_lockjaw.sql`). `start_shadow_patient_exit()` is called unconditionally from
+`close_position_trailing_tp()` (both paper and live mode) right alongside whatever exit actually
+happens, recording the SAME `P_init`/`P_floor` math as the real mechanism
+(`compute_slippage_floor_price()` off `db.compute_live_edge_pct()`) plus the `immediate_exit_price`
+the real exit obtained, for later comparison — but never places a bullpen order and never touches
+`positions`. `sweep_shadow_patient_exits()` runs every cycle from `main()` (alongside
+`sweep_pending_exit_orders()`), approximating fill as `best_bid >= current pegged price` (no real
+order book to poll) and timing out at `config.ORDER_PEG_MAX_TOTAL_WAIT_SECONDS` closed at whatever
+`best_bid` currently is — same guaranteed-termination discipline as Rule 6/11, just simulated. A
+market that becomes unreadable mid-simulation (resolved, no book) is marked `abandoned` with no
+`resolved_price` rather than fabricating a comparison number.
+
+**Safety property specifically tested**: both call sites (`close_position_trailing_tp()`'s create
+call, `main()`'s sweep call) are wrapped in `try/except` — a bug in this purely-observational
+feature must never be able to block or crash the real exit it rides alongside.
+`TestClosePositionTrailingTpShadowWiring.test_shadow_call_failure_does_not_block_the_real_exit`
+exercises this directly: `start_shadow_patient_exit` raising `RuntimeError` still leaves the real
+position closed and the circuit breaker called.
+
+**Reads via** `db.get_shadow_patient_exit_comparison_stats(min_samples=20)` — withholds a verdict
+below 20 closed samples (same discipline as `compute_live_edge_pct()`'s own gate); once enough
+exist, `avg_uplift_pct` answers whether pegging would have beaten the bot's real immediate exits on
+average, and `fill_rate` shows how often a resting peg would actually have gotten filled at all
+before timing out.
+
+**Tests**: `test_db_shadow_patient_exit.py` (new, +7 — CRUD + comparison-stats aggregation),
+`TestStartShadowPatientExit`/`TestSweepShadowPatientExits`/
+`TestClosePositionTrailingTpShadowWiring` in `test_bot_risk_checks.py` (new, +9). 542 Python tests
+passing (was 526).
