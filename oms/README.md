@@ -44,10 +44,18 @@ human to reconcile") a first-class state instead of an exception path.
   depends on the real `bullpen` binary being installed. Still not
   wired to a live call site.
 
-Session 5 wires `bot.py` in as a client (paper path only). None of this is
-wired into `bot.py` or `LIVE_MODE` yet — see the roadmap doc's Phase 2
-section for the full session-by-session plan and its paper-mode-first
-validation discipline.
+Session 5 (`../oms_client.py`, repo root, not under `oms/` since it's
+Python) is the HTTP client `bot.py` will eventually use —
+`create_order()`/`get_order()`/`cancel_order()`, unit-tested with a mocked
+connection and verified live end-to-end against a real running `omsd`.
+Not wired into `bot.py` yet: the originally-planned call site
+(`sweep_pending_exit_orders()`/`start_patient_exit()`, Rule 31 Priority 3)
+turned out to be `LIVE_MODE`-only by construction, so it would never
+actually run against this bot's paper-only configuration — Session 6
+targets `start_shadow_patient_exit()`/`sweep_shadow_patient_exits()`
+instead (fires in paper mode on every real trailing-TP exit). See the
+roadmap doc's Phase 2 section for the corrected session-by-session plan
+and its paper-mode-first validation discipline.
 
 ## Development
 

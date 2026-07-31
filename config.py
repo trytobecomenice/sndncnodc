@@ -1152,6 +1152,14 @@ POOL_REFILL_ACTIVITY_SAMPLE_SIZE = 50
 # same "no new open ports" posture as the rest of this deploy post-2026-07-29).
 METRICS_PORT = 9100
 
+# Go OMS service (oms/, Phase 2 of the architecture roadmap) — localhost
+# only, matches oms/cmd/omsd's own default OMS_ADDR. See oms_client.py.
+# Not wired into any real call site yet; both values match the Go service's
+# own defaults purely so a local `go run ./oms/cmd/omsd` and this client
+# agree without extra configuration.
+OMS_HOST = "127.0.0.1"
+OMS_PORT = 8090
+
 # Telegram alerts no-op safely (never raise, never block the main loop) if
 # TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID aren't set in .env -- see
 # telegram_alerts.py. Both env vars already existed in .env.example
