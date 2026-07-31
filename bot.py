@@ -1086,6 +1086,48 @@ def _parse_market_resolution(market_info):
     return {str(name).lower(): float(p) for name, p in zip(outcomes, prices)}
 
 
+def _trade_age_seconds(trade):
+    """Seconds between now and trade["timestamp"] (the
+    "%Y-%m-%d %H:%M:%S UTC" string polymarket_data_api.py formats — see
+    format_trade()), or None if missing/unparseable. Used by process_trade()
+    to decide whether a BUY signal is old enough to warrant an extra
+    resolved-market sanity check (config.STALE_TRADE_RESOLUTION_CHECK_SECONDS)
+    before opening a position.
+    """
+    ts = trade.get("timestamp")
+    if not ts:
+        return None
+    try:
+        dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+    return (datetime.now(timezone.utc) - dt).total_seconds()
+
+
+def _market_already_resolved(market_slug, risk_state):
+    """True if market_slug has already settled — checks risk_state's
+    in-memory "resolved_markets" cache first (free after the first hit for
+    a given market this process), only falling back to a live metadata
+    fetch + _parse_market_resolution() the first time a market is asked
+    about. A fetch failure is NOT treated as "resolved" (fails open here,
+    deliberately the opposite of resolve_market_event()'s fail-closed
+    doctrine): this is a belt-and-suspenders sanity check on an otherwise-
+    legitimate-looking signal, not itself a primary risk gate, and a
+    transient metadata-fetch error must not block a genuinely fresh buy.
+    """
+    resolved_markets = risk_state.setdefault("resolved_markets", set())
+    if market_slug in resolved_markets:
+        return True
+    try:
+        market_info = polymarket_simulator.fetch_market_metadata(market_slug)
+    except Exception:
+        return False
+    if _parse_market_resolution(market_info) is not None:
+        resolved_markets.add(market_slug)
+        return True
+    return False
+
+
 # Consecutive closeout-sweep fetch failures per market_slug, used ONLY to
 # throttle repeated error logging (added 2026-07-19). During a bullpen
 # backend outage the hourly sweep re-logged an identical "market check
@@ -2409,6 +2451,20 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
     key = position_key(trader, market_slug, outcome)
 
     if side == "BUY":
+        # Resolved-market guard (2026-07-31) — see config.
+        # STALE_TRADE_RESOLUTION_CHECK_SECONDS and _market_already_resolved()'s
+        # docstrings. Checked before anything else in this branch (including
+        # the muted-trader/Shadow-Rehab path) so a stale replayed trade can't
+        # balloon a shadow position either.
+        age = _trade_age_seconds(trade)
+        if age is not None and age > config.STALE_TRADE_RESOLUTION_CHECK_SECONDS \
+                and _market_already_resolved(market_slug, risk_state):
+            append_log({**base_event, "event_type": "skip_resolved_market_stale_trade",
+                        "reason": f"source trade is {age / 3600:.1f}h old and {market_slug} "
+                                  f"has already resolved — refusing to open a fresh position "
+                                  f"from a stale/replayed signal"})
+            return
+
         # 'Dual-Track' reconciliation (2026-07-25): a polling-observed BUY
         # (always has an accurate whale price/size, being the purpose-built
         # feed) for a key WSS already opened with only an ESTIMATED dollar
@@ -2970,7 +3026,25 @@ def _mark_trade_seen(seen_by_wallet, seen_set, wallet_address, trade_id):
     time bot.py restarts. wallet_address=None (pre-2026-07-31 legacy rows
     with no attribution) is grouped into one _UNKNOWN_WALLET_KEY bucket so it
     can't grow unbounded either.
+
+    Idempotent (2026-07-31 fix): a no-op if trade_id is already in seen_set.
+    Found live in production: a duplicate trade_id within the SAME raw feed
+    batch (the caller's new_trades filter only checks seen_set once, before
+    the per-trade loop, not per-iteration) used to append a second copy of
+    the same id into dq. deque(maxlen=N) then evicts the FIRST copy on some
+    later append and seen_set.discard()'s it — while the second, still-live
+    copy sat deeper in the deque, un-eviction-tracked, silently un-deduping
+    an already-processed trade the moment the first copy's slot rotated out.
+    Confirmed live: a single resolved-market trade for
+    will-spain-win-the-2026-fifa-world-cup-963 (and 19 other already-settled
+    markets) got re-opened as a fresh paper_buy roughly hourly for 14+
+    hours, each one immediately closed out again by the next hourly
+    resolution sweep — corrupting realized_pnl_total() (which directly feeds
+    risk_manager.compute_equity(), i.e. the drawdown kill switch) with
+    repeated phantom PnL for trades that had already been booked.
     """
+    if trade_id in seen_set:
+        return
     wallet_key = (wallet_address or "").lower() or _UNKNOWN_WALLET_KEY
     dq = seen_by_wallet.setdefault(wallet_key, deque(maxlen=config.SEEN_TRADE_IDS_PER_WALLET_CAP))
     if len(dq) == dq.maxlen:
@@ -3045,6 +3119,16 @@ def main():
         # shifted" apart from "we changed the scoring formula out from
         # under it." None on a fresh DB with no active rule_set yet.
         "active_rule_set_version": get_active_rule_set_version(),
+        # Resolved-market guard (2026-07-31 fix, belt-and-suspenders
+        # alongside the _mark_trade_seen() idempotency fix above): once a
+        # market_slug is confirmed resolved, remembered here for the rest
+        # of this process's life so a stale trade for it (from any dedup
+        # gap, present or future) can never open a fresh position again.
+        # In-memory only, not persisted — a restart just re-pays one cheap
+        # metadata fetch the next time that market_slug is (still
+        # incorrectly) offered as a buy signal, which is the rare case this
+        # guard exists for in the first place.
+        "resolved_markets": set(),
     }
 
     logger.info(f"Copybot starting — mode={'LIVE' if config.LIVE_MODE else 'PAPER'}, "
@@ -3162,6 +3246,19 @@ def main():
                 trade["detected_by"] = "polling"
                 tid = trade.get("trade_id")
                 if tid:
+                    # Re-check seen_set per-iteration, not just via the
+                    # new_trades filter above (2026-07-31 fix): if the SAME
+                    # trade_id appears twice in one raw feed batch, both
+                    # copies pass that one-time pre-loop filter (neither is
+                    # in seen_set yet when it runs) and would otherwise both
+                    # reach process_trade() below — a real double-copy of
+                    # the same trade in a single poll cycle. See
+                    # _mark_trade_seen()'s docstring for the production
+                    # incident (will-spain-win-the-2026-fifa-world-cup-963
+                    # and 19 other resolved markets, phantom-recopied
+                    # hourly) this combines with to close.
+                    if tid in seen_set:
+                        continue
                     _mark_trade_seen(seen_trade_ids_by_wallet, seen_set, trade.get("user_address"), tid)
                 # Persist the seen-mark BEFORE the trade can execute: if we
                 # crash mid-order, restart must treat this trade as already

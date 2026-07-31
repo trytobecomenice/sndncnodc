@@ -7,7 +7,7 @@ Run: python3 -m unittest test_bot_risk_checks -v
 
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import bot
@@ -58,6 +58,37 @@ class TestMarkTradeSeen(unittest.TestCase):
         bot._mark_trade_seen(seen_by_wallet, seen_set, None, "legacy-1")
         self.assertIn(bot._UNKNOWN_WALLET_KEY, seen_by_wallet)
         self.assertIn("legacy-1", seen_set)
+
+    def test_marking_an_already_seen_trade_is_a_no_op(self):
+        seen_by_wallet, seen_set = {}, set()
+        bot._mark_trade_seen(seen_by_wallet, seen_set, "0xTrader", "t0")
+        bot._mark_trade_seen(seen_by_wallet, seen_set, "0xTrader", "t0")
+        self.assertEqual(list(seen_by_wallet["0xtrader"]), ["t0"])
+
+    def test_duplicate_mark_does_not_desync_seen_set_from_the_deque(self):
+        """Regression for a real production incident (2026-07-31): before
+        this fix, marking the same trade_id seen twice (e.g. it appears
+        twice within one raw feed batch) left a duplicate entry in the
+        wallet's deque. Once the per-wallet cap later rotated past the
+        FIRST copy, seen_set.discard() removed the tid globally even though
+        a second, still-live copy remained deeper in the deque -- desyncing
+        seen_set from the deque and silently un-deduping an
+        already-processed trade. Confirmed live:
+        will-spain-win-the-2026-fifa-world-cup-963 (and 19 other already-
+        resolved markets) got re-opened as a fresh paper_buy roughly hourly
+        for 14+ hours, corrupting realized_pnl_total() -- which directly
+        feeds risk_manager.compute_equity(), i.e. the drawdown kill switch
+        -- with repeated phantom PnL.
+        """
+        seen_by_wallet, seen_set = {}, set()
+        bot._mark_trade_seen(seen_by_wallet, seen_set, "0xTrader", "t0")
+        bot._mark_trade_seen(seen_by_wallet, seen_set, "0xTrader", "t0")  # duplicate mark
+        for i in range(1, 3):
+            bot._mark_trade_seen(seen_by_wallet, seen_set, "0xTrader", f"t{i}")
+        # cap is 3 (setUp); the deque must hold exactly one copy of each
+        # distinct id, not a duplicate "t0" crowding out "t2".
+        self.assertEqual(list(seen_by_wallet["0xtrader"]), ["t0", "t1", "t2"])
+        self.assertIn("t0", seen_set)
 
 
 class TestSlippageCeiling(unittest.TestCase):
@@ -1779,6 +1810,112 @@ class TestProcessTradeDualTrackReconciliation(unittest.TestCase):
         recon_events = [c for c in mock_log.call_args_list
                         if c.args[0].get("event_type") == "whale_price_reconciled"]
         self.assertEqual(recon_events, [])
+
+
+class TestTradeAgeSeconds(unittest.TestCase):
+    def test_parses_the_formatted_utc_timestamp(self):
+        ts = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S UTC")
+        age = bot._trade_age_seconds({"timestamp": ts})
+        self.assertAlmostEqual(age, 2 * 3600, delta=5)
+
+    def test_none_on_missing_timestamp(self):
+        self.assertIsNone(bot._trade_age_seconds({}))
+
+    def test_none_on_unparseable_timestamp(self):
+        self.assertIsNone(bot._trade_age_seconds({"timestamp": "t"}))
+
+
+class TestMarketAlreadyResolved(unittest.TestCase):
+    def test_true_and_cached_when_metadata_shows_resolved(self):
+        risk_state = {}
+        market_info = {"closed": True, "umaResolutionStatus": "resolved",
+                       "outcomes": ["Yes", "No"], "outcomePrices": ["1", "0"]}
+        with patch("bot.polymarket_simulator.fetch_market_metadata",
+                   return_value=market_info) as mock_fetch:
+            self.assertTrue(bot._market_already_resolved("m1", risk_state))
+            # Second call for the SAME market must hit the cache, not refetch.
+            self.assertTrue(bot._market_already_resolved("m1", risk_state))
+        mock_fetch.assert_called_once()
+        self.assertIn("m1", risk_state["resolved_markets"])
+
+    def test_false_when_market_still_open(self):
+        risk_state = {}
+        with patch("bot.polymarket_simulator.fetch_market_metadata",
+                   return_value={"closed": False}):
+            self.assertFalse(bot._market_already_resolved("m1", risk_state))
+        self.assertNotIn("m1", risk_state.get("resolved_markets", set()))
+
+    def test_false_on_fetch_failure_not_treated_as_resolved(self):
+        risk_state = {}
+        with patch("bot.polymarket_simulator.fetch_market_metadata",
+                   side_effect=Exception("network error")):
+            self.assertFalse(bot._market_already_resolved("m1", risk_state))
+
+
+class TestProcessTradeResolvedMarketGuard(unittest.TestCase):
+    """Belt-and-suspenders guard (2026-07-31) alongside the _mark_trade_seen()
+    idempotency fix: a BUY signal old enough to be suspicious
+    (config.STALE_TRADE_RESOLUTION_CHECK_SECONDS) gets one live resolution
+    check before opening a position. Regression coverage for the production
+    incident where a stale, already-resolved-market trade kept re-copying
+    itself roughly hourly, corrupting realized_pnl_total() (and therefore
+    the drawdown kill switch)."""
+
+    def _kwargs(self, age_hours, **trade_overrides):
+        ts = (datetime.now(timezone.utc) - timedelta(hours=age_hours)).strftime(
+            "%Y-%m-%d %H:%M:%S UTC") if age_hours is not None else "t"
+        trade = {
+            "user_address": "0xTrader", "market_slug": "some-market", "outcome": "Yes",
+            "side": "BUY", "price": 0.55, "size_usd": 5.5, "trade_id": "tid-1",
+            "timestamp": ts, "market_title": "", "detected_by": "polling",
+        }
+        trade.update(trade_overrides)
+        return dict(
+            trade=trade, positions={}, source_positions={}, source_cost_basis={},
+            trader_performance={}, muted_traders={},
+            tracked_by_lower={"0xtrader": ("0xTrader", "nick")},
+            risk_state={"market_to_event": {"some-market": "some-event"},
+                        "market_to_category": {"some-market": "crypto"}, "kill_switch": None},
+            wallet_scores={},
+        )
+
+    def test_stale_trade_on_a_resolved_market_is_skipped(self):
+        with patch("bot.polymarket_simulator.fetch_market_metadata",
+                   return_value={"closed": True, "umaResolutionStatus": "resolved",
+                                 "outcomes": ["Yes", "No"], "outcomePrices": ["1", "0"]}), \
+             patch("bot.risk_manager.check_buy") as mock_check_buy, \
+             patch("bot.append_log") as mock_log:
+            bot.process_trade(**self._kwargs(age_hours=2))
+
+        mock_check_buy.assert_not_called()
+        skip_events = [c for c in mock_log.call_args_list
+                       if c.args[0].get("event_type") == "skip_resolved_market_stale_trade"]
+        self.assertEqual(len(skip_events), 1)
+
+    def test_stale_trade_on_a_still_open_market_proceeds_normally(self):
+        with patch("bot.polymarket_simulator.fetch_market_metadata",
+                   return_value={"closed": False}), \
+             patch("bot.risk_manager.check_buy",
+                   return_value=(False, "skip_risk_exposure_ceiling", "over cap")), \
+             patch("bot.fetch_book_depth_usd", return_value=None), \
+             patch("bot.append_log") as mock_log:
+            bot.process_trade(**self._kwargs(age_hours=2))
+
+        skip_events = [c for c in mock_log.call_args_list
+                       if c.args[0].get("event_type") == "skip_resolved_market_stale_trade"]
+        self.assertEqual(skip_events, [])
+
+    def test_fresh_trade_never_triggers_a_resolution_fetch_at_all(self):
+        """The whole point of gating on age first: a genuinely fresh signal
+        (the overwhelming common case) must cost nothing extra."""
+        with patch("bot.polymarket_simulator.fetch_market_metadata") as mock_fetch, \
+             patch("bot.risk_manager.check_buy",
+                   return_value=(False, "skip_risk_exposure_ceiling", "over cap")), \
+             patch("bot.fetch_book_depth_usd", return_value=None), \
+             patch("bot.append_log"):
+            bot.process_trade(**self._kwargs(age_hours=0.01))
+
+        mock_fetch.assert_not_called()
 
 
 class TestProcessTradeSellShortfallWiring(unittest.TestCase):

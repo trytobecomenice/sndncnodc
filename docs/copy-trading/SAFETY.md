@@ -3430,3 +3430,77 @@ eviction order, case normalization, `None`-wallet bucketing). 454 Python
 tests passing (was 446). **Needs BOTH a `bot.py` restart AND `pnpm run
 db:migrate` applied wherever this deploys** — not yet live as of this
 entry.
+
+## 52. `_mark_trade_seen()` idempotency fix + resolved-market guard (Rule 14 addendum, 2026-07-31)
+
+**Trigger**: user asked for a status check ("how is the bot running today");
+found the drawdown kill switch latched (2026-07-30T23:56:50Z, equity
+$4278.12 vs. peak $6783.03) on a book (`strategy="bot_filtered"`, 49 open
+positions, $341 cost basis) far too small to produce that swing. Traced to
+`bot_event_log`: `will-spain-win-the-2026-fifa-world-cup-963` (and 19 other
+already-resolved markets) had the exact SAME `source_trade_id` re-processed
+into a fresh `paper_buy` roughly hourly for 14+ hours — each immediately
+closed out again by the next hourly closeout sweep with the identical
+`pnl_usd`, on the live process §51's per-wallet dedup fix was already
+running on. §51 closed the restart-time eviction gap; this is a DIFFERENT
+gap, live within a single continuously-running process.
+
+**Root cause**: `_mark_trade_seen()` was not idempotent. The main loop's
+`new_trades = [t for t in trades if t.get("trade_id") not in seen_set]`
+filter runs ONCE, before the per-trade loop — if the same trade_id is
+present twice in one raw poll batch, both copies pass this filter (neither
+is in `seen_set` yet when it runs), and the loop calls both
+`_mark_trade_seen()` AND `process_trade()` twice for the same real trade.
+The second `_mark_trade_seen()` call appended a SECOND copy of the same
+trade_id into the wallet's bounded deque without checking whether it was
+already there. When `SEEN_TRADE_IDS_PER_WALLET_CAP`'s rotation later
+evicted the FIRST copy, `seen_set.discard(dq[0])` removed the trade_id from
+`seen_set` globally — while the second, still-live copy remained deeper in
+the deque, invisible to that discard. `seen_set` and the deque desync: the
+trade_id reads as "unseen" again well before the wallet's own 100-slot cap
+should have naturally forgotten it, and the exact same stale trade gets
+copied again.
+
+**Fix, in `bot.py`**:
+1. `_mark_trade_seen()` — now a no-op (`return` immediately) if `trade_id`
+   is already in `seen_set`, so a duplicate mark from any source can never
+   create a second deque entry for the same id.
+2. Main polling loop — added `if tid in seen_set: continue` immediately
+   before marking/processing each trade in `new_trades`, closing the
+   specific within-batch-duplicate route that produced the double-mark.
+3. `_market_already_resolved(market_slug, risk_state)` (new) +
+   `config.STALE_TRADE_RESOLUTION_CHECK_SECONDS = 3600` — belt-and-
+   suspenders guard in `process_trade()`'s BUY branch, checked first
+   (before the muted-trader/Shadow-Rehab path too): a BUY signal whose own
+   `timestamp` is more than 1 hour old gets one live
+   `polymarket_simulator.fetch_market_metadata()` +
+   `_parse_market_resolution()` check; refuses to open a position if the
+   market has already settled, independent of whatever dedup mechanism let
+   the stale signal through. Result cached in
+   `risk_state["resolved_markets"]` (in-memory, not persisted — a restart
+   just re-pays one cheap fetch the next time, which should be rare) so a
+   confirmed-resolved market never pays this cost twice; a fresh (<1h)
+   signal — the normal case — never calls it at all. Fails OPEN on a fetch
+   error (deliberately the opposite of `resolve_market_event()`'s
+   fail-closed doctrine): this is a sanity check on an otherwise-legitimate
+   signal, not itself a primary risk gate, so a transient network error
+   must not block a genuine buy.
+
+**Examined, not changed**: Shadow Rehab's `_execute_shadow_buy()` (Rule 37)
+deliberately has no per-position buy cap — confirmed by design intent in
+its own 2026-07-27 docstring, and confirmed the kill switch's
+`compute_equity()` only ever reads `strategy="bot_filtered"` positions, so
+this is NOT what corrupted the kill switch. It does inflate
+`daily_portfolio_snapshots`'s dashboard figures (one muted wallet's shadow
+position alone reached 2,364 buys / $11,820 phantom cost basis, of a
+258-position / $121,619 total shadow book) — flagged, left for a separate
+decision.
+
+**Tests**: `TestMarkTradeSeen` (+2: marking an already-seen id is a no-op;
+duplicate-mark doesn't desync `seen_set` from the deque — direct regression
+for this incident), `TestTradeAgeSeconds` (+3), `TestMarketAlreadyResolved`
+(+3), `TestProcessTradeResolvedMarketGuard` (+3) in
+`test_bot_risk_checks.py`. 465 Python tests passing (was 454). **Needs a
+`bot.py` restart to take effect — not yet live as of this entry.** The kill
+switch stays latched pending this deploy; do not `reset_kill_switch.py`
+before it's live.

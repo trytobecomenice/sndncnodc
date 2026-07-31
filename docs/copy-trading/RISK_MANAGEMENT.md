@@ -917,6 +917,60 @@ passing (was 446; +4 `test_db_seen_trade.py`, +4 `TestMarkTradeSeen`). Docs: thi
 `SAFETY.md` §51. **Needs a `bot.py` restart AND the new migration applied (`pnpm run db:migrate`)
 to take effect** — not yet live as of this entry.
 
+**Addendum 2026-07-31 (later same day) — `_mark_trade_seen()` idempotency bug + resolved-market
+guard.**
+
+> **Challenge:** the per-wallet dedup fix above (deployed, restarted, live) did NOT fully close the
+> "already-resolved trade replayed as new" failure mode — the SAME real trade for
+> `will-spain-win-the-2026-fifa-world-cup-963` (and 19 other long-resolved markets) kept getting
+> re-opened as a fresh paper_buy roughly hourly for 14+ hours on the live, freshly-restarted process,
+> each closed out again by the next hourly closeout sweep. **This directly corrupted
+> `realized_pnl_total()` — which feeds `risk_manager.compute_equity()`, i.e. the drawdown kill
+> switch — with repeated phantom PnL**, latching the kill switch on 2026-07-30 based on a fabricated
+> equity swing (peak $6783.03 → $4278.12 in under an hour), not a real drawdown.
+> **Mechanism:** `_mark_trade_seen()` was not idempotent. If a trade_id is ever marked seen TWICE
+> (confirmed live route: the same trade_id present twice within one raw poll batch — the
+> `new_trades` filter only checks `seen_set` once, before the per-trade loop, not per iteration, so
+> both copies pass and `process_trade()`/`_mark_trade_seen()` both ran twice), the wallet's bounded
+> deque gets a duplicate entry. When the per-wallet cap (`SEEN_TRADE_IDS_PER_WALLET_CAP=100`) later
+> rotates past the FIRST copy, `seen_set.discard(dq[0])` removes the trade_id from `seen_set`
+> globally — even though a second, still-live copy remains deeper in the deque. `seen_set` and the
+> deque desync; the trade_id looks "unseen" again the next time the same stale trade shows up in the
+> feed, well before the 100-slot cap should have naturally forgotten it.
+
+Two fixes, in `bot.py`:
+
+1. **`_mark_trade_seen()` made idempotent** — a no-op if `trade_id` is already in `seen_set`, so a
+   duplicate mark (from any source) can never desync the deque from `seen_set` again.
+2. **In-loop re-check** in the main polling loop: `if tid in seen_set: continue` immediately before
+   marking/processing each trade, closing the specific within-batch-duplicate route that produced
+   the double-mark in the first place.
+3. **Belt-and-suspenders resolved-market guard** (`_market_already_resolved()`,
+   `config.STALE_TRADE_RESOLUTION_CHECK_SECONDS = 3600`): a BUY signal whose own reported timestamp
+   is more than 1 hour old gets one live resolution check before opening a position — refuses to buy
+   if the market has already settled, regardless of how a stale trade slipped past dedup. Cached
+   per-market in-memory (`risk_state["resolved_markets"]`) once confirmed resolved, so this costs
+   nothing on repeat; a fresh (<1h) signal — the overwhelming common case — never pays this check at
+   all. Placed before the muted-trader check in `process_trade()`'s BUY branch so a stale replay
+   can't balloon a Shadow Rehab position either.
+
+**Not itself a bug, but re-examined and left unchanged**: Shadow Rehab's lack of a per-position buy
+cap (`_execute_shadow_buy()`, Rule 37) was flagged during this investigation — one muted, highly
+active wallet's shadow position had accumulated 2,364 buys / $11,820 phantom cost basis (of a
+258-position / $121,619 total shadow book). This is confirmed to be a deliberate 2026-07-27 design
+choice ("multiple shadow buys into the same market simply average up freely" — shadow positions
+never touch `risk_manager`/exposure calculations, confirmed: the kill switch's `compute_equity()`
+call only ever sees `strategy="bot_filtered"` positions), not the cause of the kill-switch
+corruption above. It does, however, distort `daily_portfolio_snapshots`'s dashboard-facing
+`total_equity`/`total_unrealized_pnl` figures, which are not strategy-filtered. Left as-is pending a
+separate decision — see [[pending-next-steps]].
+
+454 → 465 Python tests passing (+2 `TestMarkTradeSeen` regression tests, +3 `TestTradeAgeSeconds`,
++3 `TestMarketAlreadyResolved`, +3 `TestProcessTradeResolvedMarketGuard`). Docs: this addendum;
+`SAFETY.md` §52. **Needs a `bot.py` restart to take effect — not yet deployed as of this entry.**
+The kill switch remains latched (triggered 2026-07-30T23:56:50Z) and should NOT be reset until this
+fix is live; the underlying `bot_filtered` book itself is healthy (49 positions, $341 cost basis).
+
 ---
 
 ## 15. Confidence-weighted position sizing

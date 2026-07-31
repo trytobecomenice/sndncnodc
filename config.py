@@ -540,6 +540,23 @@ DIRECT_API_PER_WALLET_LIMIT = 20
 # ever need to never re-see its own already-processed trades.
 SEEN_TRADE_IDS_PER_WALLET_CAP = 100
 
+# Belt-and-suspenders guard (2026-07-31), alongside the _mark_trade_seen()
+# idempotency fix in bot.py: a BUY signal whose own reported timestamp is
+# older than this gets one extra live resolution check
+# (_market_already_resolved()) before opening a position, refusing to buy
+# if the market has already settled. Confirmed live in production: a dedup
+# gap (fixed alongside this) let a handful of already-resolved-market
+# trades get silently un-deduped and re-copied as "new" roughly hourly for
+# 14+ hours, each closed out again by the next hourly closeout sweep —
+# repeatedly injecting phantom realized PnL into realized_pnl_total(),
+# which corrupted risk_manager.compute_equity() (the drawdown kill switch)
+# with a fake equity swing. 1 hour: comfortably longer than any genuine
+# copy-trading signal should ever be (this bot's own poll cadence is 30s),
+# short enough that this extra fetch essentially never fires for real,
+# fresh activity — only for exactly the pathological stale-replay case
+# this exists to catch.
+STALE_TRADE_RESOLUTION_CHECK_SECONDS = 3600
+
 # Seconds between recovery-check attempts once the bot has HALTED on a
 # bullpen authentication failure (exit code 2 — see BullpenAuthError in
 # bullpen_client.py). Deliberately much slower than POLL_INTERVAL_SECONDS:
