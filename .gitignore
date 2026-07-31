@@ -11,6 +11,9 @@ wss_listener.out.log
 watchdog.out.log
 watchdog.cron.log
 data/watchdog_paused
+autodeploy.out.log
+autodeploy.cron.log
+data/autodeploy.lock
 *.pre-cutover-*
 .claude/settings.local.json
 

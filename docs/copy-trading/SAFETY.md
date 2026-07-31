@@ -3737,3 +3737,36 @@ here — flagged as a real fast-follow, not solved silently.
 **Tests**: `test_watchdog.py` (+5: no-op when paused, no-op when already alive, restart+two-alert
 happy path, restart-failed alert path, sanity check that the pause-path fixture itself works).
 493 Python tests passing (was 488).
+
+## 57. `autodeploy.py` — automated git-pull-test-restart pipeline (2026-07-31)
+
+**Why**: every deploy this entire session was manual — `git pull`, kill the old `bot.py`, start the
+new one, by hand, every single time a fix shipped. Joey explicitly asked for this to become
+automatic. **This is a real, deliberate increase in autonomy**: a future push to `main` now goes
+live within one cron tick (default every 5 min) with no human reviewing that specific commit
+first — flagged here explicitly, not left implicit.
+
+**What it does**: cron-triggered (see crontab entry below). Each run: skip if
+`data/autodeploy.lock` exists (a previous run still in flight — prevents overlapping deploys). Else
+`git fetch origin main`; if `HEAD` already matches `origin/main`, no-op. Otherwise: alert
+("detected"), `git pull`, then run the **full test suite as a hard gate**
+(`python3 -m unittest discover`). Only if tests pass does it touch `bot.py` at all — pauses
+`watchdog.py` via the SAME `data/watchdog_paused` sentinel §56 already defined (without this, the
+watchdog's own every-2-minute check could race this script's `stop_bot()`/`start_bot()` and
+"helpfully" restart the OLD code first), stops the old process, starts the new one, confirms the
+new pid, un-pauses the watchdog, and sends a final success/failure alert.
+
+**If tests fail, `git reset --hard` back to the pre-pull commit — bot.py is never touched at all**,
+still running the last known-good code. This is the one property that makes "no human reviews each
+push" acceptable: a broken commit can get pulled and tested, but can never get run.
+
+**Deployment**: cron entry on the EC2 box, every 5 minutes:
+```
+*/5 * * * * cd /home/ubuntu/polymarket-copybot && /usr/bin/python3 autodeploy.py >> autodeploy.cron.log 2>&1
+```
+
+**Tests**: `test_autodeploy.py` (+6: no-op when locked, no-op when already up to date, happy-path
+deploy+restart with both alerts, pull-failure alert without touching `bot.py`, test-failure
+triggers a real `git reset --hard` and never calls `stop_bot()`/`start_bot()`, a successful deploy
+whose restart itself fails still alerts urgently and releases the watchdog pause). 499 Python
+tests passing (was 493).
