@@ -3833,3 +3833,42 @@ NOT presented as the fix for the larger problem — see RISK_MANAGEMENT.md Rule 
 the full honest accounting. No code changes, no new tests (existing `TestCheckTrailingTakeProfit`
 coverage already exercises both the enabled and disabled paths via explicit `patch.object` in
 each test, never relying on the module-level default) — 521 Python tests still passing.
+
+## 60. Parallelized TTP price fetch (Rule 7 addendum, 2026-07-31)
+
+**Trigger**: fast-resolving esports matches sometimes got no exit at all — a match can start and
+finish inside the 5-minute gap between `check_trailing_take_profit()` sweeps, and that sweep
+historically priced every position ONE AT A TIME (>120s across 79 positions, back when this used a
+bullpen subprocess per position), which is the real reason the interval couldn't safely be
+shortened. Joey asked directly whether C++ would help — checked honestly before assuming: no, this
+is the bot's own fetch-one-at-a-time pattern, not market illiquidity (unlike Sec.53's/Rule 7's
+earlier addendum), so the fix is Python-level I/O concurrency, not a language rewrite.
+
+**What ships**: `check_trailing_take_profit(..., executor=None)` — passed `bot.py`'s existing
+single long-lived `ThreadPoolExecutor` (`direct_feed_executor`, already used for wallet-trade
+fetching, no second pool created), parallelizes `get_market_prices()` and (when theta-decay TP is
+on) `resolve_market_end_date()` — the latter deduplicated by `market_slug` first, since several
+positions can share one market. The decide-and-act phase (peak tracking, arming/firing an exit,
+`close_position_trailing_tp()` which can move real money in `LIVE_MODE`) stays strictly
+SEQUENTIAL afterward in the main thread, reading from already-fetched results — concurrency never
+touches `positions` or an actual sell decision. `executor=None` (default) preserves the exact
+original one-at-a-time behavior — every existing caller/test needed zero changes. Wired into
+`main()`'s own TTP sweep call site, reusing `direct_feed_executor`.
+
+**Tests**: `TestCheckTrailingTakeProfitParallelFetch` (+5, new class) — uses a REAL
+`ThreadPoolExecutor`, not a mock of the pool itself, to genuinely exercise the concurrent wiring:
+parallel and sequential paths both price every eligible position correctly, one position's fetch
+exception doesn't abort the others, end-date resolution is deduplicated by market_slug under
+concurrency, an empty position book never touches the executor at all. 526 Python tests passing
+(was 521).
+
+**Real test-isolation bug caught while writing these, unrelated to the parallelization itself**: a
+test that didn't explicitly disable `ENABLE_THETA_DECAY_TP_ACTIVATION` (flipped to `True` by
+default earlier the same session, Sec.59) silently attempted a real, unmocked network call via
+`resolve_market_end_date()` on the main thread — fails soft internally so it never raised, but was
+confirmed to corrupt an unrelated LATER test's mocked `http.client.HTTPSConnection` state when run
+in the same process (`polymarket_simulator`'s per-thread connection cache holding onto a stale,
+un-mocked connection object). Fixed via an explicit `setUp()`/`tearDown()` patching the flag
+`False` for this whole test class. Lesson for future sessions: flipping a feature's default means
+every OTHER test touching that code path needs re-auditing, not just tests about the feature
+itself.

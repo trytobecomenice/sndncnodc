@@ -408,6 +408,50 @@ timing.
 > copied at all. 488 Python tests passing (was 480; +4 `TestGetMarketPrices` stale-fallback
 > regressions in this addendum, +4 Rule 27's).
 
+**Addendum 2026-07-31 (same day, later) — TTP price fetch parallelized.**
+
+> **Challenge:** investigating the Rule 26/31 resolution-loss finding surfaced a second, distinct
+> latency problem: fast-resolving markets (esports matches that can go from a large peak straight
+> to `resolved` within minutes) sometimes got NO exit at all, because `check_trailing_take_profit()`
+> only runs once per `TRAILING_TP_CHECK_INTERVAL_SECONDS` (5 min) — a match can start and finish
+> inside one gap between sweeps. Confirmed live: 3 of 4 trades that reached a real peak (>=50%) but
+> still ended `resolved` (missed their exit) were the same wallet's Dota2 matches.
+> **Root contributor to the 5-minute interval itself, not just a symptom:** the sweep historically
+> priced every open position ONE AT A TIME — "a full sweep is one price fetch per open position
+> (measured >120s across 79 positions)" back when this used a bullpen subprocess per position — so
+> shortening the interval below what a full sequential sweep itself takes was never viable.
+> **Checked honestly before assuming C++ was the answer** (Joey asked directly): this is NOT a
+> market-illiquidity problem like Rule 7's stale-order-book addendum above — it's the bot's own
+> fetch-one-at-a-time pattern. The fix is Python-level I/O concurrency, the same pattern already
+> proven for wallet-trade fetching (`polymarket_data_api.make_persistent_executor()`), not a
+> language rewrite — a genuine instance of the 4-layer roadmap's own "validate the bottleneck
+> before investing in speed" principle, this time landing on "don't reach for C++ yet" for a
+> different, concrete reason than the illiquidity case.
+
+**Fixed**: `check_trailing_take_profit()` gained an optional `executor` parameter. Passed
+`bot.py`'s existing single long-lived `ThreadPoolExecutor` (`direct_feed_executor`, already used
+for wallet-trade fetching — no second pool created), it parallelizes `get_market_prices()` (and,
+when theta-decay is on, `resolve_market_end_date()`, deduplicated by `market_slug` first since
+several positions can share one market) across every eligible position at once. The
+DECIDE-and-ACT phase — updating `peak_profit_pct`, arming/firing an exit, calling
+`close_position_trailing_tp()` (which can move real money in `LIVE_MODE`) — stays strictly
+SEQUENTIAL in the main thread afterward, reading from the already-fetched results: concurrency
+only ever touches the read-only network fetch, never `positions`/an actual sell decision.
+`executor=None` (default) falls back to the original one-at-a-time behavior, byte-for-byte — no
+existing caller is forced to change. 526 Python tests passing (was 521; +5
+`TestCheckTrailingTakeProfitParallelFetch`, using a REAL `ThreadPoolExecutor` to genuinely
+exercise the concurrent wiring rather than mocking the pool itself).
+
+**Real bug caught while writing these tests, unrelated to the parallelization itself**: a test that
+didn't explicitly disable `ENABLE_THETA_DECAY_TP_ACTIVATION` (now `True` by default as of this
+same session's Rule 31 addendum) silently attempted a real, unmocked network call via
+`resolve_market_end_date()` — which fails soft internally so it didn't raise, but was confirmed to
+corrupt an unrelated LATER test's mocked `http.client.HTTPSConnection` state when run in the same
+process (via `polymarket_simulator`'s per-thread connection cache). Fixed by explicitly patching
+the flag `False` in this test class's `setUp()` — a real, if narrow, test-isolation lesson:
+flipping a feature's default now means every OTHER test of code paths it touches needs to account
+for that, not just the tests specifically about the feature itself.
+
 ---
 
 ## 8. Database ownership boundaries

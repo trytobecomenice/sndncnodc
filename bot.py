@@ -39,6 +39,7 @@ import signal
 import sys
 import time
 from collections import deque
+from concurrent.futures import as_completed
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
@@ -1010,7 +1011,7 @@ def sweep_zombie_positions(positions, trader_performance, muted_traders, tracked
 
 
 def check_trailing_take_profit(positions, trader_performance, muted_traders, tracked_by_lower,
-                                market_to_end_date=None):
+                                market_to_end_date=None, executor=None):
     """Trailing Take-Profit (TTP). For every active position: fetches a
     current price, updates the position's high-water-mark peak_profit_pct
     (persisted in state.json so it survives restarts), and once that peak
@@ -1019,11 +1020,28 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
     (percentage points) off the peak.
 
     Time-gated to run at most once per TRAILING_TP_CHECK_INTERVAL_SECONDS
-    (see main loop) -- a full sweep is one `price` subprocess per open
-    position (measured >120s across 79 positions), far too slow to run
-    every poll. Runs alongside (not instead of) the trade-copying logic and
-    the circuit breaker -- this is what lets the bot exit a tracked-trader
-    position on its own schedule, even if the trader hasn't sold yet.
+    (see main loop) -- historically one price fetch per open position, done
+    SEQUENTIALLY (measured >120s across 79 positions back when this used a
+    bullpen subprocess per position), far too slow to run every poll.
+
+    Parallel price fetch (2026-07-31): found live investigating why fast-
+    resolving markets (esports matches that can go from a large peak to
+    resolved within minutes) kept missing their exit entirely -- the fix for
+    THAT specific finding was theta-decay TP (Rule 31 addendum), but the
+    5-minute SWEEP INTERVAL itself was also identified as a real, separate
+    bottleneck, and it was dominated by this function's own positions being
+    priced one at a time. `executor` (pass bot.py's ONE long-lived
+    ThreadPoolExecutor, same pattern already used for wallet-trade fetching
+    -- see polymarket_data_api.make_persistent_executor()) parallelizes the
+    slow network I/O (get_market_prices()/resolve_market_end_date()) across
+    all eligible positions at once. The DECISION + MUTATION phase (updating
+    peak_profit_pct, arming/firing an exit, calling close_position_
+    trailing_tp() which can move real money in LIVE_MODE) stays strictly
+    SEQUENTIAL in the main thread afterward, using the already-fetched
+    results -- concurrency only ever touches the read-only network fetch,
+    never `positions`/`trader_performance`/`muted_traders` or an actual
+    sell decision. executor=None (default) falls back to the original
+    one-at-a-time behavior, byte-for-byte -- no caller is forced to change.
 
     Activation threshold ("Priority 4", 2026-07-26): config.
     ENABLE_THETA_DECAY_TP_ACTIVATION=False (default) keeps the original
@@ -1033,7 +1051,10 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
     per market via resolve_market_end_date() and cached in
     market_to_end_date (in-memory, persisted to bot_market_event.
     end_date_iso) -- a market whose end date can't be resolved falls back
-    to the static threshold, never guesses.
+    to the static threshold, never guesses. When parallelized, this fetch
+    is deduplicated by market_slug first (several positions can share one
+    market) so two positions on the same market never trigger two redundant
+    concurrent lookups of the same end date.
 
     Returns {position_key: indicative_price} for every position it managed
     to price this sweep -- piggybacked on by the portfolio-equity /
@@ -1045,9 +1066,18 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
     """
     market_to_end_date = market_to_end_date if market_to_end_date is not None else {}
     prices_by_key = {}
+
+    # Phase 1 (cheap, no I/O): collect every position actually eligible for
+    # a price check this sweep -- unchanged filtering logic, just separated
+    # out so phase 2 knows exactly what to fetch before fetching anything.
+    # NOTE: SHUTDOWN_REQUESTED is now only re-checked in phase 3, not
+    # between individual fetches like the old one-at-a-time loop did -- a
+    # shutdown mid-sweep now lets the (read-only, side-effect-free) fetch
+    # phase finish before stopping, rather than truncating it. In practice
+    # this should make graceful shutdown FASTER, not slower: parallel
+    # fetches finish well before the old sequential loop would have.
+    eligible = []
     for key in list(positions.keys()):
-        if SHUTDOWN_REQUESTED:
-            return prices_by_key
         pos = positions.get(key)
         if not pos or pos.get("shares", 0) <= 0:
             continue
@@ -1055,13 +1085,74 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
         if len(parts) != 3:
             continue
         trader, market_slug, outcome = parts
-        nickname = nickname_for(trader, tracked_by_lower)
-
         entry_price = pos.get("avg_entry_price") or 0.0
         if entry_price <= 0:
             continue
+        eligible.append((key, trader, market_slug, outcome, entry_price))
 
-        best_bid, indicative_price, err = get_market_prices(market_slug, outcome)
+    if not eligible:
+        return prices_by_key
+
+    # Phase 2 (the slow part, now optionally parallel): one get_market_prices()
+    # call per eligible position.
+    def _fetch_price(item):
+        _, _, market_slug, outcome, _ = item
+        return get_market_prices(market_slug, outcome)
+
+    price_results = {}
+    if executor is not None:
+        futures = {executor.submit(_fetch_price, item): item for item in eligible}
+        for future in as_completed(futures):
+            key = futures[future][0]
+            try:
+                price_results[key] = future.result()
+            except Exception as e:
+                price_results[key] = (None, None, str(e))
+    else:
+        for item in eligible:
+            price_results[item[0]] = _fetch_price(item)
+
+    # Phase 2b: theta-decay end-date resolution, deduplicated by market_slug
+    # (several positions can share one market) -- same optional-parallel
+    # shape as phase 2, but keyed on market_slug instead of position key.
+    if config.ENABLE_THETA_DECAY_TP_ACTIVATION:
+        missing_market_slugs = {
+            market_slug for _, _, market_slug, _, _ in eligible
+            if market_slug not in market_to_end_date
+        }
+        if missing_market_slugs:
+            if executor is not None:
+                futures = {executor.submit(resolve_market_end_date, ms): ms
+                           for ms in missing_market_slugs}
+                for future in as_completed(futures):
+                    market_slug = futures[future]
+                    try:
+                        end_date_iso = future.result()
+                    except Exception:
+                        end_date_iso = None
+                    if end_date_iso:
+                        market_to_end_date[market_slug] = end_date_iso
+                        save_market_end_date(market_slug, end_date_iso)
+            else:
+                for market_slug in missing_market_slugs:
+                    end_date_iso = resolve_market_end_date(market_slug)
+                    if end_date_iso:
+                        market_to_end_date[market_slug] = end_date_iso
+                        save_market_end_date(market_slug, end_date_iso)
+
+    # Phase 3 (sequential, in the main thread only): decide + act, using the
+    # results already gathered above -- identical logic/order to the
+    # original one-at-a-time loop, just reading from price_results instead
+    # of fetching inline.
+    for key, trader, market_slug, outcome, entry_price in eligible:
+        if SHUTDOWN_REQUESTED:
+            return prices_by_key
+        pos = positions.get(key)
+        if not pos:
+            continue  # closed by an earlier iteration this same sweep
+        nickname = nickname_for(trader, tracked_by_lower)
+
+        best_bid, indicative_price, err = price_results.get(key, (None, None, "no price result"))
         if indicative_price is None:
             append_log({"timestamp": now_iso(), "event_type": "error",
                         "trader_address": trader, "market_slug": market_slug,
@@ -1085,11 +1176,6 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
         activation_pct = config.TRAILING_TP_ACTIVATION_PCT
         if config.ENABLE_THETA_DECAY_TP_ACTIVATION:
             end_date_iso = market_to_end_date.get(market_slug)
-            if end_date_iso is None:
-                end_date_iso = resolve_market_end_date(market_slug)
-                if end_date_iso:
-                    market_to_end_date[market_slug] = end_date_iso
-                    save_market_end_date(market_slug, end_date_iso)
             days_remaining = compute_days_remaining(end_date_iso)
             activation_pct = compute_theta_decay_activation_pct(days_remaining)
 
@@ -3183,7 +3269,11 @@ def main():
     # discard its worker threads' persistent HTTPS connections and lose the
     # measured 0.4-0.5s/cycle (vs ~2.3s/cycle cold) speedup entirely. Sized
     # to comfortably cover every tracked wallet concurrently, not a fixed
-    # guess, so this stays correct if the tracked list grows later.
+    # guess, so this stays correct if the tracked list grows later. Also
+    # passed into check_trailing_take_profit() (2026-07-31) to parallelize
+    # its own per-position price fetches — same executor, different cadence
+    # (every TRAILING_TP_CHECK_INTERVAL_SECONDS instead of every poll), no
+    # conflict: submitted work just queues if all workers are briefly busy.
     direct_feed_executor = make_persistent_executor(max_workers=max(len(wallet_addresses), 10))
 
     # Portfolio-risk state (risk_manager.py): the latched kill switch and
@@ -3465,7 +3555,8 @@ def main():
                 try:
                     prices_by_key = check_trailing_take_profit(
                         positions, trader_performance, muted_traders, tracked_by_lower,
-                        market_to_end_date=risk_state["market_to_end_date"])
+                        market_to_end_date=risk_state["market_to_end_date"],
+                        executor=direct_feed_executor)
                 except Exception as e:
                     prices_by_key = None
                     append_log({"timestamp": now_iso(), "event_type": "error",

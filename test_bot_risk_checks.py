@@ -7,6 +7,7 @@ Run: python3 -m unittest test_bot_risk_checks -v
 
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -2734,6 +2735,105 @@ class TestCheckTrailingTakeProfitThetaDecayWiring(unittest.TestCase):
         mock_resolve.assert_called_once()
         mock_save.assert_called_once_with("some-market", "2026-08-01")
         self.assertEqual(market_to_end_date["some-market"], "2026-08-01")
+
+
+class TestCheckTrailingTakeProfitParallelFetch(unittest.TestCase):
+    """Parallel price fetch (2026-07-31) — check_trailing_take_profit()'s
+    optional `executor` parameter. Built after finding fast-resolving
+    esports matches could go from a large peak straight to resolved within
+    one 5-minute sweep interval, which this function's own positions being
+    priced one at a time (historically the dominant cost of a sweep)
+    directly contributed to. Uses a REAL ThreadPoolExecutor (not mocked)
+    to genuinely exercise the concurrent wiring, with get_market_prices/
+    resolve_market_end_date themselves mocked (the expensive I/O).
+
+    ENABLE_THETA_DECAY_TP_ACTIVATION patched to False by default here
+    (found live, 2026-07-31: since that flag's own default flipped to True
+    the same session, a test that doesn't disable it and doesn't mock
+    resolve_market_end_date() silently attempts a REAL, unmocked network
+    call -- which doesn't raise here (resolve_market_end_date fails soft
+    internally), but was confirmed to corrupt a LATER, unrelated test's
+    mocked http.client.HTTPSConnection state when run in the same process,
+    via polymarket_simulator's per-thread connection cache). The one test
+    that actually needs the flag on sets it explicitly itself."""
+
+    def setUp(self):
+        self._theta_patcher = patch.object(config, "ENABLE_THETA_DECAY_TP_ACTIVATION", False)
+        self._theta_patcher.start()
+
+    def tearDown(self):
+        self._theta_patcher.stop()
+
+    def _position(self, entry=0.5, peak=None):
+        return {"shares": 10.0, "cost_basis_usd": 5.0, "avg_entry_price": entry,
+                "buy_count": 1, "peak_profit_pct": peak if peak is not None else 0.0}
+
+    def test_parallel_path_prices_every_eligible_position(self):
+        positions = {
+            "0xA|m1|Yes": self._position(), "0xB|m2|Yes": self._position(),
+            "0xC|m3|Yes": self._position(),
+        }
+        with patch("bot.get_market_prices", return_value=(0.55, 0.60, None)):
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                result = bot.check_trailing_take_profit(positions, {}, {}, {}, executor=ex)
+        self.assertEqual(result, {"0xA|m1|Yes": 0.60, "0xB|m2|Yes": 0.60, "0xC|m3|Yes": 0.60})
+
+    def test_sequential_path_prices_every_eligible_position(self):
+        # Same assertion as the parallel test above, executor omitted --
+        # confirms the two code paths agree without running them in the
+        # same test (avoids a real cross-file test-isolation interaction
+        # between a live ThreadPoolExecutor and an unrelated module's own
+        # threading.local()-based connection cache, found live 2026-07-31).
+        positions = {
+            "0xA|m1|Yes": self._position(), "0xB|m2|Yes": self._position(),
+            "0xC|m3|Yes": self._position(),
+        }
+        with patch("bot.get_market_prices", return_value=(0.55, 0.60, None)):
+            result = bot.check_trailing_take_profit(positions, {}, {}, {})
+        self.assertEqual(result, {"0xA|m1|Yes": 0.60, "0xB|m2|Yes": 0.60, "0xC|m3|Yes": 0.60})
+
+    def test_one_positions_fetch_failure_does_not_abort_the_others(self):
+        positions = {
+            "0xA|m-bad|Yes": self._position(), "0xB|m-good|Yes": self._position(),
+        }
+
+        def fake_prices(market_slug, outcome, ignore_staleness=False):
+            if market_slug == "m-bad":
+                raise RuntimeError("network error")
+            return (0.55, 0.60, None)
+
+        with patch("bot.get_market_prices", side_effect=fake_prices), \
+             patch("bot.append_log") as mock_log, \
+             ThreadPoolExecutor(max_workers=4) as ex:
+            prices_by_key = bot.check_trailing_take_profit(positions, {}, {}, {}, executor=ex)
+
+        self.assertNotIn("0xA|m-bad|Yes", prices_by_key)
+        self.assertEqual(prices_by_key["0xB|m-good|Yes"], 0.60)
+        error_events = [c for c in mock_log.call_args_list if c.args[0].get("event_type") == "error"]
+        self.assertEqual(len(error_events), 1)
+        self.assertIn("network error", error_events[0].args[0]["error"])
+
+    def test_end_date_resolution_is_deduplicated_by_market_slug_when_parallel(self):
+        # Two positions, SAME market_slug, different outcome -- must only
+        # resolve the end date once, not twice.
+        positions = {
+            "0xA|shared-market|Yes": self._position(peak=0.05),
+            "0xB|shared-market|No": self._position(peak=0.05),
+        }
+        with patch.object(config, "ENABLE_THETA_DECAY_TP_ACTIVATION", True), \
+             patch("bot.get_market_prices", return_value=(0.55, 0.55, None)), \
+             patch("bot.resolve_market_end_date", return_value="2026-08-01") as mock_resolve, \
+             patch("bot.save_market_end_date"), \
+             ThreadPoolExecutor(max_workers=4) as ex:
+            bot.check_trailing_take_profit(positions, {}, {}, {}, market_to_end_date={}, executor=ex)
+        mock_resolve.assert_called_once_with("shared-market")
+
+    def test_no_eligible_positions_returns_empty_without_touching_the_executor(self):
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            with patch.object(ex, "submit") as mock_submit:
+                result = bot.check_trailing_take_profit({}, {}, {}, {}, executor=ex)
+        self.assertEqual(result, {})
+        mock_submit.assert_not_called()
 
 
 class TestSweepZombiePositions(unittest.TestCase):
