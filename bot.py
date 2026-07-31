@@ -761,12 +761,23 @@ def whale_still_holding(current_whale_shares, whale_shares_at_creation, min_frac
 
 def close_position_trailing_tp(key, trader, nickname, market_slug, outcome, positions,
                                 current_price, peak_profit_pct, profit_pct,
-                                trader_performance, muted_traders):
-    """Executes the Trailing Take-Profit 'suck back' exit: a full-position
-    market sell, independent of any source trade. Mirrors the SELL branch of
-    process_trade (live-execute before touching the ledger, require_filled,
-    circuit breaker on the realized pnl) but always closes 100% of the
-    position rather than a fraction.
+                                trader_performance, muted_traders, close_reason="trailing_tp"):
+    """Executes a full-position market sell exit, independent of any source
+    trade -- originally built for the Trailing Take-Profit 'suck back' exit
+    (the default close_reason), now shared by every "independently decided
+    to exit this position" mechanism (2026-08-01: also Time-Decay Loss Cut)
+    since the actual execution/ledger/circuit-breaker logic is identical,
+    only the LABEL differs. Mirrors the SELL branch of process_trade
+    (live-execute before touching the ledger, require_filled, circuit
+    breaker on the realized pnl) but always closes 100% of the position
+    rather than a fraction.
+
+    close_reason drives the event_type ("paper_sell_{close_reason}"/
+    "live_sell_{close_reason}") and is threaded into the patient-exit-peg
+    and shadow-patient-exit calls below too -- deliberately kept distinct
+    per mechanism (not folded into a generic "we_exited" label) so future
+    close-reason-mix analysis (the exact query that found the Time-Decay
+    Loss Cut problem in the first place) can still tell them apart.
     """
     pos = positions[key]
     shares_closed = pos["shares"]
@@ -799,7 +810,7 @@ def close_position_trailing_tp(key, trader, nickname, market_slug, outcome, posi
         # never make an exit LESS likely to happen than it already was.
         if config.ENABLE_PATIENT_EXIT_PEGGING:
             pending_id = start_patient_exit(key, trader, market_slug, outcome, shares_closed,
-                                             close_reason="trailing_tp")
+                                             close_reason=close_reason)
             if pending_id is not None:
                 return
 
@@ -844,14 +855,14 @@ def close_position_trailing_tp(key, trader, nickname, market_slug, outcome, posi
     # able to block or crash it.
     try:
         start_shadow_patient_exit(key, trader, market_slug, outcome, shares_closed,
-                                   immediate_exit_price=effective_price, close_reason="trailing_tp")
+                                   immediate_exit_price=effective_price, close_reason=close_reason)
     except Exception as e:
         logger.warning(f"start_shadow_patient_exit failed for {market_slug}/{outcome}: {e}")
 
     del positions[key]
 
     append_log({**base_event,
-                "event_type": "paper_sell_trailing_tp" if not config.LIVE_MODE else "live_sell_trailing_tp",
+                "event_type": f"paper_sell_{close_reason}" if not config.LIVE_MODE else f"live_sell_{close_reason}",
                 "our_shares_closed": shares_closed,
                 "our_shares_remaining": 0.0,
                 "proceeds_usd": proceeds_usd,
@@ -1126,10 +1137,12 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
         for item in eligible:
             price_results[item[0]] = _fetch_price(item)
 
-    # Phase 2b: theta-decay end-date resolution, deduplicated by market_slug
-    # (several positions can share one market) -- same optional-parallel
-    # shape as phase 2, but keyed on market_slug instead of position key.
-    if config.ENABLE_THETA_DECAY_TP_ACTIVATION:
+    # Phase 2b: end-date resolution, deduplicated by market_slug (several
+    # positions can share one market) -- same optional-parallel shape as
+    # phase 2, but keyed on market_slug instead of position key. Shared by
+    # theta-decay TP activation AND Time-Decay Loss Cut (2026-08-01) -- both
+    # need days-remaining, so either flag alone is enough to trigger this.
+    if config.ENABLE_THETA_DECAY_TP_ACTIVATION or config.ENABLE_TIME_DECAY_LOSS_CUT:
         missing_market_slugs = {
             market_slug for _, _, market_slug, _, _ in eligible
             if market_slug not in market_to_end_date
@@ -1187,10 +1200,32 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
         peak_profit_pct = max(pos.get("peak_profit_pct", indicative_profit_pct), indicative_profit_pct)
         pos["peak_profit_pct"] = peak_profit_pct
 
-        activation_pct = config.TRAILING_TP_ACTIVATION_PCT
-        if config.ENABLE_THETA_DECAY_TP_ACTIVATION:
+        days_remaining = None
+        if config.ENABLE_THETA_DECAY_TP_ACTIVATION or config.ENABLE_TIME_DECAY_LOSS_CUT:
             end_date_iso = market_to_end_date.get(market_slug)
             days_remaining = compute_days_remaining(end_date_iso)
+
+        # Time-Decay Loss Cut (2026-08-01) — evaluated BEFORE the TTP
+        # activation gate below, deliberately: it targets exactly the
+        # positions that gate will never let through (peak_profit_pct below
+        # any reasonable activation threshold), so the two are naturally
+        # mutually exclusive, not competing for the same trigger. Requires
+        # a live best_bid to exit into, same discipline as the TTP branch.
+        if config.ENABLE_TIME_DECAY_LOSS_CUT and best_bid is not None:
+            lifespan_fraction = compute_lifespan_fraction_remaining(pos.get("opened_at"), days_remaining)
+            if is_time_decay_loss_cut_eligible(peak_profit_pct, lifespan_fraction):
+                logger.info(f"Time-Decay Loss Cut triggered for {nickname} {market_slug} ({outcome}): "
+                            f"peak {peak_profit_pct:.1%} never armed, "
+                            f"{lifespan_fraction:.1%} of lifespan remaining, cutting now.")
+                loss_cut_profit_pct = (best_bid - entry_price) / entry_price
+                close_position_trailing_tp(key, trader, nickname, market_slug, outcome, positions,
+                                            best_bid, peak_profit_pct, loss_cut_profit_pct,
+                                            trader_performance, muted_traders,
+                                            close_reason="time_decay_loss_cut")
+                continue
+
+        activation_pct = config.TRAILING_TP_ACTIVATION_PCT
+        if config.ENABLE_THETA_DECAY_TP_ACTIVATION:
             activation_pct = compute_theta_decay_activation_pct(days_remaining)
 
         if peak_profit_pct < activation_pct:
@@ -2152,6 +2187,54 @@ def compute_theta_decay_activation_pct(days_remaining):
     return t_min + (t_base - t_min) * fraction
 
 
+def compute_lifespan_fraction_remaining(opened_at, days_remaining, now=None):
+    """Time-Decay Loss Cut (2026-08-01): what fraction of a position's OWN
+    entry-to-resolution runway is left right now -- e.g. 0.20 means 20% of
+    the span from when WE opened this position to this market's resolution
+    date is still ahead. Deliberately relative to each position's own
+    lifespan, not a fixed absolute time window, so a 2-hour esports match
+    and a 6-month macro market are judged on the same proportional scale
+    rather than one fixed cutoff being wrong for both.
+
+    Returns None (never guesses) when either input is unusable: no entry
+    timestamp (a position loaded from before this field existed), or no
+    resolvable end date (same "unknown isn't confirmed toxic" fallback
+    compute_days_remaining() already uses) -- or when total lifespan comes
+    out non-positive (a market already past its own end date some other
+    way), where a fraction wouldn't be meaningful.
+    """
+    if opened_at is None or days_remaining is None:
+        return None
+    now = now if now is not None else time.time()
+    days_held = (now - opened_at) / 86400.0
+    total_lifespan_days = days_held + days_remaining
+    if total_lifespan_days <= 0:
+        return None
+    return days_remaining / total_lifespan_days
+
+
+def is_time_decay_loss_cut_eligible(peak_profit_pct, lifespan_fraction_remaining,
+                                     peak_floor_pct=None, lifespan_fraction_threshold=None):
+    """Time-Decay Loss Cut (2026-08-01) — see config.ENABLE_TIME_DECAY_LOSS_CUT's
+    docstring for the real-data root cause this targets. BOTH conditions
+    required: peak_profit_pct has NEVER exceeded peak_floor_pct (a position
+    that showed real life stays on the TTP/resolution path, unaffected) AND
+    lifespan_fraction_remaining has fallen to/below lifespan_fraction_threshold
+    (deep into the position's own last stretch, not just 'been open a
+    while'). lifespan_fraction_remaining=None (unresolvable end date or
+    missing entry timestamp) never fires -- consistent with every other
+    "don't guess when data's missing" gate in this codebase.
+    """
+    peak_floor_pct = (peak_floor_pct if peak_floor_pct is not None
+                       else config.TIME_DECAY_LOSS_CUT_PEAK_FLOOR_PCT)
+    lifespan_fraction_threshold = (lifespan_fraction_threshold if lifespan_fraction_threshold is not None
+                                    else config.TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION)
+    if lifespan_fraction_remaining is None:
+        return False
+    return (peak_profit_pct < peak_floor_pct
+            and lifespan_fraction_remaining <= lifespan_fraction_threshold)
+
+
 def position_key(trader, market_slug, outcome):
     """Lowercases `trader` before building the key (2026-07-26 fix) --
     without this, the SAME real wallet detected via two sources that report
@@ -2644,7 +2727,8 @@ def _execute_buy(base_event, key, trader, market_slug, outcome, price, trade_usd
                 + shortfall.get("network_fee_usd", 0.0)
 
     pos = positions.get(key) or {"shares": 0.0, "cost_basis_usd": 0.0, "avg_entry_price": 0.0,
-                                  "buy_count": 0, "peak_profit_pct": 0.0, "last_priced_at": time.time()}
+                                  "buy_count": 0, "peak_profit_pct": 0.0, "last_priced_at": time.time(),
+                                  "opened_at": time.time()}
     prior_buy_count = pos.get("buy_count", 1)  # legacy default, same assumption as the cap check above
     new_shares = pos["shares"] + our_shares
     new_cost = pos["cost_basis_usd"] + actual_cost_usd

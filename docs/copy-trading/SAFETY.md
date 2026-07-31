@@ -3942,3 +3942,63 @@ mixed `shadow_positions` dict with a second wallet at $999,999 cost basis to con
 
 **Tests**: `TestExecuteShadowBuy` +3 in `test_bot_risk_checks.py` (at-cap skip, under-cap proceeds,
 cross-market summation). 545 Python tests passing (was 542).
+
+## 63. Time-Decay Loss Cut — an evidence-based early-exit for positions that never had a peak (Rule 26/31 addendum, 2026-08-01)
+
+**Trigger**: item 5 of the post-kill-switch-fix roadmap — an open strategic question, explicitly left
+unresolved by Rule 31's 2026-07-31 addendum, on whether holding non-strict-7 wallets' signals to
+resolution has any real edge. Investigated with real `paper_trade` data before proposing anything:
+grouped 373 closed non-strict-7 trades by `close_reason` — `resolved` (247 trades, **-$271.70**,
+-13.0% avg return) vs. `source_sell` (122 trades, **+$51.54**, +19.2% avg return). Drilling into the
+132 losing `resolved` trades found the real shape of the problem: **100% lost 80-100% of stake**
+(binary-market resolution has no partial-loss case) and **97.7% never exceeded 5% peak profit** —
+meaning trailing TP and theta-decay TP are structurally unable to help most of this bucket, since
+there was never a peak to protect. Joey's own hypothesis — that these might be liquidity-reward
+farmers (Rule 40/41's disqualifier) rather than genuine directional traders — was checked directly
+against per-wallet data and **ruled out**: the largest losing wallet's average entry price is exactly
+$0.50 (the least farming-like price possible), and none of the top losers meet Rule 41's ≥50%-
+extreme-price gate.
+
+**What ships**: `config.ENABLE_TIME_DECAY_LOSS_CUT` (default `False`), `TIME_DECAY_LOSS_CUT_PEAK_FLOOR_PCT`
+(0.05) and `TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION` (0.20) — both confirmed with Joey via
+`AskUserQuestion` before implementing. `bot.compute_lifespan_fraction_remaining(opened_at,
+days_remaining, now=None)` (pure function) computes what fraction of a position's OWN entry-to-
+resolution runway is left, deliberately relative rather than a fixed absolute time window (Joey's
+explicit requirement — sports markets and macro markets have very different natural timeframes).
+`bot.is_time_decay_loss_cut_eligible(peak_profit_pct, lifespan_fraction_remaining, ...)` (pure
+function) requires BOTH conditions: peak never exceeded the floor, AND lifespan fraction at/below the
+threshold — a position with a real peak is always left alone regardless of how late in life it is.
+Wired into `check_trailing_take_profit()`'s Phase 3, evaluated BEFORE the TTP activation gate (the
+two are naturally mutually exclusive: this only fires when peak is below any reasonable activation
+threshold) — requires a live `best_bid` to exit into, same discipline as the TTP branch. Phase 2b's
+end-date resolution now triggers on EITHER `ENABLE_THETA_DECAY_TP_ACTIVATION` or
+`ENABLE_TIME_DECAY_LOSS_CUT`, not just the former.
+
+**New `opened_at` field**: positions previously had no stable entry timestamp. Seeded once in
+`_execute_buy()` (the single shared buy-execution path both `process_trade()` and Rule 29's
+dip-and-rebound sweep funnel through — see that function's own docstring on why there's only one
+implementation), never reset on an average-up. Round-trips through `load_state()`/`save_state()` via
+the existing `paper_trade.opened_at` column, which was already only ever set on `INSERT`, never
+`UPDATE` — no schema change needed. A position loaded from before this field existed has
+`opened_at=None`, which `compute_lifespan_fraction_remaining()` treats as "unknown, never guess" —
+fails open (never cuts), consistent with every other missing-data gate in this codebase.
+
+**`close_position_trailing_tp()` generalized**, not duplicated: gained a `close_reason="trailing_tp"`
+parameter (default preserves existing behavior byte-for-byte) rather than copy-pasting its ~90 lines
+of exit/patient-peg/shadow-peg/ledger/circuit-breaker logic for a second mechanism. `event_type`
+derives from it (`paper_sell_{close_reason}`/`live_sell_{close_reason}`), and it's threaded into the
+`start_patient_exit()`/`start_shadow_patient_exit()` calls too. `db.py`'s `_CLOSE_REASON_BY_EVENT`
+gained `paper_sell_time_decay_loss_cut`/`live_sell_time_decay_loss_cut` entries — deliberately a
+DISTINCT `close_reason` from `trailing_tp`, not folded together, so future close-reason-mix analysis
+(the exact query that found this whole problem) can still tell a real profit-protection exit apart
+from a evidence-based early bail.
+
+**Default `False`, deliberately not enabled yet** — unlike theta-decay TP (which had years of TTP
+precedent behind its shape before being turned on), this is a brand-new exit rationale with zero
+live-data validation. Recommended before flipping on: let its own `close_reason='time_decay_loss_cut'`
+bucket accumulate real outcomes first.
+
+**Tests**: `TestComputeLifespanFractionRemaining` (+5), `TestIsTimeDecayLossCutEligible` (+5),
+`TestClosePositionTrailingTpCloseReason` (+2), `TestCheckTrailingTakeProfitTimeDecayLossCutWiring`
+(+6) in `test_bot_risk_checks.py`; `test_load_state_positions_carry_opened_at` (+1) in
+`test_db_pending_execution.py`. 564 Python tests passing (was 545).

@@ -921,6 +921,38 @@ THETA_DECAY_TP_WINDOW_DAYS = 7
 # signals to resolution worth it at all) stays open.
 ENABLE_THETA_DECAY_TP_ACTIVATION = True
 
+# Time-Decay Loss Cut (2026-08-01) — the deeper fix theta-decay TP's own
+# comment above explicitly flagged as still open. Root-caused directly
+# against real data (RISK_MANAGEMENT.md Rule 26/Sec.62-equivalent
+# addendum): of the 247 resolved-losing non-strict-7 trades, ALL 132
+# losers lost 80-100% of stake (binary resolution to $0, no partial-loss
+# case exists) and 97.7% NEVER exceeded 5% peak profit — meaning no
+# profit-protection mechanism (TTP, theta-decay TP) can structurally help
+# them, since they never had a peak to protect. Checked and RULED OUT the
+# liquidity-farming hypothesis first (wallet-level entry prices for these
+# specific losing trades cluster at $0.16-$0.66, not the <5%/>95% extreme-
+# price farming signature Rule 40/41 already established) — this is
+# ordinary directional copy-trading variance, not toxic flow.
+#
+# Trigger: peak_profit_pct has NEVER exceeded TIME_DECAY_LOSS_CUT_PEAK_FLOOR_PCT
+# (a position that's shown real life is left to TTP/resolution as before)
+# AND the position is in the final TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION of
+# its OWN entry-to-resolution lifespan (compute_lifespan_fraction_remaining()
+# — reuses the same resolve_market_end_date()/days-remaining machinery
+# theta-decay TP already built, scaled per-market rather than a fixed
+# absolute cutoff — Joey's own requirement: a sports match's "last 20%" and
+# a 6-month macro market's "last 20%" are very different absolute
+# durations, and this scales to both correctly). Both conditions required,
+# same "don't guess when data's missing" discipline as theta-decay TP: an
+# unresolvable end date or missing entry timestamp never fires this.
+#
+# Default False -- untested design (Joey confirmed the parameters below via
+# AskUserQuestion, but this hasn't run against live data yet the way
+# theta-decay TP had before being flipped on).
+ENABLE_TIME_DECAY_LOSS_CUT = False
+TIME_DECAY_LOSS_CUT_PEAK_FLOOR_PCT = 0.05
+TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION = 0.20
+
 # Kill switch: portfolio equity is defined as PAPER_BANKROLL_USD + realized
 # PnL + unrealized PnL (unrealized comes from the trailing-TP sweep's price
 # fetches, so equity refreshes every TRAILING_TP_CHECK_INTERVAL_SECONDS ~5

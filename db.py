@@ -177,6 +177,13 @@ def load_state():
                 "buy_count": row["buy_count"],
                 "peak_profit_pct": row["peak_profit_pct"],
                 "last_priced_at": row["last_priced_at"] or row["opened_at"],
+                # 2026-08-01, Time-Decay Loss Cut: the FIRST buy's real
+                # timestamp, never touched by averaging up (paper_trade.
+                # opened_at is only ever set on INSERT, never UPDATE — see
+                # save_state()) — the anchor compute_lifespan_fraction_
+                # remaining() needs to know how much of this position's own
+                # entry-to-resolution runway has elapsed.
+                "opened_at": row["opened_at"],
             }
 
         source_positions = {}
@@ -579,6 +586,14 @@ def _decision_type_for_event(event_type, side):
 _CLOSE_REASON_BY_EVENT = {
     "paper_sell_trailing_tp": ("trailing_tp", True, "bot_filtered"),
     "live_sell_trailing_tp": ("trailing_tp", True, "bot_filtered"),
+    # 2026-08-01, Time-Decay Loss Cut — deliberately a DISTINCT close_reason
+    # from trailing_tp (not folded in) so future close-reason-mix analysis
+    # (the same query that found this problem in the first place) can tell
+    # "we protected a real gain" apart from "we bailed on a flat position
+    # late in its life" — mixing them would corrupt exactly the kind of
+    # analysis that motivated building this.
+    "paper_sell_time_decay_loss_cut": ("time_decay_loss_cut", True, "bot_filtered"),
+    "live_sell_time_decay_loss_cut": ("time_decay_loss_cut", True, "bot_filtered"),
     "position_resolved": ("resolved", True, "bot_filtered"),
     "paper_sell": ("source_sell", False, "bot_filtered"),
     "live_sell": ("source_sell", False, "bot_filtered"),

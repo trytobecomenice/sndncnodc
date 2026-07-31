@@ -2924,6 +2924,195 @@ class TestCheckTrailingTakeProfitThetaDecayWiring(unittest.TestCase):
         self.assertEqual(market_to_end_date["some-market"], "2026-08-01")
 
 
+class TestComputeLifespanFractionRemaining(unittest.TestCase):
+    def test_none_opened_at_returns_none(self):
+        self.assertIsNone(bot.compute_lifespan_fraction_remaining(None, 5.0))
+
+    def test_none_days_remaining_returns_none(self):
+        self.assertIsNone(bot.compute_lifespan_fraction_remaining(time.time(), None))
+
+    def test_computes_fraction_of_total_entry_to_resolution_span(self):
+        now = 1_000_000.0
+        opened_at = now - 4 * 86400  # held 4 days so far
+        # 1 day remaining, 4 held -> total lifespan 5 days -> 1/5 = 0.20 remaining
+        result = bot.compute_lifespan_fraction_remaining(opened_at, 1.0, now=now)
+        self.assertAlmostEqual(result, 0.20)
+
+    def test_freshly_opened_position_is_near_full_lifespan_remaining(self):
+        now = 1_000_000.0
+        result = bot.compute_lifespan_fraction_remaining(now, 10.0, now=now)
+        self.assertAlmostEqual(result, 1.0)
+
+    def test_non_positive_total_lifespan_returns_none(self):
+        now = 1_000_000.0
+        # opened far in the "future" relative to now (bad clock/data) with
+        # 0 days remaining -> total lifespan <= 0, not a meaningful fraction.
+        result = bot.compute_lifespan_fraction_remaining(now + 86400, 0.0, now=now)
+        self.assertIsNone(result)
+
+
+class TestIsTimeDecayLossCutEligible(unittest.TestCase):
+    def setUp(self):
+        self._saved = (config.TIME_DECAY_LOSS_CUT_PEAK_FLOOR_PCT,
+                        config.TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION)
+        config.TIME_DECAY_LOSS_CUT_PEAK_FLOOR_PCT = 0.05
+        config.TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION = 0.20
+
+    def tearDown(self):
+        (config.TIME_DECAY_LOSS_CUT_PEAK_FLOOR_PCT,
+         config.TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION) = self._saved
+
+    def test_none_lifespan_fraction_never_fires(self):
+        self.assertFalse(bot.is_time_decay_loss_cut_eligible(0.0, None))
+
+    def test_flat_position_deep_in_lifespan_is_eligible(self):
+        self.assertTrue(bot.is_time_decay_loss_cut_eligible(0.02, 0.15))
+
+    def test_at_exactly_the_lifespan_threshold_is_eligible(self):
+        self.assertTrue(bot.is_time_decay_loss_cut_eligible(0.0, 0.20))
+
+    def test_position_with_a_real_peak_is_never_eligible_even_late_in_life(self):
+        self.assertFalse(bot.is_time_decay_loss_cut_eligible(0.30, 0.05))
+
+    def test_early_in_lifespan_is_not_eligible_even_if_flat(self):
+        self.assertFalse(bot.is_time_decay_loss_cut_eligible(0.0, 0.80))
+
+
+class TestClosePositionTrailingTpCloseReason(unittest.TestCase):
+    def test_custom_close_reason_drives_event_type_and_downstream_calls(self):
+        positions = {"0xTrader|m|Yes": {"shares": 10.0, "cost_basis_usd": 4.0}}
+        with patch.object(config, "LIVE_MODE", False), \
+             patch("bot.start_shadow_patient_exit") as mock_shadow, \
+             patch("bot.check_circuit_breaker"), \
+             patch("bot.append_log") as mock_log:
+            bot.close_position_trailing_tp(
+                "0xTrader|m|Yes", "0xTrader", "Trader", "m", "Yes", positions,
+                current_price=0.30, peak_profit_pct=0.02, profit_pct=-0.40,
+                trader_performance={}, muted_traders={}, close_reason="time_decay_loss_cut",
+            )
+        event = mock_log.call_args_list[0].args[0]
+        self.assertEqual(event["event_type"], "paper_sell_time_decay_loss_cut")
+        self.assertEqual(mock_shadow.call_args.kwargs["close_reason"], "time_decay_loss_cut")
+
+    def test_default_close_reason_is_unchanged_trailing_tp(self):
+        positions = {"0xTrader|m|Yes": {"shares": 10.0, "cost_basis_usd": 4.0}}
+        with patch.object(config, "LIVE_MODE", False), \
+             patch("bot.start_shadow_patient_exit"), \
+             patch("bot.check_circuit_breaker"), \
+             patch("bot.append_log") as mock_log:
+            bot.close_position_trailing_tp(
+                "0xTrader|m|Yes", "0xTrader", "Trader", "m", "Yes", positions,
+                current_price=0.60, peak_profit_pct=0.60, profit_pct=0.50,
+                trader_performance={}, muted_traders={},
+            )
+        event = mock_log.call_args_list[0].args[0]
+        self.assertEqual(event["event_type"], "paper_sell_trailing_tp")
+
+
+class TestCheckTrailingTakeProfitTimeDecayLossCutWiring(unittest.TestCase):
+    """The opt-in flag's actual effect: a flat position deep in its own
+    lifespan gets cut early instead of riding to resolution, but only when
+    both the peak-floor and lifespan-fraction conditions hold, and never
+    without a live best_bid to exit into."""
+
+    def setUp(self):
+        self._saved = (config.ENABLE_TIME_DECAY_LOSS_CUT, config.ENABLE_THETA_DECAY_TP_ACTIVATION,
+                        config.TIME_DECAY_LOSS_CUT_PEAK_FLOOR_PCT,
+                        config.TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION)
+        config.ENABLE_THETA_DECAY_TP_ACTIVATION = False
+        config.TIME_DECAY_LOSS_CUT_PEAK_FLOOR_PCT = 0.05
+        config.TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION = 0.20
+
+    def tearDown(self):
+        (config.ENABLE_TIME_DECAY_LOSS_CUT, config.ENABLE_THETA_DECAY_TP_ACTIVATION,
+         config.TIME_DECAY_LOSS_CUT_PEAK_FLOOR_PCT,
+         config.TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION) = self._saved
+
+    def _position(self, opened_at, peak=0.0):
+        return {"shares": 10.0, "cost_basis_usd": 5.0, "avg_entry_price": 0.5,
+                "buy_count": 1, "peak_profit_pct": peak, "opened_at": opened_at}
+
+    def test_flag_off_never_cuts_regardless_of_lifespan(self):
+        now = time.time()
+        positions = {"0xTrader|some-market|Yes": self._position(opened_at=now - 40 * 86400)}
+        with patch.object(config, "ENABLE_TIME_DECAY_LOSS_CUT", False), \
+             patch("bot.get_market_prices", return_value=(0.48, 0.50, None)), \
+             patch("bot.resolve_market_end_date") as mock_resolve, \
+             patch("bot.close_position_trailing_tp") as mock_close:
+            bot.check_trailing_take_profit(positions, {}, {}, {})
+        mock_resolve.assert_not_called()
+        mock_close.assert_not_called()
+
+    def test_flat_position_deep_in_lifespan_gets_cut(self):
+        now = time.time()
+        # Opened 40 days ago, 10 days remaining -> 10/50 = 20% remaining.
+        positions = {"0xTrader|some-market|Yes": self._position(opened_at=now - 40 * 86400)}
+        with patch.object(config, "ENABLE_TIME_DECAY_LOSS_CUT", True), \
+             patch("bot.get_market_prices", return_value=(0.48, 0.50, None)), \
+             patch("bot.resolve_market_end_date", return_value="2026-01-01"), \
+             patch("bot.save_market_end_date"), \
+             patch("bot.compute_days_remaining", return_value=10.0), \
+             patch("bot.close_position_trailing_tp") as mock_close:
+            bot.check_trailing_take_profit(positions, {}, {}, {}, market_to_end_date={})
+        mock_close.assert_called_once()
+        self.assertEqual(mock_close.call_args.kwargs.get("close_reason")
+                          or mock_close.call_args.args[-1], "time_decay_loss_cut")
+
+    def test_position_with_a_real_peak_is_left_alone(self):
+        now = time.time()
+        positions = {"0xTrader|some-market|Yes": self._position(opened_at=now - 40 * 86400, peak=0.30)}
+        with patch.object(config, "ENABLE_TIME_DECAY_LOSS_CUT", True), \
+             patch.object(config, "TRAILING_TP_ACTIVATION_PCT", 0.50), \
+             patch("bot.get_market_prices", return_value=(0.48, 0.50, None)), \
+             patch("bot.resolve_market_end_date", return_value="2026-01-01"), \
+             patch("bot.save_market_end_date"), \
+             patch("bot.compute_days_remaining", return_value=10.0), \
+             patch("bot.close_position_trailing_tp") as mock_close:
+            bot.check_trailing_take_profit(positions, {}, {}, {}, market_to_end_date={})
+        mock_close.assert_not_called()  # peak 30% >= 5% floor -- not this mechanism's target
+
+    def test_early_in_lifespan_is_left_alone_even_if_flat(self):
+        now = time.time()
+        # Opened just now, 40 days remaining -> ~100% of lifespan left.
+        positions = {"0xTrader|some-market|Yes": self._position(opened_at=now)}
+        with patch.object(config, "ENABLE_TIME_DECAY_LOSS_CUT", True), \
+             patch("bot.get_market_prices", return_value=(0.48, 0.50, None)), \
+             patch("bot.resolve_market_end_date", return_value="2026-01-01"), \
+             patch("bot.save_market_end_date"), \
+             patch("bot.compute_days_remaining", return_value=40.0), \
+             patch("bot.close_position_trailing_tp") as mock_close:
+            bot.check_trailing_take_profit(positions, {}, {}, {}, market_to_end_date={})
+        mock_close.assert_not_called()
+
+    def test_no_live_best_bid_never_cuts(self):
+        now = time.time()
+        positions = {"0xTrader|some-market|Yes": self._position(opened_at=now - 40 * 86400)}
+        with patch.object(config, "ENABLE_TIME_DECAY_LOSS_CUT", True), \
+             patch("bot.get_market_prices", return_value=(None, 0.50, None)), \
+             patch("bot.resolve_market_end_date", return_value="2026-01-01"), \
+             patch("bot.save_market_end_date"), \
+             patch("bot.compute_days_remaining", return_value=10.0), \
+             patch("bot.close_position_trailing_tp") as mock_close:
+            bot.check_trailing_take_profit(positions, {}, {}, {}, market_to_end_date={})
+        mock_close.assert_not_called()
+
+    def test_missing_opened_at_never_cuts(self):
+        # A position loaded from before this field existed -- must fail
+        # open (never cut), not crash or guess an entry time.
+        now = time.time()
+        pos = self._position(opened_at=now - 40 * 86400)
+        del pos["opened_at"]
+        positions = {"0xTrader|some-market|Yes": pos}
+        with patch.object(config, "ENABLE_TIME_DECAY_LOSS_CUT", True), \
+             patch("bot.get_market_prices", return_value=(0.48, 0.50, None)), \
+             patch("bot.resolve_market_end_date", return_value="2026-01-01"), \
+             patch("bot.save_market_end_date"), \
+             patch("bot.compute_days_remaining", return_value=10.0), \
+             patch("bot.close_position_trailing_tp") as mock_close:
+            bot.check_trailing_take_profit(positions, {}, {}, {}, market_to_end_date={})
+        mock_close.assert_not_called()
+
+
 class TestCheckTrailingTakeProfitParallelFetch(unittest.TestCase):
     """Parallel price fetch (2026-07-31) — check_trailing_take_profit()'s
     optional `executor` parameter. Built after finding fast-resolving

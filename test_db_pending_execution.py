@@ -183,6 +183,28 @@ class TestSourceCostBasisRoundTrip(_TempDbTestCase):
         self.assertEqual(state["source_positions"]["0xtrader|m1|Yes"], 100.0)
         self.assertEqual(state["source_cost_basis"]["0xtrader|m1|Yes"], 45.0)
 
+    def test_load_state_positions_carry_opened_at(self):
+        # Time-Decay Loss Cut (2026-08-01) needs a stable entry timestamp,
+        # unaffected by averaging up -- paper_trade.opened_at is only ever
+        # set on INSERT (see save_state()), so a position round-tripped
+        # through save/load must expose that exact value, not last_priced_at.
+        db.save_state({
+            "seen_trade_ids": [], "positions": {},
+            "source_positions": {}, "source_cost_basis": {},
+            "trader_performance": {}, "muted_traders": {},
+        })
+        conn = self._raw_conn()
+        conn.execute(
+            "INSERT INTO paper_trade (id, wallet_address, market_slug, outcome, our_size_usd, "
+            "cost_basis_usd, our_shares, avg_entry_price, buy_count, status, opened_at, "
+            "peak_profit_pct, last_priced_at) VALUES "
+            "('row1', '0xTrader', 'm1', 'Yes', 5.0, 5.0, 10.0, 0.5, 1, 'open', 1000, 0.0, 2000)"
+        )
+        conn.commit()
+        conn.close()
+        state = db.load_state()
+        self.assertEqual(state["positions"]["0xTrader|m1|Yes"]["opened_at"], 1000)
+
     def test_missing_source_cost_basis_defaults_to_zero(self):
         # A key present in source_positions but absent from source_cost_basis
         # (shouldn't happen via bot.py's own bookkeeping, but load_state()

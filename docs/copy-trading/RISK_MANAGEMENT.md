@@ -2759,6 +2759,61 @@ nothing in the fuller history contradicts those original calls.
 > (`close_reason='source_sell'`: 122 trades, +$51.54, +19.2% EV, the same session) — stays open,
 > not resolved by this change.
 
+**Addendum 2026-08-01 — the open question above, answered with data, and a new mechanism built
+from it (Time-Decay Loss Cut).**
+
+> **Challenge:** the deeper question the 2026-07-31 addendum left open. Investigated directly
+> before proposing any fix.
+>
+> **Two hypotheses checked against real `paper_trade` data, one ruled out:**
+> 1. *Is holding to resolution structurally bad?* Yes, clearly — the same 247 `close_reason='resolved'`
+>    trades lost **-$271.70 total (-13.0% avg return, 46.6% win rate)**, vs. the 122
+>    `close_reason='source_sell'` trades at **+$51.54 (+19.2% avg return, 58.2% win rate)**. But a
+>    deeper cut of the 132 losing `resolved` trades found something the 2026-07-31 addendum hadn't
+>    yet surfaced: **100% of them lost 80-100% of stake** (a binary market resolving against a held
+>    position always goes to $0 — there's no partial-loss case) and **97.7% never exceeded even 5%
+>    peak profit**. This means TP-family mechanisms (trailing TP, theta-decay TP) are structurally
+>    incapable of helping the bulk of this problem — there's no peak to protect, ever. This isn't an
+>    EXIT-TIMING problem for these specific trades; it's "this copied bet was wrong from day one."
+> 2. *Are these wallets liquidity-reward farmers* (Rule 40/41's disqualifying pattern — Joey's own
+>    hypothesis, worth checking given precedent) *rather than genuine directional traders?* **Ruled
+>    out.** Broke the 132 losers down by wallet: the single biggest loser (`0x5b4ec9c0...`, -$360
+>    across 40 trades) has an average entry price of exactly **$0.50** — the most direction-neutral,
+>    least-farming-like price possible. The next-largest (-$223, -$150) sit at $0.16-$0.34 average
+>    entry, and none meet Rule 41's gate (≥50% of trades at <5%/>95% price AND ≥5x repeated quote).
+>    This is ordinary directional copy-trading variance, not toxic flow — confirmed with real
+>    per-wallet data, not assumed.
+>
+> **Mechanism: Time-Decay Loss Cut** (`config.ENABLE_TIME_DECAY_LOSS_CUT`, default `False`).
+> Since profit-protection can't help a position that never had a profit, this is a genuinely
+> different kind of exit — an evidence-based "give up early" rule, not a "lock in the win" rule.
+> Fires when **both**: `peak_profit_pct` has never exceeded
+> `config.TIME_DECAY_LOSS_CUT_PEAK_FLOOR_PCT` (5%, Joey's own confirmed value — a position that DID
+> show real life stays on the TTP/resolution path untouched) **and**
+> `compute_lifespan_fraction_remaining()` has fallen to/below
+> `config.TIME_DECAY_LOSS_CUT_LIFESPAN_FRACTION` (20%, also Joey's confirmed value) — the fraction of
+> this SPECIFIC position's own entry-to-resolution runway still remaining, not a fixed absolute time
+> window. Deliberately relative, per Joey's own requirement: "each is different like sports etc" — a
+> 2-hour esports match's last 20% of life and a 6-month macro market's last 20% are wildly different
+> absolute durations, and a fixed cutoff would be wrong for one or the other. Reuses the exact
+> `resolve_market_end_date()`/`compute_days_remaining()` machinery theta-decay TP already built,
+> against a new `opened_at` timestamp on each position (seeded once at first buy, in `_execute_buy()`
+> — the ONE shared buy-execution path both `process_trade()` and Rule 29's dip-and-rebound sweep
+> funnel through — never reset on an average-up, and round-tripped through `load_state()`/
+> `save_state()` via `paper_trade.opened_at`, which was already only ever set on `INSERT`).
+> `close_position_trailing_tp()` was generalized to accept a `close_reason` parameter (default
+> unchanged, `"trailing_tp"`) rather than duplicating its ~90 lines of exit/patient-peg/shadow-peg/
+> ledger/circuit-breaker logic — a new `close_reason="time_decay_loss_cut"` labels these exits with
+> their own distinct `paper_sell_time_decay_loss_cut`/`live_sell_time_decay_loss_cut` event types
+> (and `db.py`'s `_CLOSE_REASON_BY_EVENT` entries) so future close-reason-mix analysis — the exact
+> query that found this whole problem — can still tell the two mechanisms apart.
+>
+> **Default `False` — deliberately NOT flipped on yet**, unlike theta-decay TP: that mechanism had
+> years of TTP precedent behind its shape before being enabled; this is a brand-new exit rationale
+> with zero live-data validation so far. Recommended next step before enabling: let it run and watch
+> its own close-reason bucket accumulate real outcomes, same "prove it before trusting it" discipline
+> as every other opt-in flag in this file.
+
 ---
 
 ## 32. Paper accounting grounded in real fillable prices, not the whale's own fill (2026-07-26)
