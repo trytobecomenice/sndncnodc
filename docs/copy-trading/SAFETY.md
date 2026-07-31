@@ -3643,3 +3643,55 @@ timestamp < cutoff`) were both full-table-scanning and sorting all 453K+ rows on
 `bot_event_log_timestamp_idx` added (`packages/db/src/schema.ts`, migration
 `0019_yummy_luckman.sql`) — confirmed live locally (an 85K-row copy) that the same query dropped
 from a full scan to ~1.2ms.
+
+## 55. Chronically-thin-market TTP fixes: entry-price floor + stale-tolerant fallback (Rule 7/27 addenda, 2026-07-31)
+
+**Trigger**: user reported a Telegram error alert ("order book ... is stale: 30.1s old ... exceeds
+15") and asked whether real-time on-chain tracking latency was the cause. It wasn't — investigated
+and found `polymarket_simulator.MAX_BOOK_AGE_SECONDS=15`'s staleness guard had been failing
+**100-240 times/hour, steadily, for 30+ hours** (confirmed via hourly bucket counts — this long
+predates the same-day Docker/Prometheus deploy, which was a separate, real but secondary
+contributor). 74 distinct open `bot_filtered` positions were affected, some failing 100-145
+times/day each.
+
+**Root cause**: these specific markets (2028-election longshot candidates, multi-year-out crypto
+price targets like "ETH dip to $1000/$1250/$1500 by Dec 2026", far-dated Fed-rate/award-show
+predictions) are thin enough that Polymarket's own order book genuinely doesn't refresh within 15
+seconds — a market-liquidity fact, not a latency problem on this codebase's side. Confirmed this
+distinction explicitly with the user: no amount of low-latency engineering (the C++ market-data
+layer discussed in the 4-layer roadmap) would help here, since the bottleneck is "nobody is trading
+this token," not "our code is slow to read the book" — a real, concrete instance of the roadmap's
+own "validate the bottleneck before investing in speed" principle.
+
+**Compounding effect on long-term profitability, not just noise**: `check_trailing_take_profit()`'s
+existing design treats a failed price check as "skip this cycle" — but for these 74 positions, that
+meant `pos["last_priced_at"]` (only updated on a successful read) never advanced, freezing
+`peak_profit_pct` and preventing TTP from ever managing them. The 2026-07-25 sizing report already
+found held-to-resolution trades are net-NEGATIVE EV (-13% of stake) — these positions were
+structurally forced into exactly that bucket by a mechanical limitation, not a genuine trading
+decision.
+
+**Two-part fix**:
+1. **`config.PER_TRADE_ENTRY_PRICE_FLOOR = 0.02`** — `process_trade()`'s BUY branch now skips
+   copying any individual trade priced within this distance of $0/$1, regardless of which wallet
+   made it (new event `skip_extreme_tail_entry_price`). Extends Rule 27's `TCA_MIN_ENTRY_PRICE`
+   (a WALLET-discovery-time filter) down to the per-trade level — an otherwise-normal tracked
+   wallet occasionally dabbling in one extreme-tail bet was previously uncaught by the wallet-level
+   check. Same 0.02 value, not re-derived.
+2. **`polymarket_simulator.StaleOrderBookError`** (new, `RuntimeError` subclass) replaces the bare
+   `RuntimeError` `fetch_order_book()` raised on a stale book — lets `get_market_prices()` (`bot.py`)
+   distinguish "book is real but old" from "read itself failed" (network/delisted/etc). On this
+   specific exception, `get_market_prices()` now retries once with `ignore_staleness=True` and
+   returns an indicative price (midpoint preferred over `last_trade_price`, matching the fresh
+   path's own preference order) for peak-tracking — with `best_bid` always `None` on this path, so
+   `check_trailing_take_profit()`'s existing `if best_bid is None: continue` exit-gate needed zero
+   changes to stay safe. A side effect: since a successful (even stale-fallback) read no longer
+   falls into the `if indicative_price is None: log error` branch, these no longer flood
+   `bot_event_log` as `event_type="error"` or trigger §54's Telegram error-alert either —
+   resolved as a consequence of the fix, not a separate change.
+
+**Tests**: `TestGetMarketPrices` (+4: stale-then-fallback-succeeds returns indicative with
+`best_bid=None`; falls back to `last_trade_price` when the stale book is one-sided; the retry
+itself failing still fails soft; a stale book with no usable price at all still fails soft),
+`TestProcessTradeEntryPriceFloor` (+4: low-tail and high-tail prices skipped, a price just outside
+the floor and a normal price both proceed unaffected). 488 Python tests passing (was 480).

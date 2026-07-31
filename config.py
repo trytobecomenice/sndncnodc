@@ -937,6 +937,26 @@ MAX_DRAWDOWN_FROM_PEAK_USD = 450.0
 # reused here for a different subsystem, not re-derived.
 EQUITY_MARK_MIN_ENTRY_PRICE = 0.02
 
+# Per-TRADE entry-price floor (2026-07-31) — process_trade()'s BUY branch
+# skips copying an individual trade priced within this distance of $0 or $1,
+# regardless of which wallet made it. Rule 27's TCA_MIN_ENTRY_PRICE (TS,
+# discoverCategorySpecialists.ts) already does the analogous check at
+# WALLET-discovery time (reject a whole candidate wallet); this is the
+# missing per-trade counterpart for an otherwise-normal tracked wallet that
+# occasionally also dabbles in an extreme-tail bet. Investigated live: 74
+# distinct open positions were hitting polymarket_simulator.
+# MAX_BOOK_AGE_SECONDS's staleness guard 100+ times/day EACH, because these
+# specific chronically-thin markets (2028-election longshots, multi-year-out
+# crypto price targets, etc.) rarely trade at all — before the
+# get_market_prices() stale-tolerant-fallback fix (same commit), this froze
+# their TTP peak-tracking entirely, structurally forcing them into the
+# held-to-resolution bucket the 2026-07-25 sizing report already found is
+# net-NEGATIVE EV (-13% of stake) — nearly all this bot's real positive edge
+# comes from copying the whale's own sell or a live trailing-TP exit, both
+# of which need a workable price feed to fire at all. Same 0.02 value as
+# EQUITY_MARK_MIN_ENTRY_PRICE/TCA_MIN_ENTRY_PRICE, not re-derived.
+PER_TRADE_ENTRY_PRICE_FLOOR = 0.02
+
 # Files (all inside this project directory)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADE_LOG_PATH = os.path.join(BASE_DIR, "trades_log.json")

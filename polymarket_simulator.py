@@ -88,6 +88,18 @@ REQUEST_HEADERS = {
     "Accept": "application/json",
 }
 
+class StaleOrderBookError(RuntimeError):
+    """Raised by fetch_order_book() specifically when the book itself was
+    read successfully but its own server timestamp exceeds
+    MAX_BOOK_AGE_SECONDS (2026-07-31) — a distinct exception, not a bare
+    RuntimeError, so callers can tell "the book is real but old" apart from
+    "the read itself failed" (network/HTTP/parse errors). bot.py's
+    get_market_prices() catches this specifically to retry with
+    ignore_staleness=True for peak-tracking purposes on chronically thin
+    markets, while still refusing to ever fire an exit off stale data.
+    """
+
+
 # One HTTPSConnection per (thread, host), reused across calls this thread
 # makes to that host. Keyed by host since this module alone talks to two
 # hosts (gamma-api for market/fee metadata, clob for order books).
@@ -393,7 +405,7 @@ def fetch_order_book(token_id, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness
     if book_timestamp_ms is not None and not ignore_staleness:
         age_seconds = time.time() - (float(book_timestamp_ms) / 1000.0)
         if age_seconds > MAX_BOOK_AGE_SECONDS:
-            raise RuntimeError(
+            raise StaleOrderBookError(
                 f"order book for token {token_id} is stale: {age_seconds:.1f}s old "
                 f"(server timestamp {book_timestamp_ms}), exceeds "
                 f"MAX_BOOK_AGE_SECONDS={MAX_BOOK_AGE_SECONDS} — refusing to price "

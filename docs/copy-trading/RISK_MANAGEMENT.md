@@ -384,6 +384,30 @@ source trader eventually selling — which may happen too late, or not before a 
 Trailing TP locks in gains proactively rather than passively mirroring the source trader's exit
 timing.
 
+**Addendum 2026-07-31 — stale-tolerant peak-tracking fallback (`get_market_prices()`).**
+
+> **Challenge:** "the fetch itself fails, that position simply isn't re-evaluated that cycle"
+> (above) turned out to have a real, chronic failure mode hiding inside it: `polymarket_
+> simulator.fetch_order_book()`'s own staleness guard (`MAX_BOOK_AGE_SECONDS=15`) raised on
+> 74 distinct open positions 100+ times per DAY EACH, because their markets (2028-election
+> longshots, multi-year-out crypto price targets, etc.) are thin enough that Polymarket's own book
+> genuinely doesn't refresh that fast. "Not re-evaluated that cycle" meant, in practice, "not
+> re-evaluated basically ever" for these specific positions — `pos["last_priced_at"]` never
+> advances on a failed check, so `peak_profit_pct` froze permanently, and TTP could never manage
+> them at all.
+> **Fix:** `get_market_prices()` now catches the staleness failure specifically (a new
+> `polymarket_simulator.StaleOrderBookError`, distinct from a broken/delisted-market failure) and
+> retries once with `ignore_staleness=True`, returning an indicative price (midpoint preferred
+> over `last_trade_price`, same preference order as the fresh path) for peak-tracking — with
+> `best_bid` always `None` on this path, so `check_trailing_take_profit()`'s existing `if best_bid
+> is None: continue` (an exit can only ever fire on a live bid) needed zero changes to stay safe.
+> A position on a chronically thin market can now at least have its high-water-mark tracked
+> against a stale-but-real quote, instead of being frozen and structurally forced into the
+> held-to-resolution bucket Rule 27's addendum above already ties to net-negative EV. Paired with
+> Rule 27's new per-trade entry-price floor, which stops *future* trades of this kind from being
+> copied at all. 488 Python tests passing (was 480; +4 `TestGetMarketPrices` stale-fallback
+> regressions in this addendum, +4 Rule 27's).
+
 ---
 
 ## 8. Database ownership boundaries
@@ -1834,6 +1858,31 @@ caught (which independently still returns `true` for this wallet on its own).
 wallet's paper-thin per-trade dollar profit — investigating it with real numbers (not just the
 instinct) surfaced a more specific, more actionable problem than "the edge is thin": the price point
 itself is untrustworthy, not just small.
+
+**Addendum 2026-07-31 — per-TRADE counterpart added (`config.PER_TRADE_ENTRY_PRICE_FLOOR`, Python).**
+
+> **Challenge:** this rule only ever ran at wallet-discovery time — an otherwise-normal tracked
+> wallet that occasionally also buys an extreme-tail longshot had every one of those individual
+> trades copied anyway. Investigating a real Telegram alert ("30.1s stale") led to finding 74
+> distinct open positions repeatedly failing `polymarket_simulator.MAX_BOOK_AGE_SECONDS`'s
+> 15-second staleness guard — 100+ times per DAY each — because these specific markets
+> (2028-election longshots, multi-year-out crypto price targets, etc.) are chronically thin and
+> genuinely don't trade often enough for Polymarket's own order book to refresh that fast.
+> **Mechanism:** before this addendum, `check_trailing_take_profit()`'s price check failing this
+> hard meant `pos["last_priced_at"]` never advanced and `peak_profit_pct` froze — these positions
+> could never be actively managed by TTP at all, structurally forcing them into the
+> held-to-resolution bucket the 2026-07-25 sizing report already found is net-NEGATIVE EV
+> (-13% of stake) — nearly all of this bot's real positive edge comes from copying the whale's own
+> sell or firing a live trailing-TP exit, both of which need a workable price feed to happen.
+
+`process_trade()`'s BUY branch now skips copying an individual trade (regardless of which wallet
+made it) whose own reported price is within `config.PER_TRADE_ENTRY_PRICE_FLOOR = 0.02` of $0 or
+$1 — same value as `TCA_MIN_ENTRY_PRICE` above, not re-derived, applied one level down (per-trade,
+not per-wallet). New event type `skip_extreme_tail_entry_price`. See Rule 7's addendum for the
+complementary fix (a stale-tolerant peak-tracking fallback for positions that get opened anyway,
+e.g. from a wallet whose *category-weighted* average stays comfortably inside the floor even
+though one specific trade doesn't). 488 Python tests passing (was 480; +4
+`TestProcessTradeEntryPriceFloor`).
 
 ---
 

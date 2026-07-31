@@ -544,11 +544,45 @@ def get_market_prices(market_slug, outcome, ignore_staleness=False):
     fetch_order_book_for_outcome/fetch_order_book — see those docstrings.
     Only sweep_zombie_positions/close_position_zombie_dump should ever pass
     True; the normal TTP sweep must keep refusing stale books.
+
+    Stale-tolerant peak-tracking fallback (2026-07-31): a chronically thin
+    market's book can genuinely stay >MAX_BOOK_AGE_SECONDS old for hours
+    (confirmed live: 74 distinct positions, 100+ failures/day each) — before
+    this fix, EVERY such check returned (None, None, err), which meant
+    peak_profit_pct froze forever (pos["last_priced_at"] is only updated on
+    a successful read) and these positions could never be actively managed
+    by TTP at all, structurally forcing them into the held-to-resolution
+    bucket the 2026-07-25 sizing report found is net-NEGATIVE EV. Now: a
+    fresh-required call (ignore_staleness=False) that fails ONLY because
+    the book is stale (StaleOrderBookError, not a broken/delisted market)
+    retries once with ignore_staleness=True and returns an indicative price
+    from that stale book for peak-tracking — but ALWAYS with best_bid=None,
+    so check_trailing_take_profit()'s existing `if best_bid is None:
+    continue` (an exit can only fire on a live bid) needs no changes at all
+    to keep this safe. midpoint is preferred over last_trade_price here for
+    the same reason the fresh path prefers it — a single old trade is less
+    trustworthy than the book's current two-sided quote, stale or not.
     """
     try:
         _, book = polymarket_simulator.fetch_order_book_for_outcome(
             market_slug, outcome, ignore_staleness=ignore_staleness
         )
+    except polymarket_simulator.StaleOrderBookError as e:
+        if ignore_staleness:
+            return None, None, f"price check failed: {e}"  # should be unreachable
+        try:
+            _, book = polymarket_simulator.fetch_order_book_for_outcome(
+                market_slug, outcome, ignore_staleness=True
+            )
+        except Exception as e2:
+            return None, None, f"price check failed: {e2}"
+        midpoint = None
+        if book["bids"] and book["asks"]:
+            midpoint = (book["bids"][0][0] + book["asks"][0][0]) / 2
+        indicative = midpoint or book.get("last_trade_price")
+        if not indicative or indicative <= 0:
+            return None, None, f"no usable stale-fallback price for {market_slug}/{outcome}: {book}"
+        return None, indicative, None
     except Exception as e:
         return None, None, f"price check failed: {e}"
 
@@ -2484,6 +2518,19 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
                         "reason": f"source trade is {age / 3600:.1f}h old and {market_slug} "
                                   f"has already resolved — refusing to open a fresh position "
                                   f"from a stale/replayed signal"})
+            return
+
+        # Per-trade entry-price floor (2026-07-31) — see config.
+        # PER_TRADE_ENTRY_PRICE_FLOOR's docstring. Checked before the muted-
+        # trader/Shadow-Rehab path too, same reasoning as the guard above:
+        # an extreme-tail trade shouldn't balloon a shadow position either.
+        if price < config.PER_TRADE_ENTRY_PRICE_FLOOR or price > 1 - config.PER_TRADE_ENTRY_PRICE_FLOOR:
+            append_log({**base_event, "event_type": "skip_extreme_tail_entry_price",
+                        "reason": f"source price {price} is within "
+                                  f"{config.PER_TRADE_ENTRY_PRICE_FLOOR} of $0/$1 — these chronically "
+                                  f"thin markets structurally can't be TTP-managed, forcing a "
+                                  f"held-to-resolution outcome the 2026-07-25 sizing report found "
+                                  f"is net-negative EV"})
             return
 
         # 'Dual-Track' reconciliation (2026-07-25): a polling-observed BUY

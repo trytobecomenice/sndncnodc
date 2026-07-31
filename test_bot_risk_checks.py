@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import bot
 import config
+import polymarket_simulator
 
 
 class TestMarkTradeSeen(unittest.TestCase):
@@ -831,6 +832,71 @@ class TestGetMarketPrices(unittest.TestCase):
         self.assertIsNone(best_bid)
         self.assertIsNone(indicative)
         self.assertIn("no market", err)
+
+    def test_stale_book_retries_with_ignore_staleness_for_peak_tracking(self):
+        """Regression (2026-07-31): before this fix, a StaleOrderBookError on
+        a chronically thin market returned (None, None, err), freezing
+        peak_profit_pct forever (pos["last_priced_at"] only updates on a
+        successful read). Now: retries once with ignore_staleness=True and
+        returns an indicative price -- but best_bid MUST stay None so
+        check_trailing_take_profit()'s existing exit-gate needs no changes
+        to stay safe."""
+        stale_book = {"bids": [(0.05, 10.0)], "asks": [(0.07, 10.0)], "last_trade_price": 0.04}
+        with patch(
+            "bot.polymarket_simulator.fetch_order_book_for_outcome",
+            side_effect=[
+                polymarket_simulator.StaleOrderBookError("order book ... is stale: 45.0s old"),
+                ({}, stale_book),
+            ],
+        ) as mock_fetch:
+            best_bid, indicative, err = bot.get_market_prices("thin-market", "Yes")
+        self.assertIsNone(best_bid)  # never eligible to fire an exit
+        self.assertIsNone(err)
+        self.assertAlmostEqual(indicative, 0.06)  # midpoint of the stale book, preferred over last_trade
+        self.assertEqual(mock_fetch.call_count, 2)
+        self.assertEqual(mock_fetch.call_args_list[0].kwargs.get("ignore_staleness"), False)
+        self.assertEqual(mock_fetch.call_args_list[1].kwargs.get("ignore_staleness"), True)
+
+    def test_stale_book_falls_back_to_last_trade_when_stale_book_is_one_sided(self):
+        stale_book = {"bids": [], "asks": [(0.07, 10.0)], "last_trade_price": 0.04}
+        with patch(
+            "bot.polymarket_simulator.fetch_order_book_for_outcome",
+            side_effect=[
+                polymarket_simulator.StaleOrderBookError("stale"),
+                ({}, stale_book),
+            ],
+        ):
+            best_bid, indicative, err = bot.get_market_prices("thin-market", "Yes")
+        self.assertIsNone(best_bid)
+        self.assertIsNone(err)
+        self.assertAlmostEqual(indicative, 0.04)
+
+    def test_stale_retry_itself_failing_returns_a_soft_error(self):
+        with patch(
+            "bot.polymarket_simulator.fetch_order_book_for_outcome",
+            side_effect=[
+                polymarket_simulator.StaleOrderBookError("stale"),
+                RuntimeError("market delisted"),
+            ],
+        ):
+            best_bid, indicative, err = bot.get_market_prices("thin-market", "Yes")
+        self.assertIsNone(best_bid)
+        self.assertIsNone(indicative)
+        self.assertIn("market delisted", err)
+
+    def test_stale_retry_with_no_usable_price_at_all_returns_a_soft_error(self):
+        empty_stale_book = {"bids": [], "asks": [], "last_trade_price": None}
+        with patch(
+            "bot.polymarket_simulator.fetch_order_book_for_outcome",
+            side_effect=[
+                polymarket_simulator.StaleOrderBookError("stale"),
+                ({}, empty_stale_book),
+            ],
+        ):
+            best_bid, indicative, err = bot.get_market_prices("thin-market", "Yes")
+        self.assertIsNone(best_bid)
+        self.assertIsNone(indicative)
+        self.assertIsNotNone(err)
 
 
 class TestFetchDirectFeed(unittest.TestCase):
@@ -1916,6 +1982,72 @@ class TestProcessTradeResolvedMarketGuard(unittest.TestCase):
             bot.process_trade(**self._kwargs(age_hours=0.01))
 
         mock_fetch.assert_not_called()
+
+
+class TestProcessTradeEntryPriceFloor(unittest.TestCase):
+    """Per-trade entry-price floor (2026-07-31, config.
+    PER_TRADE_ENTRY_PRICE_FLOOR) — skips copying an individual trade priced
+    within the floor of $0/$1, regardless of which wallet made it. Built
+    after investigating 74 distinct open positions repeatedly failing
+    polymarket_simulator.MAX_BOOK_AGE_SECONDS's staleness guard because
+    these specific chronically-thin markets rarely trade at all, which
+    froze their TTP peak-tracking and forced them into the
+    held-to-resolution bucket the 2026-07-25 sizing report found is
+    net-negative EV."""
+
+    def _kwargs(self, price, **trade_overrides):
+        trade = {
+            "user_address": "0xTrader", "market_slug": "some-market", "outcome": "Yes",
+            "side": "BUY", "price": price, "size_usd": 5.5, "trade_id": "tid-1",
+            "timestamp": "t", "market_title": "", "detected_by": "polling",
+        }
+        trade.update(trade_overrides)
+        return dict(
+            trade=trade, positions={}, source_positions={}, source_cost_basis={},
+            trader_performance={}, muted_traders={},
+            tracked_by_lower={"0xtrader": ("0xTrader", "nick")},
+            risk_state={"market_to_event": {"some-market": "some-event"},
+                        "market_to_category": {"some-market": "crypto"}, "kill_switch": None},
+            wallet_scores={},
+        )
+
+    def test_low_extreme_tail_price_is_skipped(self):
+        with patch("bot.risk_manager.check_buy") as mock_check_buy, \
+             patch("bot.append_log") as mock_log:
+            bot.process_trade(**self._kwargs(price=0.005))
+        mock_check_buy.assert_not_called()
+        skip_events = [c for c in mock_log.call_args_list
+                       if c.args[0].get("event_type") == "skip_extreme_tail_entry_price"]
+        self.assertEqual(len(skip_events), 1)
+
+    def test_high_extreme_tail_price_is_also_skipped(self):
+        with patch("bot.risk_manager.check_buy") as mock_check_buy, \
+             patch("bot.append_log") as mock_log:
+            bot.process_trade(**self._kwargs(price=0.995))
+        mock_check_buy.assert_not_called()
+        skip_events = [c for c in mock_log.call_args_list
+                       if c.args[0].get("event_type") == "skip_extreme_tail_entry_price"]
+        self.assertEqual(len(skip_events), 1)
+
+    def test_price_just_outside_the_floor_proceeds_normally(self):
+        with patch("bot.risk_manager.check_buy",
+                   return_value=(False, "skip_risk_exposure_ceiling", "over cap")), \
+             patch("bot.fetch_book_depth_usd", return_value=None), \
+             patch("bot.append_log") as mock_log:
+            bot.process_trade(**self._kwargs(price=0.03))
+        skip_events = [c for c in mock_log.call_args_list
+                       if c.args[0].get("event_type") == "skip_extreme_tail_entry_price"]
+        self.assertEqual(skip_events, [])
+
+    def test_normal_price_never_triggers_the_floor_check_path(self):
+        with patch("bot.risk_manager.check_buy",
+                   return_value=(False, "skip_risk_exposure_ceiling", "over cap")), \
+             patch("bot.fetch_book_depth_usd", return_value=None), \
+             patch("bot.append_log") as mock_log:
+            bot.process_trade(**self._kwargs(price=0.55))
+        skip_events = [c for c in mock_log.call_args_list
+                       if c.args[0].get("event_type") == "skip_extreme_tail_entry_price"]
+        self.assertEqual(skip_events, [])
 
 
 class TestProcessTradeSellShortfallWiring(unittest.TestCase):
