@@ -134,6 +134,13 @@
       "when": 1785431332021,
       "tag": "0018_spooky_ender_wiggin",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1785506227929,
+      "tag": "0019_yummy_luckman",
+      "breakpoints": true
     }
   ]
 }

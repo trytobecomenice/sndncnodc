@@ -3619,3 +3619,27 @@ compose -f monitoring/docker-compose.yml up -d` still needs to be run manually o
 (Docker itself needs installing first), and Joey needs to create her own Telegram bot via
 `@BotFather` and populate `.env` with the token/chat_id — neither of those two steps can be done
 from this session.
+
+**Update, same day**: after deploying, Docker+Prometheus+Grafana running together pushed the EC2
+box's swap usage from 686MB to 1.2GB within ~20 minutes, actively swapping (confirmed live via
+`vmstat`) — degrading the box badly enough that `bot.py`'s own Trailing Take-Profit price checks
+started failing on `polymarket_simulator.MAX_BOOK_AGE_SECONDS=15`'s staleness guard (CLOB order
+books read as "stale" purely because local processing had gotten too slow, not a real remote/
+Polygon issue), and the Next.js dashboard's page loads degraded to 7-38s. **Docker stack stopped**
+(`sudo docker compose -f monitoring/docker-compose.yml down`) to restore `bot.py`'s reliability —
+confirmed swap-in/out activity dropped to near-zero and stale-book errors to 0/60s immediately
+after. The 908MB box genuinely cannot run this monitoring stack alongside the bot reliably;
+revisit only after upgrading the EC2 instance (e.g. to a 2GB t3.small) — see
+[[career-positioning-and-quant-roadmap]]/plan file for the decision. Telegram alerting itself
+(no Docker needed) stays live and unaffected.
+
+**Second, unrelated bug found investigating the dashboard slowness**: even with Docker stopped and
+the dashboard process freshly restarted, `/overview` was still taking 7-38s. Root cause:
+`bot_event_log` had grown to 453,345 rows (driven by tonight's incident volume — repeated
+stale-trade skips, kill-switch churn) with **no index beyond its primary key** — every other
+significant table in this schema has one, this one never did. `apps/dashboard/app/overview/
+page.tsx`'s `ORDER BY timestamp DESC LIMIT 15` (and `db.py`'s own `prune_event_log()`'s `WHERE
+timestamp < cutoff`) were both full-table-scanning and sorting all 453K+ rows on every call. Fixed:
+`bot_event_log_timestamp_idx` added (`packages/db/src/schema.ts`, migration
+`0019_yummy_luckman.sql`) — confirmed live locally (an 85K-row copy) that the same query dropped
+from a full scan to ~1.2ms.

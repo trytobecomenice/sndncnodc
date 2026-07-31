@@ -320,16 +320,31 @@ export const dailyReport = sqliteTable("daily_report", {
 // parity with today's state.json/trades_log.json). TS/Drizzle still owns the
 // DDL; only bot.py/db.py read and write the rows. ---------------------------
 
-export const botEventLog = sqliteTable("bot_event_log", {
-  id: id(),
-  timestamp: integer("timestamp", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
-  eventType: text("event_type").notNull(),
-  traderAddress: text("trader_address"),
-  marketSlug: text("market_slug"),
-  outcome: text("outcome"),
-  side: text("side"),
-  payloadJson: text("payload_json").notNull(),
-});
+export const botEventLog = sqliteTable(
+  "bot_event_log",
+  {
+    id: id(),
+    timestamp: integer("timestamp", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+    eventType: text("event_type").notNull(),
+    traderAddress: text("trader_address"),
+    marketSlug: text("market_slug"),
+    outcome: text("outcome"),
+    side: text("side"),
+    payloadJson: text("payload_json").notNull(),
+  },
+  // Added 2026-07-31: found live, this table had NO index beyond its primary
+  // key despite being the single busiest table in the DB (every event.py
+  // append_log() call inserts a row) -- apps/dashboard's /overview page does
+  // `ORDER BY timestamp DESC LIMIT 15` on every load, and db.py's own
+  // prune_event_log() does `WHERE timestamp < cutoff`, both full-table-scanning
+  // and sorting 450K+ rows without this. Confirmed live: /overview page loads
+  // had degraded to 7-38s (should be well under 1s) once this table grew that
+  // large from one night's incident-driven event volume (repeated stale-trade
+  // skips, kill-switch churn, etc.) -- every other significant table in this
+  // schema already has an index on its own hot lookup column; this one simply
+  // never got one.
+  (t) => [index("bot_event_log_timestamp_idx").on(t.timestamp)]
+);
 
 export const botSeenTrade = sqliteTable("bot_seen_trade", {
   tradeId: text("trade_id").primaryKey(),

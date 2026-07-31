@@ -1,0 +1,1 @@
+CREATE INDEX `bot_event_log_timestamp_idx` ON `bot_event_log` (`timestamp`);
