@@ -27,8 +27,12 @@ human to reconcile") a first-class state instead of an exception path.
 
 - `httpserver/` — plain `net/http` service exposing the store (Session 3):
   `POST /orders` (idempotent create, 201/200), `GET /orders/{id}`,
-  `POST /orders/{id}/cancel` (Pending → Invalidated via `order.Order`'s own
-  `Transition()`, 409 if the order's current state disallows it). No
+  `POST /orders/{id}/cancel` (Pending → Invalidated), and
+  `POST /orders/{id}/transition` (Session 6: generic
+  Filled/Expired/Invalidated, body `{"to": "filled"}` etc — added once a
+  real caller needed all three terminal outcomes, not just cancellation).
+  Every handler routes through `order.Order`'s own `Transition()` before
+  writing to the store, 409 if the order's current state disallows it. No
   framework, no gRPC — see the package doc for why.
 - `cmd/omsd/` — the runnable binary (`go run ./cmd/omsd`, env
   `OMS_DB_PATH`/`OMS_ADDR`). Not started by anything in production yet —
@@ -44,18 +48,24 @@ human to reconcile") a first-class state instead of an exception path.
   depends on the real `bullpen` binary being installed. Still not
   wired to a live call site.
 
-Session 5 (`../oms_client.py`, repo root, not under `oms/` since it's
-Python) is the HTTP client `bot.py` will eventually use —
-`create_order()`/`get_order()`/`cancel_order()`, unit-tested with a mocked
-connection and verified live end-to-end against a real running `omsd`.
-Not wired into `bot.py` yet: the originally-planned call site
-(`sweep_pending_exit_orders()`/`start_patient_exit()`, Rule 31 Priority 3)
+`../oms_client.py` (repo root, not under `oms/` since it's Python) is the
+HTTP client — `create_order()`/`get_order()`/`cancel_order()`/
+`transition_order()`, unit-tested with a mocked connection and verified
+live end-to-end against a real running `omsd`.
+
+**Session 6 (2026-08-01): wired into bot.py, opt-in, off by default.**
+`config.ENABLE_OMS_SHADOW_MIRROR` (default `False`) — when on,
+`start_shadow_patient_exit()`/`sweep_shadow_patient_exits()`
+(`docs/copy-trading/SAFETY.md` §61) additionally mirror their
+already-decided outcomes into the Go OMS via `oms_client.py`, purely to
+validate the OMS's own correctness under real usage; every call is
+wrapped in `try/except` and never influences the real shadow-patient-exit
+simulation's own data or decisions. Not the originally-planned call site —
+`sweep_pending_exit_orders()`/`start_patient_exit()` (Rule 31 Priority 3)
 turned out to be `LIVE_MODE`-only by construction, so it would never
-actually run against this bot's paper-only configuration — Session 6
-targets `start_shadow_patient_exit()`/`sweep_shadow_patient_exits()`
-instead (fires in paper mode on every real trailing-TP exit). See the
-roadmap doc's Phase 2 section for the corrected session-by-session plan
-and its paper-mode-first validation discipline.
+actually run against this bot's paper-only configuration. `omsd` itself
+still isn't started by anything in production, so this is fully inert
+until Joey deliberately runs it and flips the flag.
 
 ## Development
 

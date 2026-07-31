@@ -56,6 +56,7 @@ from bullpen_client import (
 )
 from polymarket_data_api import fetch_all_wallets_concurrent, make_persistent_executor
 import polymarket_simulator
+import oms_client
 import telegram_alerts
 from prometheus_client import Gauge, start_http_server
 
@@ -1772,11 +1773,51 @@ def start_shadow_patient_exit(key, trader, market_slug, outcome, shares, immedia
     floor_price = compute_slippage_floor_price(mid_price, live_edge)
     init_price = best_ask  # same "join the touch on the ask side" as the real mechanism
 
-    return create_shadow_patient_exit(
+    row_id = create_shadow_patient_exit(
         wallet_address=trader, market_slug=market_slug, outcome=outcome, position_key=key,
         shares=shares, init_price=init_price, floor_price=floor_price,
         immediate_exit_price=immediate_exit_price, close_reason=close_reason,
     )
+
+    # Go OMS mirror (2026-08-01, Session 6, config.ENABLE_OMS_SHADOW_MIRROR
+    # default False) -- purely an additional, parallel record for
+    # validating the OMS itself; never allowed to affect this function's
+    # real return value or the shadow-patient-exit row just created above.
+    if config.ENABLE_OMS_SHADOW_MIRROR and row_id is not None:
+        try:
+            oms_client.create_order(idempotency_key=row_id)
+        except oms_client.OmsClientError as e:
+            logger.warning(f"OMS shadow mirror create failed for {row_id}: {e}")
+
+    return row_id
+
+
+_SHADOW_STATUS_TO_OMS_STATUS = {
+    "filled": "filled",
+    "fallback_timeout": "expired",
+    "abandoned": "invalidated",
+}
+
+
+def _mirror_shadow_patient_exit_terminal_to_oms(row_id, python_status):
+    """Best-effort mirror of an already-decided shadow-patient-exit
+    terminal outcome into the Go OMS (2026-08-01, Session 6) -- re-derives
+    the OMS order's internal id via create_order()'s own idempotent replay
+    (row_id is the SAME idempotency key start_shadow_patient_exit() used
+    to create it, whether or not the mirror was actually on back then),
+    then transitions it. Never raises: a failure here must never affect
+    the real shadow-patient-exit row the caller already closed.
+    """
+    if not config.ENABLE_OMS_SHADOW_MIRROR:
+        return
+    to = _SHADOW_STATUS_TO_OMS_STATUS.get(python_status)
+    if to is None:
+        return
+    try:
+        oms_order = oms_client.create_order(idempotency_key=row_id)
+        oms_client.transition_order(oms_order["id"], to=to)
+    except oms_client.OmsClientError as e:
+        logger.warning(f"OMS shadow mirror transition failed for {row_id} -> {to}: {e}")
 
 
 def sweep_shadow_patient_exits():
@@ -1805,15 +1846,18 @@ def sweep_shadow_patient_exits():
         best_bid, best_ask, price_error = get_market_bid_ask(row["market_slug"], row["outcome"])
         if best_bid is None:
             close_shadow_patient_exit(row["id"], "abandoned", resolved_price=None)
+            _mirror_shadow_patient_exit_terminal_to_oms(row["id"], "abandoned")
             continue
 
         if best_bid >= row["current_price"]:
             close_shadow_patient_exit(row["id"], "filled", resolved_price=row["current_price"])
+            _mirror_shadow_patient_exit_terminal_to_oms(row["id"], "filled")
             continue
 
         elapsed = now - row["created_at"]
         if elapsed >= config.ORDER_PEG_MAX_TOTAL_WAIT_SECONDS:
             close_shadow_patient_exit(row["id"], "fallback_timeout", resolved_price=best_bid)
+            _mirror_shadow_patient_exit_terminal_to_oms(row["id"], "fallback_timeout")
             continue
 
         mid = (best_bid + best_ask) / 2

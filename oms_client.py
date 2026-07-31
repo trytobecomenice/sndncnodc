@@ -92,3 +92,21 @@ def cancel_order(order_id, timeout=None):
     separate exception type yet for "illegal transition" vs "genuinely
     failed"; a caller that cares has to inspect the message."""
     return _request("POST", f"/orders/{order_id}/cancel", timeout=timeout)
+
+
+TRANSITIONABLE_STATUSES = {"filled", "expired", "invalidated"}
+
+
+def transition_order(order_id, to, timeout=None):
+    """POST /orders/{id}/transition — mirrors an ALREADY-DECIDED outcome
+    into the OMS (2026-08-01, Session 6). `to` must be one of "filled",
+    "expired", "invalidated" — matches the Go server's own
+    transitionableStatuses (see oms/httpserver.go); checked client-side
+    first purely to fail fast with a clear message rather than a round
+    trip for an obviously-wrong value, the server re-validates regardless.
+    Raises OmsClientError on a 409 (illegal transition, e.g. the order is
+    already terminal) the same as any other non-2xx response.
+    """
+    if to not in TRANSITIONABLE_STATUSES:
+        raise ValueError(f"to={to!r} must be one of {sorted(TRANSITIONABLE_STATUSES)}")
+    return _request("POST", f"/orders/{order_id}/transition", body={"to": to}, timeout=timeout)

@@ -100,6 +100,32 @@ class TestCancelOrder(unittest.TestCase):
         self.assertIn("illegal order transition", str(ctx.exception))
 
 
+class TestTransitionOrder(unittest.TestCase):
+    def test_success_returns_the_transitioned_order(self):
+        conn = _mock_conn(200, {"id": "order-1", "status": "filled"})
+        with patch("oms_client.http.client.HTTPConnection", return_value=conn):
+            result = oms_client.transition_order("order-1", "filled")
+        self.assertEqual(result["status"], "filled")
+        method, path = conn.request.call_args.args[:2]
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/orders/order-1/transition")
+        sent_body = json.loads(conn.request.call_args.kwargs["body"])
+        self.assertEqual(sent_body, {"to": "filled"})
+
+    def test_rejects_an_unrecognized_target_before_making_any_request(self):
+        with patch("oms_client.http.client.HTTPConnection") as mock_conn_cls:
+            with self.assertRaises(ValueError):
+                oms_client.transition_order("order-1", "banana")
+        mock_conn_cls.assert_not_called()
+
+    def test_conflict_on_already_terminal_order_raises_oms_client_error(self):
+        conn = _mock_conn(409, {"error": "illegal order transition: filled -> expired"})
+        with patch("oms_client.http.client.HTTPConnection", return_value=conn):
+            with self.assertRaises(oms_client.OmsClientError) as ctx:
+                oms_client.transition_order("order-1", "expired")
+        self.assertIn("illegal order transition", str(ctx.exception))
+
+
 class TestRequestRobustness(unittest.TestCase):
     def test_non_json_body_on_a_success_status_does_not_crash(self):
         conn = MagicMock()

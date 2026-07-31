@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import bot
 import config
+import oms_client
 import polymarket_simulator
 
 
@@ -2819,6 +2820,91 @@ class TestStartShadowPatientExit(unittest.TestCase):
         self.assertIsNone(result)
         mock_create.assert_not_called()
 
+    def test_oms_mirror_off_by_default_never_calls_oms_client(self):
+        with patch.object(config, "ENABLE_OMS_SHADOW_MIRROR", False), \
+             patch("bot.get_market_bid_ask", return_value=(0.47, 0.50, None)), \
+             patch("bot.create_shadow_patient_exit", return_value="row-1"), \
+             patch("bot.oms_client.create_order") as mock_oms_create:
+            bot.start_shadow_patient_exit(
+                "0xTrader|m|Yes", "0xTrader", "m", "Yes", 10.0,
+                immediate_exit_price=0.46, close_reason="trailing_tp",
+            )
+        mock_oms_create.assert_not_called()
+
+    def test_oms_mirror_on_creates_an_oms_order_with_the_row_id_as_key(self):
+        with patch.object(config, "ENABLE_OMS_SHADOW_MIRROR", True), \
+             patch("bot.get_market_bid_ask", return_value=(0.47, 0.50, None)), \
+             patch("bot.create_shadow_patient_exit", return_value="row-1"), \
+             patch("bot.oms_client.create_order") as mock_oms_create:
+            result = bot.start_shadow_patient_exit(
+                "0xTrader|m|Yes", "0xTrader", "m", "Yes", 10.0,
+                immediate_exit_price=0.46, close_reason="trailing_tp",
+            )
+        self.assertEqual(result, "row-1")
+        mock_oms_create.assert_called_once_with(idempotency_key="row-1")
+
+    def test_oms_mirror_failure_does_not_affect_the_real_return_value(self):
+        with patch.object(config, "ENABLE_OMS_SHADOW_MIRROR", True), \
+             patch("bot.get_market_bid_ask", return_value=(0.47, 0.50, None)), \
+             patch("bot.create_shadow_patient_exit", return_value="row-1"), \
+             patch("bot.oms_client.create_order", side_effect=oms_client.OmsClientError("boom")):
+            result = bot.start_shadow_patient_exit(
+                "0xTrader|m|Yes", "0xTrader", "m", "Yes", 10.0,
+                immediate_exit_price=0.46, close_reason="trailing_tp",
+            )
+        self.assertEqual(result, "row-1")  # unaffected by the OMS mirror failing
+
+    def test_oms_mirror_never_called_when_the_real_create_returns_none(self):
+        with patch.object(config, "ENABLE_OMS_SHADOW_MIRROR", True), \
+             patch("bot.get_market_bid_ask", return_value=(0.47, 0.50, None)), \
+             patch("bot.create_shadow_patient_exit", return_value=None), \
+             patch("bot.oms_client.create_order") as mock_oms_create:
+            bot.start_shadow_patient_exit(
+                "0xTrader|m|Yes", "0xTrader", "m", "Yes", 10.0,
+                immediate_exit_price=0.46, close_reason="trailing_tp",
+            )
+        mock_oms_create.assert_not_called()
+
+
+class TestMirrorShadowPatientExitTerminalToOms(unittest.TestCase):
+    """_mirror_shadow_patient_exit_terminal_to_oms() -- the best-effort
+    helper sweep_shadow_patient_exits() calls after each terminal close.
+    Must never raise, regardless of what fails."""
+
+    def test_off_by_default_never_calls_oms_client(self):
+        with patch.object(config, "ENABLE_OMS_SHADOW_MIRROR", False), \
+             patch("bot.oms_client.create_order") as mock_create:
+            bot._mirror_shadow_patient_exit_terminal_to_oms("shadow1", "filled")
+        mock_create.assert_not_called()
+
+    def test_maps_python_status_to_oms_status_correctly(self):
+        cases = [("filled", "filled"), ("fallback_timeout", "expired"), ("abandoned", "invalidated")]
+        for python_status, oms_status in cases:
+            with self.subTest(python_status=python_status):
+                with patch.object(config, "ENABLE_OMS_SHADOW_MIRROR", True), \
+                     patch("bot.oms_client.create_order", return_value={"id": "oms-order-1"}) as mock_create, \
+                     patch("bot.oms_client.transition_order") as mock_transition:
+                    bot._mirror_shadow_patient_exit_terminal_to_oms("shadow1", python_status)
+                mock_create.assert_called_once_with(idempotency_key="shadow1")
+                mock_transition.assert_called_once_with("oms-order-1", to=oms_status)
+
+    def test_unrecognized_python_status_is_a_silent_no_op(self):
+        with patch.object(config, "ENABLE_OMS_SHADOW_MIRROR", True), \
+             patch("bot.oms_client.create_order") as mock_create:
+            bot._mirror_shadow_patient_exit_terminal_to_oms("shadow1", "some_future_status")
+        mock_create.assert_not_called()
+
+    def test_create_failure_is_caught_never_raised(self):
+        with patch.object(config, "ENABLE_OMS_SHADOW_MIRROR", True), \
+             patch("bot.oms_client.create_order", side_effect=oms_client.OmsClientError("boom")):
+            bot._mirror_shadow_patient_exit_terminal_to_oms("shadow1", "filled")  # must not raise
+
+    def test_transition_failure_is_caught_never_raised(self):
+        with patch.object(config, "ENABLE_OMS_SHADOW_MIRROR", True), \
+             patch("bot.oms_client.create_order", return_value={"id": "oms-order-1"}), \
+             patch("bot.oms_client.transition_order", side_effect=oms_client.OmsClientError("boom")):
+            bot._mirror_shadow_patient_exit_terminal_to_oms("shadow1", "filled")  # must not raise
+
 
 class TestSweepShadowPatientExits(unittest.TestCase):
     """Mirrors TestSweepPendingExitOrders' terminal-state property, but for
@@ -2842,26 +2928,32 @@ class TestSweepShadowPatientExits(unittest.TestCase):
         with patch("bot.get_shadow_patient_exits", return_value=[row]), \
              patch("bot.get_market_bid_ask", return_value=(0.49, 0.51, None)), \
              patch("bot.close_shadow_patient_exit") as mock_close, \
-             patch("bot.run_bullpen_json") as mock_bullpen:
+             patch("bot.run_bullpen_json") as mock_bullpen, \
+             patch("bot._mirror_shadow_patient_exit_terminal_to_oms") as mock_mirror:
             bot.sweep_shadow_patient_exits()
         mock_bullpen.assert_not_called()
         mock_close.assert_called_once_with("shadow1", "filled", resolved_price=0.48)
+        mock_mirror.assert_called_once_with("shadow1", "filled")
 
     def test_unreadable_market_is_abandoned_not_guessed_at(self):
         row = self._row()
         with patch("bot.get_shadow_patient_exits", return_value=[row]), \
              patch("bot.get_market_bid_ask", return_value=(None, None, "no book")), \
-             patch("bot.close_shadow_patient_exit") as mock_close:
+             patch("bot.close_shadow_patient_exit") as mock_close, \
+             patch("bot._mirror_shadow_patient_exit_terminal_to_oms") as mock_mirror:
             bot.sweep_shadow_patient_exits()
         mock_close.assert_called_once_with("shadow1", "abandoned", resolved_price=None)
+        mock_mirror.assert_called_once_with("shadow1", "abandoned")
 
     def test_unfilled_past_max_wait_closes_at_current_bid_not_left_pending(self):
         old_row = self._row(created_at=time.time() - 99999, current_price=0.42)
         with patch("bot.get_shadow_patient_exits", return_value=[old_row]), \
              patch("bot.get_market_bid_ask", return_value=(0.38, 0.41, None)), \
-             patch("bot.close_shadow_patient_exit") as mock_close:
+             patch("bot.close_shadow_patient_exit") as mock_close, \
+             patch("bot._mirror_shadow_patient_exit_terminal_to_oms") as mock_mirror:
             bot.sweep_shadow_patient_exits()
         mock_close.assert_called_once_with("shadow1", "fallback_timeout", resolved_price=0.38)
+        mock_mirror.assert_called_once_with("shadow1", "fallback_timeout")
 
     def test_unfilled_within_wait_and_reprice_not_due_does_nothing(self):
         row = self._row(created_at=time.time() - 10, last_repriced_at=time.time() - 5,
@@ -2869,10 +2961,12 @@ class TestSweepShadowPatientExits(unittest.TestCase):
         with patch("bot.get_shadow_patient_exits", return_value=[row]), \
              patch("bot.get_market_bid_ask", return_value=(0.45, 0.48, None)), \
              patch("bot.update_shadow_patient_exit_price") as mock_update, \
-             patch("bot.close_shadow_patient_exit") as mock_close:
+             patch("bot.close_shadow_patient_exit") as mock_close, \
+             patch("bot._mirror_shadow_patient_exit_terminal_to_oms") as mock_mirror:
             bot.sweep_shadow_patient_exits()
         mock_update.assert_not_called()
         mock_close.assert_not_called()
+        mock_mirror.assert_not_called()  # no terminal outcome -- nothing to mirror yet
 
     def test_unfilled_and_reprice_due_decays_price_toward_floor(self):
         row = self._row(created_at=time.time() - 40, last_repriced_at=time.time() - 35,

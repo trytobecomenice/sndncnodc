@@ -1154,11 +1154,25 @@ METRICS_PORT = 9100
 
 # Go OMS service (oms/, Phase 2 of the architecture roadmap) — localhost
 # only, matches oms/cmd/omsd's own default OMS_ADDR. See oms_client.py.
-# Not wired into any real call site yet; both values match the Go service's
-# own defaults purely so a local `go run ./oms/cmd/omsd` and this client
-# agree without extra configuration.
+# Both values match the Go service's own defaults purely so a local
+# `go run ./oms/cmd/omsd` and this client agree without extra configuration.
 OMS_HOST = "127.0.0.1"
 OMS_PORT = 8090
+
+# Session 6 (2026-08-01): mirrors start_shadow_patient_exit()/
+# sweep_shadow_patient_exits()'s own already-decided outcomes into the Go
+# OMS via oms_client.py, purely to validate the OMS's own correctness/
+# reliability under real usage -- the shadow-patient-exit mechanism
+# already does its own price-reading and decision-making in Python; the
+# OMS mirror ADDS a parallel record of the same lifecycle, never replaces
+# or influences it. Every mirror call is wrapped in try/except at its call
+# site (never allowed to affect the real shadow-patient-exit simulation,
+# same "best-effort, never breaks the real path" discipline as
+# start_shadow_patient_exit() itself already follows for the real exit).
+# Default False: requires `omsd` to actually be running (nothing starts it
+# automatically yet -- no systemd unit, no watchdog.py/autodeploy.py
+# awareness), and this hasn't been validated against a real deployment.
+ENABLE_OMS_SHADOW_MIRROR = False
 
 # Telegram alerts no-op safely (never raise, never block the main loop) if
 # TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID aren't set in .env -- see

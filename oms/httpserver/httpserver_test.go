@@ -212,3 +212,129 @@ func TestCancelOrder_UnknownIDReturns404(t *testing.T) {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
 	}
 }
+
+func TestTransitionOrder_ToFilled(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	created := decodeOrder(t, postJSON(t, srv.URL+"/orders", createOrderRequest{IdempotencyKey: "trade-1"}))
+
+	resp := postJSON(t, srv.URL+"/orders/"+created.ID+"/transition", transitionOrderRequest{To: "filled"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	got := decodeOrder(t, resp)
+	if got.Status != string(order.Filled) {
+		t.Fatalf("Status = %s, want %s", got.Status, order.Filled)
+	}
+}
+
+func TestTransitionOrder_ToExpired(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	created := decodeOrder(t, postJSON(t, srv.URL+"/orders", createOrderRequest{IdempotencyKey: "trade-1"}))
+
+	resp := postJSON(t, srv.URL+"/orders/"+created.ID+"/transition", transitionOrderRequest{To: "expired"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	got := decodeOrder(t, resp)
+	if got.Status != string(order.Expired) {
+		t.Fatalf("Status = %s, want %s", got.Status, order.Expired)
+	}
+}
+
+func TestTransitionOrder_ToInvalidatedMatchesCancel(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	created := decodeOrder(t, postJSON(t, srv.URL+"/orders", createOrderRequest{IdempotencyKey: "trade-1"}))
+
+	resp := postJSON(t, srv.URL+"/orders/"+created.ID+"/transition", transitionOrderRequest{To: "invalidated"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	got := decodeOrder(t, resp)
+	if got.Status != string(order.Invalidated) {
+		t.Fatalf("Status = %s, want %s", got.Status, order.Invalidated)
+	}
+}
+
+func TestTransitionOrder_RejectsPendingAsATarget(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	created := decodeOrder(t, postJSON(t, srv.URL+"/orders", createOrderRequest{IdempotencyKey: "trade-1"}))
+
+	resp := postJSON(t, srv.URL+"/orders/"+created.ID+"/transition", transitionOrderRequest{To: "pending"})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d (pending is never a valid transition target)", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestTransitionOrder_RejectsUnknownFillStateAsATarget(t *testing.T) {
+	// Only order.Order.Reconcile() may produce UnknownFillState -- not
+	// this generic endpoint.
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	created := decodeOrder(t, postJSON(t, srv.URL+"/orders", createOrderRequest{IdempotencyKey: "trade-1"}))
+
+	resp := postJSON(t, srv.URL+"/orders/"+created.ID+"/transition", transitionOrderRequest{To: "unknown_fill_state"})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestTransitionOrder_RejectsGarbageTarget(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	created := decodeOrder(t, postJSON(t, srv.URL+"/orders", createOrderRequest{IdempotencyKey: "trade-1"}))
+
+	resp := postJSON(t, srv.URL+"/orders/"+created.ID+"/transition", transitionOrderRequest{To: "banana"})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestTransitionOrder_AlreadyTerminalReturns409(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	created := decodeOrder(t, postJSON(t, srv.URL+"/orders", createOrderRequest{IdempotencyKey: "trade-1"}))
+	firstTransition := postJSON(t, srv.URL+"/orders/"+created.ID+"/transition", transitionOrderRequest{To: "filled"})
+	if firstTransition.StatusCode != http.StatusOK {
+		t.Fatalf("first transition status = %d, want %d", firstTransition.StatusCode, http.StatusOK)
+	}
+
+	secondTransition := postJSON(t, srv.URL+"/orders/"+created.ID+"/transition", transitionOrderRequest{To: "expired"})
+	if secondTransition.StatusCode != http.StatusConflict {
+		t.Fatalf("second transition status = %d, want %d", secondTransition.StatusCode, http.StatusConflict)
+	}
+}
+
+func TestTransitionOrder_UnknownIDReturns404(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	resp := postJSON(t, srv.URL+"/orders/no-such-id/transition", transitionOrderRequest{To: "filled"})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestTransitionOrder_InvalidJSONReturns400(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	created := decodeOrder(t, postJSON(t, srv.URL+"/orders", createOrderRequest{IdempotencyKey: "trade-1"}))
+	resp, err := http.Post(srv.URL+"/orders/"+created.ID+"/transition", "application/json", bytes.NewReader([]byte("not json")))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}

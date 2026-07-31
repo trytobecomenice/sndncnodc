@@ -20,6 +20,18 @@ import (
 	"github.com/trytobecomenice/polymarket-copybot/oms/store"
 )
 
+// transitionableStatuses is the set of Status values handleTransitionOrder
+// accepts in a request body -- deliberately excludes Pending (never a
+// valid TARGET of an explicit transition request) and UnknownFillState
+// (only order.Order.Reconcile() may produce that, not this generic
+// endpoint -- see Session 7+'s eventual reconciliation surface, not built
+// yet).
+var transitionableStatuses = map[order.Status]bool{
+	order.Filled:      true,
+	order.Expired:     true,
+	order.Invalidated: true,
+}
+
 // Server wraps a *store.Store and exposes it over HTTP. Holds no other
 // state — every request is independently handled against the store, same
 // "no I/O the store itself doesn't already own" discipline store.go's own
@@ -41,6 +53,7 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /orders", srv.handleCreateOrder)
 	mux.HandleFunc("GET /orders/{id}", srv.handleGetOrder)
 	mux.HandleFunc("POST /orders/{id}/cancel", srv.handleCancelOrder)
+	mux.HandleFunc("POST /orders/{id}/transition", srv.handleTransitionOrder)
 	return mux
 }
 
@@ -125,28 +138,60 @@ func (srv *Server) handleGetOrder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, orderToResponse(o))
 }
 
-// handleCancelOrder: POST /orders/{id}/cancel. Cancellation is modeled as
-// the SAME Pending -> Invalidated transition order.Order already defines
-// (see order/state.go) — this handler fetches the current order,
-// constructs the pure Order type, and asks IT whether the transition is
-// legal before ever writing to the store. That ordering matters: the
-// state machine is the single source of truth for what's legal, the store
-// is deliberately dumb persistence (see store.UpdateStatus's own
-// docstring) — this handler is where the two get composed.
+// handleCancelOrder: POST /orders/{id}/cancel. A convenience-named
+// special case of the same transition machinery handleTransitionOrder
+// uses below — always targets Invalidated specifically.
 func (srv *Server) handleCancelOrder(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	srv.transitionOrder(w, r.PathValue("id"), order.Invalidated)
+}
+
+type transitionOrderRequest struct {
+	To string `json:"to"`
+}
+
+// handleTransitionOrder: POST /orders/{id}/transition, body {"to": "filled"
+// | "expired" | "invalidated"}. Session 6's reason for existing: the
+// pure state machine (order/state.go, Session 1) already defines Pending
+// -> Filled and Pending -> Expired as legal, but Session 3 only ever
+// exposed Pending -> Invalidated over HTTP (via /cancel) — this closes
+// that gap so a caller mirroring an ALREADY-DECIDED outcome (e.g.
+// bot.py's sweep_shadow_patient_exits(), which does its own price-reading
+// and decides fill/timeout/abandon itself) can report any of the three
+// terminal outcomes, not just cancellation.
+func (srv *Server) handleTransitionOrder(w http.ResponseWriter, r *http.Request) {
+	var req transitionOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	to := order.Status(req.To)
+	if !transitionableStatuses[to] {
+		writeError(w, http.StatusBadRequest, "to must be one of: filled, expired, invalidated")
+		return
+	}
+	srv.transitionOrder(w, r.PathValue("id"), to)
+}
+
+// transitionOrder is the shared fetch-validate-persist sequence both
+// handlers above use: fetches the current order, constructs the pure
+// Order type, and asks IT whether the transition is legal before ever
+// writing to the store. That ordering matters: the state machine is the
+// single source of truth for what's legal, the store is deliberately dumb
+// persistence (see store.UpdateStatus's own docstring) — this function is
+// where the two get composed.
+func (srv *Server) transitionOrder(w http.ResponseWriter, id string, to order.Status) {
 	current, err := srv.store.Get(id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "order not found")
 			return
 		}
-		log.Printf("httpserver: Get(%s) for cancel: %v", id, err)
+		log.Printf("httpserver: Get(%s) for transition: %v", id, err)
 		writeError(w, http.StatusInternalServerError, "failed to fetch order")
 		return
 	}
 
-	if err := current.Transition(order.Invalidated); err != nil {
+	if err := current.Transition(to); err != nil {
 		// Not a server error -- the caller asked for an illegal
 		// transition (e.g. canceling an already-filled order). 409
 		// Conflict, not 400: the request was well-formed, the resource's
@@ -155,9 +200,9 @@ func (srv *Server) handleCancelOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := srv.store.UpdateStatus(id, order.Invalidated); err != nil {
-		log.Printf("httpserver: UpdateStatus(%s, invalidated): %v", id, err)
-		writeError(w, http.StatusInternalServerError, "failed to cancel order")
+	if err := srv.store.UpdateStatus(id, to); err != nil {
+		log.Printf("httpserver: UpdateStatus(%s, %s): %v", id, to, err)
+		writeError(w, http.StatusInternalServerError, "failed to update order")
 		return
 	}
 	writeJSON(w, http.StatusOK, orderToResponse(current))

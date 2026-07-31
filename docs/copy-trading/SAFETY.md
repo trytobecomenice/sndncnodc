@@ -4127,3 +4127,71 @@ adding `config.ENABLE_ORDERBOOK_LIQUIDITY_ENTRY_GATE = False` to each class's ow
 `tearDown()`, scoped to exactly the classes affected — the liquidity-gate-specific tests in
 `TestExecuteBuyExtraction` (Sec.64) still patch it back on individually where they need to. 571
 Python tests passing, unchanged in count (this was a fix to existing tests, not new coverage).
+
+## 67. Go OMS (Phase 2, Sessions 1-6) — pure state machine through a paper-mode shadow mirror (2026-08-01)
+
+**Trigger**: Joey's confirmed architecture roadmap (`.claude/plans/async-questing-oasis.md`, Phase
+2) — a Go order-management service, sequenced deliberately as build-first, C++-later, and now
+additionally gated on real sustained profit before Phase 4's C++ market-data work is even
+considered. Built across 6 same-night sessions, each independently tested and committed.
+
+**What shipped, `oms/` (new Go module, separate from the pnpm workspace)**:
+- `order/` — pure state machine mirroring `pending_execution`'s `pending/filled/expired/invalidated`,
+  plus a new `unknown_fill_state` making `BullpenTimeoutError`'s existing "log it, never auto-retry,
+  leave for a human to reconcile" doctrine a first-class state (only `Reconcile()` can leave it, never
+  the ordinary `Transition()` path).
+- `store/` — SQLite-backed (`modernc.org/sqlite`, pure Go, no cgo), a NEW `oms_order` table alongside
+  `pending_execution` in the SAME `data/app.db`. `CreateOrder(idempotencyKey)` is the core pattern:
+  attempts an INSERT directly, re-reads on a UNIQUE-constraint conflict — race-safe by construction.
+  Its own concurrency test caught a real `SQLITE_BUSY` bug from `database/sql`'s default connection
+  pool racing for SQLite's single writer lock; fixed with `SetMaxOpenConns(1)` + WAL mode, mirroring
+  the same fix already applied on the Python/Drizzle side of this exact file.
+- `httpserver/` — plain `net/http` (no framework, no gRPC): `POST /orders` (idempotent, 201/200),
+  `GET /orders/{id}`, `POST /orders/{id}/cancel`, `POST /orders/{id}/transition` (generic
+  Filled/Expired/Invalidated, added Session 6 once a real caller needed all three). Every handler
+  routes through `order.Order.Transition()` before writing to the store — the state machine is the
+  single source of truth for what's legal, the store is deliberately dumb persistence.
+- `bullpen/` — ports `bullpen_client.py`'s subprocess contract field-for-field (`RunJSON`,
+  `RequireFilled`, `ExtractFillPrice`, `ExtractFilledShares`, `ExtractOrderID`, `ExtractOrderStatus`,
+  `TimeoutError`, `AuthError`) — not redesigned, since that contract has real production experience
+  behind it. `Runner.exec` is an injectable seam so no test depends on a real `bullpen` binary.
+- `cmd/omsd/` — the runnable binary. Not started by anything in production — no systemd unit, no
+  `watchdog.py`/`autodeploy.py` awareness.
+
+**Python side**: `oms_client.py` (stdlib `http.client`, same convention as `telegram_alerts.py`) —
+`create_order()`/`get_order()`/`cancel_order()`/`transition_order()`. Deliberately does NOT fail
+silently like `telegram_alerts.py`: an OMS call result is data a caller needs to reason about, so the
+"never let this break the real path" discipline belongs at each CALL SITE instead. A real bug was
+caught writing its tests: the `HTTPConnection` constructor call sat outside the `try/finally`, so a
+construction-time failure wasn't wrapped and could crash on an unset `conn` in `finally`.
+
+**Call-site correction, found mid-flight**: the roadmap's original Session 5/6 target
+(`sweep_pending_exit_orders()`/`start_patient_exit()`, Rule 31 Priority 3) is `LIVE_MODE`-only by
+construction — wiring the OMS there would never actually execute against this bot's paper-only
+configuration, producing zero validation data. Corrected to target
+`start_shadow_patient_exit()`/`sweep_shadow_patient_exits()` instead (Sec.61), which fires in paper
+mode on every real trailing-TP exit.
+
+**Session 6, what's actually wired**: `config.ENABLE_OMS_SHADOW_MIRROR` (default `False`).
+`start_shadow_patient_exit()` — after its real `create_shadow_patient_exit()` DB write — additionally
+calls `oms_client.create_order(idempotency_key=row_id)`, wrapped in `try/except`, never affecting the
+function's real return value. `sweep_shadow_patient_exits()`'s three terminal branches (filled/
+fallback_timeout/abandoned) each call a new `_mirror_shadow_patient_exit_terminal_to_oms()` helper
+after their real `close_shadow_patient_exit()` call, mapping to the OMS's own vocabulary
+(filled→filled, fallback_timeout→expired, abandoned→invalidated) via `create_order()`'s idempotent
+replay (re-deriving the OMS order's internal id from the same `row_id` key) then `transition_order()`.
+This ADDS a parallel record purely to validate the OMS's own correctness under real usage — it never
+influences the real shadow-patient-exit simulation's own decisions or data.
+
+**Verified live at every session**, not just unit-tested: each Go package smoke-tested against a real
+running `omsd` binary via `curl`, and Session 6's full mapping (filled/fallback_timeout/abandoned →
+filled/expired/invalidated) verified end-to-end by calling the real `_mirror_shadow_patient_exit_terminal_to_oms()`
+against a real running `omsd` from a real Python process.
+
+**Tests**: 58 Go tests across `order`/`store`/`httpserver`/`bullpen`; `test_oms_client.py` (+15);
+`TestStartShadowPatientExit`/`TestMirrorShadowPatientExitTerminalToOms`/`TestSweepShadowPatientExits`
+additions in `test_bot_risk_checks.py` (+9). 595 Python tests passing (was 571).
+
+**Default off, nothing changes in production**: `omsd` isn't started anywhere, and
+`ENABLE_OMS_SHADOW_MIRROR` defaults `False` — this entire session's work is inert until Joey
+deliberately starts the Go service and flips the flag to begin real validation.
