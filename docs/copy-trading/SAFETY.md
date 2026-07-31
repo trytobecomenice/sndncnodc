@@ -3695,3 +3695,45 @@ decision.
 itself failing still fails soft; a stale book with no usable price at all still fails soft),
 `TestProcessTradeEntryPriceFloor` (+4: low-tail and high-tail prices skipped, a price just outside
 the floor and a normal price both proceed unaffected). 488 Python tests passing (was 480).
+
+## 56. `watchdog.py` — bot.py process supervision (2026-07-31)
+
+**Trigger**: while deploying this same session's fixes, discovered `bot.py` had been dead for
+~2.5 hours with zero notice — no `SIGTERM received` log line, no traceback, just silence. Most
+likely killed by the severe memory pressure the Docker/Prometheus/Grafana monitoring stack put on
+the (at the time) 908MB EC2 box; `dmesg`/`journalctl` showed no kernel OOM-kill or `systemd-oomd`
+event for that day specifically, so the exact kill mechanism isn't 100% forensically nailed down,
+but the timing (last activity 12:32:30, squarely inside the 12:22-13:49 Docker window) is
+strongly suggestive. This is exactly the gap §54's Telegram alerting can't close on its own: an
+alert fired BY `bot.py` requires `bot.py` to still be alive to fire it.
+
+**Found and fixed in passing**: this session had been hand-maintaining `data/bot.pid` all night as
+an informal bookkeeping file — but `dashboard.py`'s own `/api/toggle` reads/writes `bot.pid` at the
+repo ROOT (`PID_PATH = os.path.join(config.BASE_DIR, "bot.pid")`), a completely different file that
+had gone stale (last touched 2026-07-29) while every restart this session updated the other one.
+Confirmed live: dashboard.py's own view of "is the bot running" had been silently wrong all night.
+`watchdog.py` uses the REAL file (via `import dashboard`, reusing its exact `bot_pid()`/
+`start_bot()` — not a reimplementation) specifically so this drift can't recur.
+
+**What it does**: a standalone script (`watchdog.py`), meant to run periodically via cron. Each
+run: if `data/watchdog_paused` exists, no-op silently (see below). Else, if `dashboard.bot_pid()`
+finds a live process, no-op silently. Else: logs it, sends an immediate Telegram alert ("found
+dead, restarting now"), calls `dashboard.start_bot()`, waits `RESTART_CONFIRM_DELAY_SECONDS=5`,
+then sends a second alert — success with the new pid, or a `🚨` failure alert if the restart
+itself didn't take, meaning genuine manual intervention is needed.
+
+**Known, documented limitation, not silently glossed over**: `dashboard.py`'s `stop_bot()` does
+NOT touch `data/watchdog_paused` — a deliberate stop (via the dashboard's stop button, or a manual
+SIGTERM) will get "helpfully" revived by this watchdog on its very next cron run unless the pause
+file is touched first (`touch data/watchdog_paused`, removed when done). Wiring the pause sentinel
+into `dashboard.py`'s own stop/start flow directly would close this gap properly but wasn't done
+here — flagged as a real fast-follow, not solved silently.
+
+**Deployment**: cron entry on the EC2 box, every 2 minutes:
+```
+*/2 * * * * cd /home/ubuntu/polymarket-copybot && /usr/bin/python3 watchdog.py
+```
+
+**Tests**: `test_watchdog.py` (+5: no-op when paused, no-op when already alive, restart+two-alert
+happy path, restart-failed alert path, sanity check that the pause-path fixture itself works).
+493 Python tests passing (was 488).
