@@ -17,12 +17,19 @@ human to reconcile") a first-class state instead of an exception path.
 
 - `order/` — the pure order state machine (Session 1). No I/O, no
   database, no network — see its own package doc for why.
+- `store/` — SQLite-backed order persistence + idempotent creation
+  (Session 2). A NEW `oms_order` table alongside `pending_execution` (not
+  a replacement) — the two coexist in `data/app.db` during the
+  parallel-run validation period. Uses `modernc.org/sqlite` (pure Go, no
+  cgo) rather than `mattn/go-sqlite3`, and `SetMaxOpenConns(1)` + WAL mode
+  to avoid `SQLITE_BUSY` under concurrent writers (caught live by this
+  package's own race test before the fix).
 
-Later sessions add a SQLite-backed order store (Session 2), an HTTP
-service (Session 3), and a Bullpen subprocess integration ported from
-`bullpen_client.py` (Session 4). None of this is wired into `bot.py` or
-`LIVE_MODE` yet — see the roadmap doc's Phase 2 section for the full
-session-by-session plan and its paper-mode-first validation discipline.
+Later sessions add an HTTP service (Session 3) and a Bullpen subprocess
+integration ported from `bullpen_client.py` (Session 4). None of this is
+wired into `bot.py` or `LIVE_MODE` yet — see the roadmap doc's Phase 2
+section for the full session-by-session plan and its paper-mode-first
+validation discipline.
 
 ## Development
 
