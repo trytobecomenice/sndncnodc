@@ -3504,3 +3504,57 @@ for this incident), `TestTradeAgeSeconds` (+3), `TestMarketAlreadyResolved`
 `bot.py` restart to take effect — not yet live as of this entry.** The kill
 switch stays latched pending this deploy; do not `reset_kill_switch.py`
 before it's live.
+
+## 53. Extreme-tail longshots excluded from `compute_unrealized_pnl()` (Rule 6 addendum, 2026-07-31)
+
+**Trigger**: after §52's fix deployed and the kill switch was cleared with
+equity_hwm reset to a verified $1869.67, it re-latched within about a
+minute — equity $1869.67 vs. a peak of $4338.78, itself a corrupted
+first-reading HWM from the very next equity evaluation after restart.
+Setting `equity_hwm` explicitly to the verified value and restarting again
+held only briefly: `equity_hwm` was found to have crept back up to
+$6831.36 with zero kill-switch trigger logged in between — a single
+equity reading spiked ~$4900-5000, ratcheted the HWM up silently, and left
+it as a landmine for the next normal reading.
+
+**Root cause**: several tracked wallets' open `bot_filtered` positions were
+ultra-longshot 2028 US presidential-election bets (`will-josh-stein-win-
+the-2028-us-presidential-election`, `will-tom-brady-win-the-2028-
+republican-presidential-nomination`, and similar) — `avg_entry_price`
+0.001-0.008, $5-10 cost basis, 2500-5000 shares each. A tiny dollar cost at
+these prices implies a huge share count; these markets are thin/illiquid,
+so a single bad or stale CLOB read on any one of them (e.g. misreading
+close to $1.00 while the position is still nominally open, not yet caught
+by the hourly closeout sweep) gets amplified by the share count into a
+multi-thousand-dollar phantom swing in `compute_unrealized_pnl()`'s
+portfolio-wide total.
+
+**Fix, in `risk_manager.py`**: `compute_unrealized_pnl()` now carries any
+position at cost (zero unrealized contribution) if its `avg_entry_price`
+is within `config.EQUITY_MARK_MIN_ENTRY_PRICE = 0.02` of either $0 or $1 —
+unconditionally, regardless of what price a given sweep reports, extending
+the function's existing "no usable price -> carried at cost" conservatism
+to "economically-tiny-cost-but-huge-share-count -> carried at cost" too.
+Gated on `avg_entry_price` (fixed at buy time) rather than on whether a
+specific reading looks suspicious, since the vulnerability is inherent to
+the position's own economics, not to any one price fetch — deterministic,
+no heuristic needed. 0.02 reuses the same threshold value as
+`DEFAULT_TCA_MIN_ENTRY_PRICE` (Rule 27, `discoverCategorySpecialists.ts`)
+— same judgment call, different subsystem, not re-derived independently.
+Applies to both `compute_equity()` (the kill switch) and
+`compute_equity_breakdown()` (the Grafana daily snapshot), since both
+share this one function — fixes the dashboard's `daily_portfolio_snapshots`
+distortion at the same time, not a separate change.
+
+**Deployed**: pushed, pulled to EC2, `bot.py` restarted (final PID recorded
+post-deploy), and `equity_hwm`/`kill_switch` reset one more time once the
+fix was confirmed running with no new extreme-tail-driven spike across
+several TTP sweep cycles.
+
+**Tests**: `TestEquity` (+4: an extreme-tail longshot marked at a
+would-be-$4990-swing price is carried at cost instead; the symmetric
+high-side tail; a position just outside the 0.02 band is still marked
+normally — confirming this isn't a blanket "small positions don't count"
+rule; a legacy position missing `avg_entry_price` entirely falls back to
+normal marking rather than being silently excluded). 469 Python tests
+passing (was 465).

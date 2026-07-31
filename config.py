@@ -924,6 +924,19 @@ PAPER_BANKROLL_USD = 1125.0
 EQUITY_FLOOR_USD = 900.0
 MAX_DRAWDOWN_FROM_PEAK_USD = 450.0
 
+# risk_manager.compute_unrealized_pnl() excludes any position bought within
+# this distance of $0 or $1 from the kill switch's mark-to-market calc
+# (carried at cost instead) — see that function's docstring. Confirmed live
+# 2026-07-31: a handful of ultra-longshot 2028-election bets (avg_entry_price
+# 0.001-0.008, $5-10 cost basis each — a tiny dollar cost implies a HUGE
+# share count at these prices) coincided with the drawdown kill switch's
+# equity swinging ~$4900-5000 in a single sweep from one bad/stale CLOB read
+# on an illiquid market, latching the kill switch on a fabricated drawdown.
+# 0.02 matches DEFAULT_TCA_MIN_ENTRY_PRICE (packages/copy-trading/src/
+# discoverCategorySpecialists.ts) — same "near-tick-extreme" judgment call,
+# reused here for a different subsystem, not re-derived.
+EQUITY_MARK_MIN_ENTRY_PRICE = 0.02
+
 # Files (all inside this project directory)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADE_LOG_PATH = os.path.join(BASE_DIR, "trades_log.json")

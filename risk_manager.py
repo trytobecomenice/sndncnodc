@@ -221,9 +221,32 @@ def compute_unrealized_pnl(positions, prices_by_key):
     unrealized PnL (it's carried at cost) rather than being guessed at —
     conservative in the sense that it neither inflates equity toward a
     higher HWM nor manufactures a phantom drawdown from a missing quote.
+
+    Extreme-tail positions (avg_entry_price within config.
+    EQUITY_MARK_MIN_ENTRY_PRICE of either $0 or $1) are carried at cost too,
+    for the same conservatism, not because they're unimportant but because
+    they're the opposite of a missing quote: a tiny cost basis (typically
+    $5-10) implies a HUGE share count at these prices, so a single bad/stale
+    CLOB read on an illiquid market amplifies into a multi-thousand-dollar
+    phantom swing in this function's total — confirmed live 2026-07-31: a
+    handful of ultra-longshot 2028 election bets (entry 0.001-0.008, $5-10
+    cost basis each) coincided with the drawdown kill switch's equity
+    swinging by ~$4900-5000 in a single sweep, latching it on a fabricated
+    drawdown. Gated on avg_entry_price (fixed at buy time), not on whether
+    THIS particular reading looks suspicious — the vulnerability is inherent
+    to the position's own economics, not to any one price fetch, so excluding
+    by entry price is deterministic and doesn't depend on guessing which
+    reads are "bad." Same "explicit judgment call, not dressed up as
+    rigorous" framing as DEFAULT_TCA_MIN_ENTRY_PRICE (packages/copy-trading/
+    src/discoverCategorySpecialists.ts), reused here for a different
+    subsystem.
     """
     unrealized = 0.0
     for key, pos in positions.items():
+        avg_entry = pos.get("avg_entry_price", 0.0)
+        if avg_entry and (avg_entry < config.EQUITY_MARK_MIN_ENTRY_PRICE
+                          or avg_entry > 1 - config.EQUITY_MARK_MIN_ENTRY_PRICE):
+            continue
         price = prices_by_key.get(key)
         if price is None or price <= 0:
             continue

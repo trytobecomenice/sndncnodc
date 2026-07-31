@@ -306,6 +306,39 @@ rather than bigger single-event/single-wallet bets, a reasonable side effect of 
 cap alone, not an inconsistency the way leaving the kill-switch thresholds unscaled would have
 been.
 
+**Addendum 2026-07-31 — extreme-tail longshots excluded from `compute_unrealized_pnl()`.**
+
+> **Challenge:** minutes after tonight's dedup fix (Rule 14 addendum above) reset the kill switch,
+> it re-latched almost immediately — equity read $1869.67 against a peak of $4338.78, itself
+> already a corrupted first-reading HWM. Manually pinning `equity_hwm` to the verified $1869.67
+> reading held for a few minutes, then the SAME class of corruption recurred: `equity_hwm` crept
+> back up to $6831.36 with zero kill-switch trigger logged in between — a single equity reading
+> spiked by roughly the same ~$4900-5000 magnitude as the original incident, silently ratcheted the
+> HWM up, and left it sitting as a landmine for the next normal-range reading.
+> **Mechanism:** a handful of tracked wallets' open `bot_filtered` positions were ultra-longshot
+> 2028 US presidential-election bets — `avg_entry_price` 0.001-0.008, $5-10 cost basis, thousands
+> of shares each (a tiny dollar cost implies a HUGE share count at these prices). These markets are
+> thin/illiquid; a single bad or stale CLOB read on any one of them (e.g. misreading something
+> close to $1.00 while the position is still nominally open) gets amplified by the huge share count
+> into a multi-thousand-dollar phantom swing in `compute_unrealized_pnl()`'s total — dwarfing the
+> position's real few-dollar cost basis and swamping the whole book's equity reading for that one
+> sweep.
+
+**Fixed** in `risk_manager.compute_unrealized_pnl()`: a position whose `avg_entry_price` is within
+`config.EQUITY_MARK_MIN_ENTRY_PRICE` (0.02 — same "near-tick-extreme, not dressed up as rigorous"
+judgment call as `DEFAULT_TCA_MIN_ENTRY_PRICE`, Rule 27, reused here for a different subsystem) of
+either $0 or $1 is now carried at cost (zero unrealized contribution) unconditionally, regardless
+of whatever price a given sweep reports — not just when the sweep couldn't price it at all (the
+existing, unchanged "missing quote" behavior). Gated on `avg_entry_price` (fixed at buy time, never
+changes), not on whether a specific reading looks suspicious: the vulnerability is inherent to the
+position's own economics (huge share count from a tiny cost basis), so excluding by entry price is
+deterministic and doesn't require guessing which individual reads are bad. Applies to both
+`compute_equity()` (the kill switch) and `compute_equity_breakdown()` (the Grafana daily snapshot)
+since both share this one function. 469 Python tests passing (was 465; +4 `TestEquity` regression
+tests). Docs: this addendum; `SAFETY.md` §53. **Deployed and live 2026-07-31** — see that entry for
+the redeploy/re-verification steps, including a final, hopefully-durable `equity_hwm` reset once
+this fix was confirmed running.
+
 ---
 
 ## 7. Exit protections

@@ -25,7 +25,7 @@ class ConfigPatchingTestCase(unittest.TestCase):
 
     PATCHED = ("MAX_TOTAL_EXPOSURE_USD", "MAX_EVENT_EXPOSURE_USD", "MAX_WALLET_EXPOSURE_USD",
                "PAPER_BANKROLL_USD", "EQUITY_FLOOR_USD", "MAX_DRAWDOWN_FROM_PEAK_USD",
-               "VIP_WALLET_EXPOSURE_CAP_USD")
+               "VIP_WALLET_EXPOSURE_CAP_USD", "EQUITY_MARK_MIN_ENTRY_PRICE")
 
     def setUp(self):
         self._saved = {name: getattr(config, name) for name in self.PATCHED}
@@ -278,6 +278,45 @@ class TestEquity(ConfigPatchingTestCase):
         self.assertAlmostEqual(breakdown["total_unrealized_pnl"], 3.0)
         self.assertAlmostEqual(breakdown["total_cash"], 127.0)
         self.assertAlmostEqual(breakdown["total_equity"], 135.0)  # 125 + 7 + 3
+
+    def test_extreme_tail_longshot_is_carried_at_cost_despite_a_priced_quote(self):
+        """Regression for a live production incident (2026-07-31): a handful
+        of ultra-longshot positions (avg_entry_price 0.001-0.008, $5-10 cost
+        basis, thousands of implied shares) coincided with a single bad/stale
+        CLOB read swinging the kill switch's equity by ~$4900-5000 in one
+        sweep -- a tiny cost basis amplified into a huge phantom gain. Must
+        be carried at cost (zero unrealized contribution) regardless of
+        whatever price the sweep reports, not just when unpriced."""
+        # 5000 shares @ $0.002 entry ($10 cost) -- if genuinely marked at a
+        # bad/stale $1.00 this would otherwise contribute +$4990 unrealized.
+        positions = {"a|m|Yes": {"cost_basis_usd": 10.0, "shares": 5000.0,
+                                  "avg_entry_price": 0.002}}
+        equity = risk_manager.compute_equity(positions, {"a|m|Yes": 1.0}, realized_pnl=0.0)
+        self.assertAlmostEqual(equity, 125.0)  # carried at cost, not +$4990
+
+    def test_extreme_tail_on_the_high_side_is_also_carried_at_cost(self):
+        # avg_entry_price 0.995 -- the symmetric high-side tail.
+        positions = {"a|m|Yes": {"cost_basis_usd": 10.0, "shares": 10.05,
+                                  "avg_entry_price": 0.995}}
+        equity = risk_manager.compute_equity(positions, {"a|m|Yes": 0.0}, realized_pnl=0.0)
+        self.assertAlmostEqual(equity, 125.0)  # carried at cost, not -$10
+
+    def test_position_just_inside_the_tail_threshold_is_still_marked_normally(self):
+        # avg_entry_price 0.03 is outside the 0.02 exclusion band -- normal
+        # mark-to-market must still apply, confirming this isn't a blanket
+        # "small positions don't count" rule.
+        positions = {"a|m|Yes": {"cost_basis_usd": 5.0, "shares": 10.0,
+                                  "avg_entry_price": 0.03}}
+        equity = risk_manager.compute_equity(positions, {"a|m|Yes": 0.80}, realized_pnl=0.0)
+        self.assertAlmostEqual(equity, 125.0 + 3.0)
+
+    def test_missing_avg_entry_price_falls_back_to_normal_marking(self):
+        # Legacy positions with no avg_entry_price recorded must not be
+        # silently excluded -- config.py's docstring only excludes KNOWN
+        # extreme-tail entries, not positions missing the field entirely.
+        positions = {"a|m|Yes": {"cost_basis_usd": 5.0, "shares": 10.0}}
+        equity = risk_manager.compute_equity(positions, {"a|m|Yes": 0.80}, realized_pnl=0.0)
+        self.assertAlmostEqual(equity, 125.0 + 3.0)
 
     def test_compute_equity_breakdown_with_no_positions(self):
         breakdown = risk_manager.compute_equity_breakdown({}, {}, realized_pnl=10.0)
