@@ -123,6 +123,51 @@ export const walletProfile = sqliteTable(
   ]
 );
 
+// Telegram wallet-approval workflow (2026-08-01): the single funnel every
+// promotion path (scoreWallets.ts's global pool AND
+// discoverCategorySpecialists.ts's category-quota system) writes through
+// instead of committing wallet_profile.status='track'/'bench' directly — see
+// packages/copy-trading/src/walletApprovalQueue.ts. Joey approves/rejects via
+// Telegram inline buttons (send_wallet_approvals.py /
+// telegram_approval_listener.py); only on 'approved' does
+// wallet_profile.status actually flip.
+export const walletApprovalRequest = sqliteTable(
+  "wallet_approval_request",
+  {
+    id: id(),
+    walletAddress: text("wallet_address").notNull(),
+    // 'track' | 'bench' — the status this request would flip wallet_profile
+    // to on approval.
+    requestedTier: text("requested_tier").notNull(),
+    // 'global_pool' (scoreWallets.ts's top-N pool) | 'category_quota'
+    // (discoverCategorySpecialists.ts's Rule 24 quota) — which pipeline
+    // proposed this candidate, for audit/debugging.
+    source: text("source").notNull(),
+    // Null for global_pool candidates (that system isn't category-scoped).
+    category: text("category"),
+    // Composite score / t-stat / win rate / trade count / roi snapshot at
+    // proposal time — same "extra detail lives in a JSON blob" pattern as
+    // wallet_profile.scoreBreakdownJson, not a wide bespoke column set.
+    scoreSnapshotJson: text("score_snapshot_json").notNull(),
+    // Human-readable justification, reused from decideStatus()'s own reason
+    // string or the category-quota candidate's stats line — shown verbatim
+    // in the Telegram message.
+    reason: text("reason").notNull(),
+    // 'pending' | 'approved' | 'rejected' | 'expired'
+    status: text("status").notNull().default("pending"),
+    telegramMessageId: integer("telegram_message_id"),
+    telegramChatId: text("telegram_chat_id"),
+    createdAt: createdAt(),
+    resolvedAt: integer("resolved_at", { mode: "timestamp" }),
+  },
+  (t) => [
+    // The dedup/cooldown lookup's access pattern (queueApprovalRequest):
+    // "does this wallet already have a pending/recent request for this tier?"
+    index("wallet_approval_request_wallet_tier_status_idx").on(t.walletAddress, t.requestedTier, t.status),
+    index("wallet_approval_request_status_idx").on(t.status),
+  ]
+);
+
 export const observedTrade = sqliteTable(
   "observed_trade",
   {

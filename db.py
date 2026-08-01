@@ -1385,6 +1385,123 @@ def close_pending_execution(pending_execution_id, status, invalidated_reason=Non
         conn.close()
 
 
+# --- wallet_approval_request (2026-08-01, Telegram wallet-approval workflow)
+# -- the single gate every promotion path (scoreWallets.ts's global pool AND
+# discoverCategorySpecialists.ts's category-quota system) queues through
+# instead of writing wallet_profile.status='track'/'bench' directly. Table +
+# schema owned by the TS side (packages/db/src/schema.ts, drizzle migration
+# 0021_careless_prima.sql) — this file only reads/writes it, same split as
+# every other shared table. See walletApprovalQueue.ts's module doc comment
+# for the full design, send_wallet_approvals.py for the Telegram send half,
+# telegram_approval_listener.py for the receive half. ----------------------
+
+def get_pending_wallet_approval_requests(unsent_only=False):
+    """All status='pending' rows, oldest first, LEFT JOINed against
+    wallet_profile for its nickname (NULL if the wallet has never been
+    scored under a display name) -- send_wallet_approvals.py wants a
+    human-readable name in the Telegram message, not just a raw address.
+    unsent_only=True additionally filters to telegram_message_id IS NULL --
+    send_wallet_approvals.py's own query, so a request that's already been
+    sent (waiting on Joey's tap) isn't re-sent as a duplicate message.
+    """
+    conn = _connect()
+    try:
+        query = (
+            "SELECT war.*, wp.nickname FROM wallet_approval_request war "
+            "LEFT JOIN wallet_profile wp ON wp.wallet_address = war.wallet_address "
+            "WHERE war.status = 'pending'"
+        )
+        if unsent_only:
+            query += " AND war.telegram_message_id IS NULL"
+        query += " ORDER BY war.created_at ASC"
+        cur = conn.execute(query)
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_wallet_approval_request(request_id):
+    """Single row by id (LEFT JOINed against wallet_profile for its
+    nickname, same as get_pending_wallet_approval_requests), or None. Used
+    by telegram_approval_listener.py to look up the candidate behind a
+    "wa:{id}:approve|reject" callback tap.
+    """
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT war.*, wp.nickname FROM wallet_approval_request war "
+            "LEFT JOIN wallet_profile wp ON wp.wallet_address = war.wallet_address "
+            "WHERE war.id = ?",
+            (request_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def mark_wallet_approval_request_sent(request_id, telegram_message_id, telegram_chat_id):
+    """Records which Telegram message this request went out as, so
+    telegram_approval_listener.py's inline-button tap (which only carries
+    the request id in its callback_data) can later look the row back up, and
+    so a second send_wallet_approvals.py run doesn't re-send it.
+    """
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE wallet_approval_request SET telegram_message_id = ?, telegram_chat_id = ? "
+            "WHERE id = ?",
+            (telegram_message_id, telegram_chat_id, request_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def resolve_wallet_approval_request(request_id, resolved_status):
+    """Terminal status transition: 'approved' | 'rejected'. On 'approved',
+    also flips wallet_profile.status to this request's own requested_tier,
+    in the SAME connection/transaction -- the whole point of this workflow
+    is that a wallet never reaches real-money 'track' (or paper-only
+    'bench') status except through exactly this path, so the two writes
+    must not be allowed to land independently (a crash between them would
+    either lose the approval or leave wallet_profile stale).
+
+    Silently no-ops (returns False) if the request is missing or no longer
+    'pending' -- guards the double-tap case (Joey taps a button twice before
+    the message finishes editing) and the "listener restarted, getUpdates
+    offset replayed an already-handled callback" case, both real
+    possibilities for a Telegram long-poller. Returns True on a genuine
+    transition.
+    """
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT wallet_address, requested_tier, status FROM wallet_approval_request WHERE id = ?",
+            (request_id,),
+        )
+        row = cur.fetchone()
+        if row is None or row["status"] != "pending":
+            return False
+
+        now = _now_ts()
+        conn.execute(
+            "UPDATE wallet_approval_request SET status = ?, resolved_at = ? WHERE id = ?",
+            (resolved_status, now, request_id),
+        )
+        if resolved_status == "approved":
+            conn.execute(
+                "UPDATE wallet_profile SET status = ?, status_reason = ?, status_changed_at = ? "
+                "WHERE wallet_address = ?",
+                (row["requested_tier"], "approved via Telegram wallet-approval workflow", now,
+                 row["wallet_address"]),
+            )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
 # --- live_whale_event / token_registry (2026-07-24) — the Consumer half of
 # wss_listener.py / token_sync_worker.py's Producer-Consumer hand-off. See
 # bot.sweep_live_whale_events()'s docstring for the full design, including

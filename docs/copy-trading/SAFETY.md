@@ -4195,3 +4195,80 @@ additions in `test_bot_risk_checks.py` (+9). 595 Python tests passing (was 571).
 **Default off, nothing changes in production**: `omsd` isn't started anywhere, and
 `ENABLE_OMS_SHADOW_MIRROR` defaults `False` — this entire session's work is inert until Joey
 deliberately starts the Go service and flips the flag to begin real validation.
+
+## 68. Telegram wallet-approval workflow — send/receive halves, cron, systemd (2026-08-01)
+
+See `docs/copy-trading/RISK_MANAGEMENT.md` Rule 49 for the full design and the schema/scoring-pipeline
+changes. This section covers the operational/security pieces: what actually runs where, and why.
+
+**Send half — `send_wallet_approvals.py`** (root-level script, meant to run once per daily scan): reads
+`db.get_pending_wallet_approval_requests(unsent_only=True)` (a LEFT JOIN against `wallet_profile` for a
+human-readable nickname), formats one message per candidate, sends via the new
+`telegram_alerts.send_telegram_message_with_buttons()`. Unlike the existing `send_telegram_alert`
+(fire-and-forget, returns bool, discards the response body), this parses the JSON response to return the
+sent message's `message_id` — the caller needs it (`db.mark_wallet_approval_request_sent`) so a later tap
+can be matched back to the right Telegram message for editing. A failed send is simply left un-sent
+(`telegram_message_id` stays NULL) and retried automatically on the next run — no separate retry queue.
+
+**Receive half — `telegram_approval_listener.py`** (root-level, long-running process, NOT a cron job):
+long-polls `getUpdates` (`allowed_updates=["callback_query"]`, `timeout=30s` per call) for a button tap,
+matches `wa:{request_id}:approve|reject` via a strict regex (`parse_callback_data` — malformed/unrelated
+`callback_data` is logged and ignored, never crashes the loop), and is the **only** code path that calls
+`db.resolve_wallet_approval_request()` — the single writer that flips `wallet_profile.status` as a result
+of this whole workflow. Same reconnect/exponential-backoff shape as `wss_listener.py`
+(`RECONNECT_BACKOFF_INITIAL_SECONDS=2` → `RECONNECT_BACKOFF_MAX_SECONDS=60`), but plain synchronous
+`http.client` long-polling, not asyncio/websockets — `getUpdates` is a normal HTTP long-poll, there's no
+persistent socket to manage. `getUpdates`'s own read-position offset is persisted to a plain local file
+(`data/telegram_update_offset.txt`, same "small local bookmark file, not a DB row" choice as `bot.pid`) —
+losing it on an ungraceful restart just means re-fetching Telegram's ~24h undelivered-update backlog, not
+a correctness bug, since `resolve_wallet_approval_request`'s already-resolved guard makes a replayed
+callback a safe no-op.
+
+**Security — chat-id authorization**: every `callback_query` is checked against `TELEGRAM_CHAT_ID`
+(`is_authorized_chat`) before anything else happens — a tap from any other chat is logged and acked with
+"Not authorized," never reaches `db.resolve_wallet_approval_request`. This bot must not let a stranger who
+somehow messages it approve a real-money wallet. Both sides are coerced to `str` before comparing (Telegram
+delivers `chat.id` as a JSON integer; `TELEGRAM_CHAT_ID` is loaded from `.env` as a string) — an unconfigured
+`TELEGRAM_CHAT_ID` never authorizes anything, fails closed.
+
+**Deployment — `telegram-approval-listener.service`** (EC2, systemd, same shape as `omsd.service`,
+installed the same one-time-manual-SSH way that was too — not tracked in the repo as a `.service` file,
+this section is its source of truth):
+```
+[Unit]
+Description=Telegram wallet-approval listener (send_wallet_approvals.py's receive half)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-copybot
+ExecStart=/usr/bin/python3 /home/ubuntu/polymarket-copybot/telegram_approval_listener.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+A systemd service (not cron) was chosen deliberately: `getUpdates` long-polling holds one connection open
+for up to 30s at a time, which fits a persistent process far better than a short-lived cron-fired script,
+and `Restart=on-failure` gives near-instant recovery plus near-instant response to a real tap instead of
+waiting for the next cron tick.
+
+**Daily scan cron** (EC2, `crontab -e`, `Etc/UTC` confirmed live via `timedatectl` — `20:00 UTC = 04:00
+HKT`):
+```
+0 20 * * * cd /home/ubuntu/polymarket-copybot && /usr/bin/pnpm run scan:leaderboard && /usr/bin/pnpm run scan:wallets && /usr/bin/pnpm --filter @copybot/copy-trading discover:category-specialists -- --queue-approvals && /usr/bin/python3 send_wallet_approvals.py >> daily_scan.cron.log 2>&1
+```
+Chosen off-peak given this box's tight 1.9GB/0-swap margin (the same constraint behind Sec.54's Docker
+incident) — the first several real runs should be watched manually (`tail daily_scan.cron.log`, `free -h`
+before/after) before trusting this fully unattended.
+
+**Tests**: see Rule 49's Tests line for the full count — `test_telegram_alerts.py` (+7, the buttons-send
+function), `test_send_wallet_approvals.py` (9), `test_telegram_approval_listener.py` (27, including the
+chat-id authorization and `get_updates`-raises-on-failure cases specifically). 658 Python tests passing.
+
+**Not yet done as of this writing**: the systemd unit and crontab line above are documented but not yet
+installed on EC2 — that's a live production change (a new always-running process able to flip real
+`wallet_profile.status`, plus a new unattended daily job) that needs Joey's explicit go-ahead before this
+session SSHes in and does it, same bar as every other EC2 deployment step in this ledger.

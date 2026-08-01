@@ -4,6 +4,7 @@
 Run: python3 -m unittest test_telegram_alerts -v
 """
 
+import json
 import socket
 import unittest
 from unittest.mock import MagicMock, patch
@@ -136,6 +137,84 @@ class TestForceIpv4Dns(unittest.TestCase):
             telegram_alerts.send_telegram_alert("hi")
         self.assertEqual(calls, ["enter", "exit"])
         mock_conn.request.assert_called_once()
+
+
+class TestSendTelegramMessageWithButtons(unittest.TestCase):
+    """2026-08-01, Telegram wallet-approval workflow."""
+
+    def setUp(self):
+        self._saved_enabled = config.ENABLE_TELEGRAM_ALERTS
+        self._saved_token = telegram_alerts.TELEGRAM_BOT_TOKEN
+        self._saved_chat_id = telegram_alerts.TELEGRAM_CHAT_ID
+        config.ENABLE_TELEGRAM_ALERTS = True
+        telegram_alerts.TELEGRAM_BOT_TOKEN = "test-token"
+        telegram_alerts.TELEGRAM_CHAT_ID = "12345"
+        self.buttons = [[{"text": "✅ Approve", "callback_data": "wa:req-1:approve"},
+                          {"text": "❌ Reject", "callback_data": "wa:req-1:reject"}]]
+
+    def tearDown(self):
+        config.ENABLE_TELEGRAM_ALERTS = self._saved_enabled
+        telegram_alerts.TELEGRAM_BOT_TOKEN = self._saved_token
+        telegram_alerts.TELEGRAM_CHAT_ID = self._saved_chat_id
+
+    def test_noop_when_alerts_disabled(self):
+        config.ENABLE_TELEGRAM_ALERTS = False
+        with patch("telegram_alerts.http.client.HTTPSConnection") as mock_conn:
+            result = telegram_alerts.send_telegram_message_with_buttons("hi", self.buttons)
+        self.assertIsNone(result)
+        mock_conn.assert_not_called()
+
+    def test_noop_when_token_missing(self):
+        telegram_alerts.TELEGRAM_BOT_TOKEN = None
+        with patch("telegram_alerts.http.client.HTTPSConnection") as mock_conn:
+            result = telegram_alerts.send_telegram_message_with_buttons("hi", self.buttons)
+        self.assertIsNone(result)
+        mock_conn.assert_not_called()
+
+    def test_returns_message_id_on_2xx_response(self):
+        mock_response = MagicMock(status=200)
+        mock_response.read.return_value = json.dumps({"ok": True, "result": {"message_id": 999}}).encode()
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = mock_response
+        with patch("telegram_alerts.http.client.HTTPSConnection", return_value=mock_conn):
+            result = telegram_alerts.send_telegram_message_with_buttons("hi", self.buttons)
+        self.assertEqual(result, 999)
+        mock_conn.close.assert_called_once()
+
+    def test_request_body_includes_inline_keyboard(self):
+        mock_response = MagicMock(status=200)
+        mock_response.read.return_value = json.dumps({"result": {"message_id": 1}}).encode()
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = mock_response
+        with patch("telegram_alerts.http.client.HTTPSConnection", return_value=mock_conn):
+            telegram_alerts.send_telegram_message_with_buttons("hi", self.buttons)
+        _, kwargs = mock_conn.request.call_args
+        sent_body = json.loads(kwargs["body"])
+        self.assertEqual(sent_body["reply_markup"], {"inline_keyboard": self.buttons})
+        self.assertEqual(sent_body["text"], "hi")
+
+    def test_returns_none_on_non_2xx_response(self):
+        mock_response = MagicMock(status=401)
+        mock_response.read.return_value = b'{"ok": false}'
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = mock_response
+        with patch("telegram_alerts.http.client.HTTPSConnection", return_value=mock_conn):
+            result = telegram_alerts.send_telegram_message_with_buttons("hi", self.buttons)
+        self.assertIsNone(result)
+
+    def test_returns_none_on_unparseable_response_body(self):
+        mock_response = MagicMock(status=200)
+        mock_response.read.return_value = b"not json"
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = mock_response
+        with patch("telegram_alerts.http.client.HTTPSConnection", return_value=mock_conn):
+            result = telegram_alerts.send_telegram_message_with_buttons("hi", self.buttons)
+        self.assertIsNone(result)
+
+    def test_network_failure_is_caught_not_raised(self):
+        with patch("telegram_alerts.http.client.HTTPSConnection", side_effect=OSError("no route")):
+            result = telegram_alerts.send_telegram_message_with_buttons("hi", self.buttons)  # must not raise
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

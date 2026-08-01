@@ -37,6 +37,7 @@ import {
   deriveTier,
   mean,
   sampleStdev,
+  shouldRedirectToApprovalQueue,
   trimToRollingWindow,
   type BehaviorStatsData,
   type Pass2Result,
@@ -574,6 +575,34 @@ describe("decideStatus", () => {
 
   it("ignores below the watch threshold", () => {
     expect(decideStatus(rules.statusThresholds.watch - 0.01, 100, rules).status).toBe("ignore");
+  });
+});
+
+// =============================================================================
+// shouldRedirectToApprovalQueue — Telegram approval workflow (2026-08-01)
+// =============================================================================
+
+describe("shouldRedirectToApprovalQueue", () => {
+  it("redirects a wallet newly crossing the track threshold (prior status 'watch')", () => {
+    expect(shouldRedirectToApprovalQueue("track", "watch")).toBe(true);
+  });
+
+  it("redirects a wallet that's never been scored before (prior status null)", () => {
+    expect(shouldRedirectToApprovalQueue("track", null)).toBe(true);
+  });
+
+  it("does NOT redirect a wallet that was already 'track' — reconfirms directly", () => {
+    expect(shouldRedirectToApprovalQueue("track", "track")).toBe(false);
+  });
+
+  it("does not redirect a 'watch' or 'ignore' decision regardless of prior status", () => {
+    expect(shouldRedirectToApprovalQueue("watch", null)).toBe(false);
+    expect(shouldRedirectToApprovalQueue("ignore", "watch")).toBe(false);
+  });
+
+  it("DOES redirect a bench->track promotion signal — a bench wallet clearing the global track bar " +
+    "still needs approval, it isn't auto-promoted just because it's already on the paper bench", () => {
+    expect(shouldRedirectToApprovalQueue("track", "bench")).toBe(true);
   });
 });
 

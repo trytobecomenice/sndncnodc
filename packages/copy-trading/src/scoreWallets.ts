@@ -161,6 +161,7 @@ import { runBullpenJson } from "@copybot/bullpen-client";
 import { botEventLog, botRiskState, db, leaderboardScan, ruleSet, walletProfile } from "@copybot/db";
 import { mapWithConcurrency } from "@copybot/shared";
 import { fetchOnePage } from "./polymarketDataApi";
+import { queueApprovalRequest } from "./walletApprovalQueue";
 
 const READ_RETRIES = 3;
 const READ_RETRY_DELAY_MS = 500;
@@ -1212,6 +1213,21 @@ export function decideStatus(
   };
 }
 
+/**
+ * Telegram approval workflow (2026-08-01): decides whether a wallet's raw
+ * decideStatus() 'track' verdict should be redirected into the Telegram
+ * approval queue instead of written to wallet_profile.status directly. Only
+ * a NEW promotion is redirected — a wallet that was ALREADY 'track' before
+ * this run reconfirms automatically (priorStatus === 'track' is the one
+ * false case for a 'track' decidedStatus). Extracted as its own pure
+ * function purely for direct unit-testability, same "extract the pure
+ * decision" pattern as decideStatus/checkToxicFlowGate/
+ * computeDemotedAddresses above.
+ */
+export function shouldRedirectToApprovalQueue(decidedStatus: string, priorStatus: string | null): boolean {
+  return decidedStatus === "track" && priorStatus !== "track";
+}
+
 // =============================================================================
 // SECTION 5: WRITING RESULTS TO THE DATABASE (the safety-boundary function)
 // =============================================================================
@@ -1812,6 +1828,23 @@ export function computeDemotedAddresses<T extends { address: string; status: str
 }
 
 /**
+ * Reads wallet_profile.status as it stood BEFORE this run, for exactly the
+ * given addresses — lets finalizeAndWrite tell "already track, just
+ * reconfirming" apart from "newly crossing the track threshold this run"
+ * (2026-08-01, Telegram approval workflow). A wallet absent from
+ * wallet_profile entirely (never scored before) is correctly treated as
+ * `null`, same fallthrough shape as filterDueForRescore's dueMap above.
+ */
+async function getPriorStatuses(addresses: string[]): Promise<Map<string, string | null>> {
+  if (addresses.length === 0) return new Map();
+  const rows = await db
+    .select({ walletAddress: walletProfile.walletAddress, status: walletProfile.status })
+    .from(walletProfile)
+    .where(inArray(walletProfile.walletAddress, addresses));
+  return new Map(rows.map((r) => [normalizeAddress(r.walletAddress), r.status]));
+}
+
+/**
  * The final stage: applies the toxic-flow gate, the recency gate, decides
  * raw status per wallet, applies the top-N pool cap, and is the ONLY place
  * in pass 2 that actually writes to wallet_profile.
@@ -1949,19 +1982,78 @@ async function finalizeAndWrite(results: Pass2Result[], rules: ScoringRules, tra
   }));
 
   const demotedAddresses = computeDemotedAddresses(decided, poolSize);
+  const priorStatuses = await getPriorStatuses(decided.map((r) => r.address));
 
   let tracked = 0;
+  let benched = 0;
   let watched = 0;
   let ignored = 0;
+  let queuedForApproval = 0;
 
   for (const r of decided) {
     const isDemoted = demotedAddresses.has(r.address);
-    const finalStatus = isDemoted ? "watch" : r.status;
-    const finalReason = isDemoted
+    const decidedStatus = isDemoted ? "watch" : r.status;
+    const decidedReason = isDemoted
       ? `${r.reason}; demoted to watch — outside this month's top-${poolSize} pool by compositeScore`
       : r.reason;
 
+    // Telegram approval workflow (2026-08-01): a wallet newly crossing the
+    // track threshold this run does NOT get committed to wallet_profile
+    // directly anymore — this global top-N pool used to be a second,
+    // independent auto-promotion path alongside discoverCategorySpecialists.
+    // ts's category-quota system, with no human review either way (see
+    // walletApprovalQueue.ts's module doc comment). Only a wallet that was
+    // ALREADY 'track' before this run (i.e. reconfirming, not newly
+    // promoted) still writes 'track' directly — no re-approval spam for
+    // wallets Joey already approved.
+    const priorStatus = priorStatuses.get(normalizeAddress(r.address)) ?? null;
+    // Bench membership is owned by the category-quota + Telegram approval
+    // workflow (discoverCategorySpecialists.ts --queue-approvals), not this
+    // global pass — decideStatus() only ever returns
+    // 'track'/'watch'/'ignore', so without this guard a routine rescore
+    // would silently wipe a Joey-approved bench wallet back to 'watch'/
+    // 'ignore' the moment its GLOBAL score (a different signal from the
+    // category-specific one that earned it 'bench') dipped. (The
+    // force-ignore gates above this point — toxic-flow/recency/liquidity-
+    // farming — are NOT exempted: those are safety overrides that already
+    // apply regardless of tier, same as for a currently-'track' wallet.)
+    const isBenchPreserved = priorStatus === "bench";
+    let finalStatus = isBenchPreserved ? "bench" : decidedStatus;
+    let finalReason = decidedReason;
+
+    if (shouldRedirectToApprovalQueue(decidedStatus, priorStatus)) {
+      // Covers two cases with one queue call: a genuinely new promotion
+      // (priorStatus 'watch'/null) AND a bench->track promotion signal
+      // (priorStatus 'bench', a legitimate reason to ask, but the wallet
+      // stays 'bench' — not demoted to 'watch' — while the request is
+      // pending, so it keeps getting live bench-tier paper trades meanwhile
+      // instead of going dark).
+      const { queued } = await queueApprovalRequest({
+        walletAddress: r.address,
+        requestedTier: "track",
+        source: "global_pool",
+        category: null,
+        scoreSnapshot: {
+          compositeScore: r.compositeScore,
+          winRate: r.recentWinRate,
+          tradeCount: r.walletStats.trades_count,
+        },
+        reason: decidedReason,
+      });
+      finalStatus = isBenchPreserved ? "bench" : "watch";
+      const queuedNote = isBenchPreserved
+        ? "pending Telegram approval to promote from bench to track (stays 'bench' meanwhile)"
+        : "pending Telegram approval — queued for real-money tracking, not auto-promoted";
+      finalReason = queued
+        ? `${decidedReason}; ${queuedNote}`
+        : `${decidedReason}; already has a pending/recently-rejected Telegram approval request, not re-queued`;
+      queuedForApproval++;
+    } else if (isBenchPreserved) {
+      finalReason = `${decidedReason}; wallet_profile.status left at 'bench' — owned by the category-quota/Telegram workflow, not this global pass`;
+    }
+
     if (finalStatus === "track") tracked++;
+    else if (finalStatus === "bench") benched++;
     else if (finalStatus === "watch") watched++;
     else ignored++;
 
@@ -1987,10 +2079,12 @@ async function finalizeAndWrite(results: Pass2Result[], rules: ScoringRules, tra
 
   const totalIgnored = ignored + recencyDropped + toxicFlowDropped + liquidityFarmingDropped;
   console.log(
-    `Pass 2 + ranking complete: ${tracked} track, ${watched} watch, ${totalIgnored} ignore ` +
+    `Pass 2 + ranking complete: ${tracked} track, ${benched} bench (unchanged, owned by the category-quota ` +
+      `workflow), ${watched} watch, ${totalIgnored} ignore ` +
       `(${toxicFlowDropped} force-ignored as toxic flow / volume farmers, ${liquidityFarmingDropped} ` +
       `force-ignored as liquidity farming / unreplicable edge, ${recencyDropped} force-ignored for going ` +
-      `cold, ${demotedAddresses.size} demoted from track by the pool cap).`
+      `cold, ${demotedAddresses.size} demoted from track by the pool cap, ${queuedForApproval} newly-` +
+      `qualifying wallet(s) queued for Telegram approval instead of auto-tracked).`
   );
 }
 

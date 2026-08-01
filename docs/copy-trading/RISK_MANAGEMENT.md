@@ -4296,6 +4296,98 @@ reaction time was worse than the documented ~5-minute cadence on any
 cycle this fired. **Needs a `bot.py` restart** to pick up the fix — same
 restart-pending status as every other change in this ledger.
 
+## 49. Telegram wallet-approval workflow — unifying two silent auto-promotion paths behind one human gate (2026-08-01)
+
+### Summary
+
+**Challenge:** Joey wants a daily automated wallet-discovery pipeline
+(`scan:leaderboard` -> `scan:wallets` -> `discoverCategorySpecialists.ts`)
+instead of the manual, unscheduled runs used until now — but exploration
+before building this surfaced a real reason the pipeline was NEVER put on a
+cron in the first place: `scoreWallets.ts`'s `finalizeAndWrite` (a global
+composite-score threshold + dynamic top-N pool, `computeDemotedAddresses`)
+writes `wallet_profile.status='track'` DIRECTLY, with no human review,
+every time it runs. Since `TRACKED_TRADERS_SOURCE="db"` reads
+`status='track'` as its live real-money copying list (2026-08-01, same-day
+addendum below), scheduling this unattended would have silently put new
+wallets into real-money rotation. This sat alongside a SECOND, independent
+promotion path — `discoverCategorySpecialists.ts`'s category-quota system
+(Rule 24) — which was report-only, requiring Joey to manually apply its
+recommendations. Two systems, two different behaviors, neither reviewed by
+a human on the path that actually mattered (the global pool's).
+
+**Mechanism:** Unified into one gate, confirmed via AskUserQuestion —
+the category-quota system becomes the sole path to `'track'`/the new
+`'bench'` tier, and `scoreWallets.ts`'s own promotion is redirected into
+the same queue instead of writing `'track'` directly:
+
+- **`wallet_approval_request`** (new table, `packages/db/src/schema.ts`,
+  migration `0021_careless_prima.sql`): one row per proposed promotion —
+  `walletAddress`, `requestedTier` ('track'|'bench'), `source`
+  ('global_pool'|'category_quota'), `category`, `scoreSnapshotJson`,
+  `reason`, `status` ('pending'|'approved'|'rejected'), Telegram
+  message/chat id, timestamps.
+- **`walletApprovalQueue.ts`**'s `queueApprovalRequest()` is the single
+  funnel both writers call — `shouldQueueApprovalRequest()` (pure,
+  unit-tested) skips a candidate that's already at the requested status,
+  already has a pending request, or was rejected within a
+  `APPROVAL_COOLDOWN_DAYS=14` cooldown (explicit judgment call, not
+  researched — same footing as this codebase's other unresearched
+  constants like `TCA_MIN_ENTRY_PRICE`).
+- **`scoreWallets.ts`'s `finalizeAndWrite`**: a wallet whose raw
+  `decideStatus()` verdict is `'track'` AND whose PRIOR status wasn't
+  already `'track'` (`shouldRedirectToApprovalQueue`, pure, unit-tested)
+  gets queued instead of committed — written as `'watch'` in the
+  meantime. A wallet already `'track'` keeps reconfirming directly, no
+  re-approval spam.
+- **Bug caught mid-build, fixed before shipping**: `decideStatus()` only
+  ever returns `'track'`/`'watch'`/`'ignore'` — never `'bench'`. Without a
+  guard, the next routine rescore of a Joey-approved bench wallet would
+  silently wipe it back to `'watch'`/`'ignore'` the moment its DIFFERENT,
+  unrelated global score dipped. Fixed: a prior status of `'bench'` is
+  preserved through this pass regardless of the global verdict; if that
+  verdict is ALSO `'track'`, a bench->track promotion request is queued
+  but the wallet stays `'bench'` (still getting whatever bench-tier
+  activity exists) while it's pending, not silently demoted.
+- **`discoverCategorySpecialists.ts`**: quota widened from
+  `quotaPerCategory` (5) to `quotaPerCategory + benchQuotaPerCategory`
+  (5+6=11) per category; the top 5 (by the existing t-stat/wash-trading
+  ranking) become `'track'` proposals, the next 6 become `'bench'`
+  proposals — 4 categories × (5+6) = 20 track + 24 bench, landing
+  mid-range of Joey's own "20-30 bench wallets" ask (AskUserQuestion, not
+  derived). New `--queue-approvals` flag (default off) actually queues
+  candidates; the existing report-only default behavior for ad-hoc manual
+  runs is unchanged.
+- **Telegram send/receive**: `send_wallet_approvals.py` sends each un-sent
+  pending request as one message with ✅ Approve / ❌ Reject inline
+  buttons (`telegram_alerts.send_telegram_message_with_buttons`, new —
+  parses the response body for `message_id`, unlike the existing
+  fire-and-forget `send_telegram_alert`). `telegram_approval_listener.py`
+  (new, long-running, systemd — see SAFETY.md §68) long-polls
+  `getUpdates`, matches a `wa:{id}:approve|reject` callback tap, and is
+  the ONLY thing that calls `db.resolve_wallet_approval_request()` — the
+  ONLY writer that flips `wallet_profile.status` as a result of this
+  workflow, in the same transaction as resolving the request.
+
+**What's still `'bench'` in name only (deliberately out of scope this
+session):** an approved `'bench'` wallet is marked but dormant — wiring
+it into `bot.py`'s live loop so it actually gets real-time simulated
+shadow trades (reusing Rule 37's `_execute_shadow_buy()`, currently only
+invoked for muted wallets) is a production main-loop change, scoped to its
+own future session rather than bundled into an already-large change here.
+
+**Tests:** `walletApprovalQueue.test.ts` (11, dedup/cooldown decision),
+`scoreWallets.test.ts` (+5: `shouldRedirectToApprovalQueue`, including the
+bench->track case), `discoverCategorySpecialists.test.ts` (+4:
+`splitTrackAndBench`) — 258 TS tests passing.
+`test_db_wallet_approval.py` (13, real temp-SQLite CRUD + the
+approve-flips-status / reject-leaves-untouched / already-resolved-is-a-
+no-op transitions), `test_telegram_alerts.py` (+7:
+`send_telegram_message_with_buttons`), `test_send_wallet_approvals.py`
+(9), `test_telegram_approval_listener.py` (27: callback parsing, chat-id
+authorization, offset persistence, `get_updates` failure->exception,
+full `handle_callback_query` scenarios) — 658 Python tests passing.
+
 ## What is intentionally still simple
 
 The current setup is conservative by design — it focuses on avoiding obvious bad fills, bad

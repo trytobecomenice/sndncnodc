@@ -11,6 +11,7 @@ import {
   passesEntryPriceFloor,
   passesTcaFilter,
   rankAndCapCategory,
+  splitTrackAndBench,
   type CategoryCandidateResult,
 } from "./discoverCategorySpecialists";
 
@@ -148,6 +149,37 @@ describe("rankAndCapCategory", () => {
     ];
     const ranked = rankAndCapCategory(entries, 5);
     expect(ranked.map((r) => r.walletAddress)).toEqual(["0xsuspect_high", "0xsuspect_low"]);
+  });
+});
+
+describe("splitTrackAndBench", () => {
+  it("splits the top trackQuota into track, the rest into bench", () => {
+    const entries = ["a", "b", "c", "d", "e"];
+    const { track, bench } = splitTrackAndBench(entries, 2);
+    expect(track).toEqual(["a", "b"]);
+    expect(bench).toEqual(["c", "d", "e"]);
+  });
+
+  it("bench is empty when there aren't more entries than the track quota", () => {
+    const entries = ["a", "b"];
+    const { track, bench } = splitTrackAndBench(entries, 5);
+    expect(track).toEqual(["a", "b"]);
+    expect(bench).toEqual([]);
+  });
+
+  it("handles an empty input", () => {
+    expect(splitTrackAndBench([], 5)).toEqual({ track: [], bench: [] });
+  });
+
+  it("composes with rankAndCapCategory's own capping: track+bench never exceeds the pre-capped input", () => {
+    const entries = Array.from({ length: 20 }, (_, i) => result({ walletAddress: `0xwallet${i}`, pnlTStat: i }));
+    const ranked = rankAndCapCategory(entries, 11); // quotaPerCategory(5) + benchQuotaPerCategory(6)
+    const { track, bench } = splitTrackAndBench(ranked, 5);
+    expect(track).toHaveLength(5);
+    expect(bench).toHaveLength(6);
+    // Highest t_stat wallets land in track, next-highest in bench, in order.
+    expect(track.map((r) => r.walletAddress)).toEqual(["0xwallet19", "0xwallet18", "0xwallet17", "0xwallet16", "0xwallet15"]);
+    expect(bench.map((r) => r.walletAddress)).toEqual(["0xwallet14", "0xwallet13", "0xwallet12", "0xwallet11", "0xwallet10", "0xwallet9"]);
   });
 });
 

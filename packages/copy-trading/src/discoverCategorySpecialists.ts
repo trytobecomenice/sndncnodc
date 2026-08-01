@@ -8,10 +8,19 @@
 // trade history -> positions -> resolution-aware realized PnL -> per-category
 // t-test) against a BROADER candidate pool, to surface wallets worth adding
 // to tracking specifically because of a strong CATEGORY-SPECIFIC edge — not
-// necessarily a strong overall record. This is a REPORTING tool only: it
-// prints a ranked list, it does not write to wallet_profile.status or touch
-// config.TRACKED_TRADERS. Deciding what to actually track stays a human
-// decision, matching how the current 20 were hand-curated in the first place.
+// necessarily a strong overall record. By default this is a REPORTING tool
+// only: it prints a ranked list, it does not write to wallet_profile.status
+// or touch config.TRACKED_TRADERS. Deciding what to actually track stays a
+// human decision, matching how the current 20 were hand-curated in the
+// first place.
+//
+// 2026-08-01 (Telegram approval workflow): pass --queue-approvals to also
+// queue each qualifying candidate into wallet_approval_request (top
+// quotaPerCategory per category as 'track', the next benchQuotaPerCategory
+// as 'bench') instead of only printing the report — see
+// walletApprovalQueue.ts's module doc comment for the full design. This is
+// how the daily cron invokes this script; an ad-hoc manual run (as before)
+// still defaults to report-only.
 //
 // =============================================================================
 // WHY NOT JUST ASK BULLPEN FOR "TOP TRADERS BY CATEGORY"? (checked live, not assumed)
@@ -284,6 +293,7 @@ import { mapWithConcurrency } from "@copybot/shared";
 import { fetchWalletTrades } from "./polymarketDataApi";
 import { CATEGORY_TAG_SLUGS, resolveMarketCategory } from "./polymarketCategories";
 import { aggregateCategoryScores, reconstructRealizedCloses } from "./scoreWalletCategories";
+import { queueApprovalRequest } from "./walletApprovalQueue";
 
 const DISCOVERY_CONCURRENCY = 5; // matches scanLeaderboard.ts's PASS1_CONCURRENCY precedent
 const ROLLING_WINDOW_DAYS = 90; // same window scoreWalletCategories.ts uses
@@ -307,6 +317,16 @@ const ROLLING_WINDOW_DAYS = 90; // same window scoreWalletCategories.ts uses
 // its own EV/Kelly pipeline, unrelated to Polymarket-tag-based domains.
 const DEFAULT_QUOTA_PER_CATEGORY = 5;
 const DEFAULT_TARGET_CATEGORIES = CATEGORY_TAG_SLUGS;
+
+// Bench tier (2026-08-01, Telegram approval workflow): the next
+// benchQuotaPerCategory candidates per category, AFTER the track quota
+// above, get proposed as 'bench' — a paper-only tier that (once a future
+// session wires it into bot.py) gets genuine simulated shadow trades before
+// ever being considered for real money. 6/category × 4 categories = 24,
+// landing mid-range of Joey's own "20-30 bench wallets" ask (confirmed via
+// AskUserQuestion, not derived) — same explicit-judgment-call footing as
+// DEFAULT_QUOTA_PER_CATEGORY itself.
+const DEFAULT_BENCH_QUOTA_PER_CATEGORY = 6;
 
 // Positive-evidence mirror of config.py's CATEGORY_SKIP_Z_CRITICAL (1.645) —
 // the SAME one-tailed 95%-confidence critical value, just testing the
@@ -386,6 +406,21 @@ export function rankAndCapCategory(
   return [...entries]
     .sort((a, b) => Number(a.washTradingSuspect) - Number(b.washTradingSuspect) || b.pnlTStat - a.pnlTStat)
     .slice(0, topN);
+}
+
+/**
+ * Splits one category's already-ranked-and-capped candidates (rankAndCapCategory,
+ * called with topN = trackQuota + benchQuota) into the track tier (the top
+ * trackQuota, by the same ordering rankAndCapCategory already applied) and
+ * the bench tier (everything after that, up to whatever's left — never more
+ * than benchQuota since the caller capped the input list already). Pure,
+ * directly unit-testable.
+ */
+export function splitTrackAndBench<T>(
+  rankedEntries: T[],
+  trackQuota: number
+): { track: T[]; bench: T[] } {
+  return { track: rankedEntries.slice(0, trackQuota), bench: rankedEntries.slice(trackQuota) };
 }
 
 async function scoreOneCandidate(
@@ -474,14 +509,18 @@ function parseArgs(): {
   tcaMinEntryPrice: number;
   washTradingThresholds: WashTradingThresholds;
   quotaPerCategory: number;
+  benchQuotaPerCategory: number;
   targetCategories: string[];
+  queueApprovals: boolean;
 } {
   const args = process.argv.slice(2);
   let minCompositeScore: number | null = DEFAULT_MIN_COMPOSITE_SCORE;
   let tcaSafetyBufferPct = DEFAULT_TCA_SAFETY_BUFFER_PCT;
   let tcaMinEntryPrice = DEFAULT_TCA_MIN_ENTRY_PRICE;
   let quotaPerCategory = DEFAULT_QUOTA_PER_CATEGORY;
+  let benchQuotaPerCategory = DEFAULT_BENCH_QUOTA_PER_CATEGORY;
   let targetCategories = DEFAULT_TARGET_CATEGORIES;
+  let queueApprovals = false;
   const washTradingThresholds: WashTradingThresholds = { ...DEFAULT_WASH_TRADING_THRESHOLDS };
   const excludeAddresses = new Set<string>();
 
@@ -512,21 +551,26 @@ function parseArgs(): {
     } else if (args[i] === "--quota-per-category" && args[i + 1]) {
       quotaPerCategory = Number(args[i + 1]);
       i++;
+    } else if (args[i] === "--bench-quota-per-category" && args[i + 1]) {
+      benchQuotaPerCategory = Number(args[i + 1]);
+      i++;
     } else if (args[i] === "--categories" && args[i + 1]) {
       targetCategories = args[i + 1].split(",").map((c) => c.trim());
       i++;
+    } else if (args[i] === "--queue-approvals") {
+      queueApprovals = true;
     }
   }
   return {
     minCompositeScore, excludeAddresses, tcaSafetyBufferPct, tcaMinEntryPrice,
-    washTradingThresholds, quotaPerCategory, targetCategories,
+    washTradingThresholds, quotaPerCategory, benchQuotaPerCategory, targetCategories, queueApprovals,
   };
 }
 
 async function main() {
   const {
     minCompositeScore, excludeAddresses, tcaSafetyBufferPct, tcaMinEntryPrice, washTradingThresholds,
-    quotaPerCategory, targetCategories,
+    quotaPerCategory, benchQuotaPerCategory, targetCategories, queueApprovals,
   } = parseArgs();
 
   const whereClauses = [];
@@ -591,41 +635,94 @@ async function main() {
       if (!passes) tcaRejected.push(e);
       return passes;
     });
-    if (survivors.length > 0) tcaViable[category] = rankAndCapCategory(survivors, quotaPerCategory);
-  }
-
-  console.log(
-    `\n=== Category Quota Discovery (target: ${quotaPerCategory} per category × ` +
-      `${targetCategories.length} categories = ${quotaPerCategory * targetCategories.length} slots, ` +
-      `TCA safety buffer=${(tcaSafetyBufferPct * 100).toFixed(1)}%) ===`
-  );
-  let totalFilled = 0;
-  for (const category of targetCategories) {
-    const entries = tcaViable[category] ?? [];
-    totalFilled += entries.length;
-    console.log(`\n${category} (${entries.length}/${quotaPerCategory} filled)${entries.length === 0 ? " — no qualifying candidates found" : ":"}`);
-    for (const e of entries) {
-      const spreadPct = e.avgEntryPrice !== null ? (estimatedRelativeSpread(e.avgEntryPrice) / 2) * 100 : NaN;
-      const feePct = e.avgEntryPrice !== null ? e.avgFeeRate * (1 - e.avgEntryPrice) * 100 : NaN;
-      // Wash-trading suspicion is a WARNING annotation, not an exclusion —
-      // e stays in tcaViable either way (see this file's module-level
-      // comment on the wash-trading screen for why this is "look closer,"
-      // not "auto-exclude").
-      const washWarning = e.washTradingSuspect
-        ? " | ⚠ WASH-TRADING SUSPECT (near-perfect win rate, thin edge, large sample — review before tracking)"
-        : "";
-      console.log(
-        `  ${e.walletAddress} | score=${e.score.toFixed(3)} | t_stat=${e.pnlTStat.toFixed(2)} | ` +
-          `win_rate=${(e.winRate * 100).toFixed(1)}% | trades=${e.tradeCount} | avg_pnl=$${e.avgPnlUsd.toFixed(2)} | ` +
-          `roi=${(e.roi * 100).toFixed(1)}% | est_slippage=${spreadPct.toFixed(1)}% | est_fee=${feePct.toFixed(1)}%${washWarning}`
-      );
+    if (survivors.length > 0) {
+      tcaViable[category] = rankAndCapCategory(survivors, quotaPerCategory + benchQuotaPerCategory);
     }
   }
 
   console.log(
-    `\nTotal slots filled: ${totalFilled} / ${quotaPerCategory * targetCategories.length} across ` +
+    `\n=== Category Quota Discovery (target: ${quotaPerCategory} track + ${benchQuotaPerCategory} bench per ` +
+      `category × ${targetCategories.length} categories = ${quotaPerCategory * targetCategories.length} track / ` +
+      `${benchQuotaPerCategory * targetCategories.length} bench slots, ` +
+      `TCA safety buffer=${(tcaSafetyBufferPct * 100).toFixed(1)}%) ===`
+  );
+  let totalTrackFilled = 0;
+  let totalBenchFilled = 0;
+  let totalQueued = 0;
+  let totalSkippedAlreadyQueued = 0;
+
+  const printEntry = (e: CategoryCandidateResult) => {
+    const spreadPct = e.avgEntryPrice !== null ? (estimatedRelativeSpread(e.avgEntryPrice) / 2) * 100 : NaN;
+    const feePct = e.avgEntryPrice !== null ? e.avgFeeRate * (1 - e.avgEntryPrice) * 100 : NaN;
+    // Wash-trading suspicion is a WARNING annotation, not an exclusion —
+    // e stays eligible either way (see this file's module-level comment on
+    // the wash-trading screen for why this is "look closer," not
+    // "auto-exclude").
+    const washWarning = e.washTradingSuspect
+      ? " | ⚠ WASH-TRADING SUSPECT (near-perfect win rate, thin edge, large sample — review before tracking)"
+      : "";
+    console.log(
+      `  ${e.walletAddress} | score=${e.score.toFixed(3)} | t_stat=${e.pnlTStat.toFixed(2)} | ` +
+        `win_rate=${(e.winRate * 100).toFixed(1)}% | trades=${e.tradeCount} | avg_pnl=$${e.avgPnlUsd.toFixed(2)} | ` +
+        `roi=${(e.roi * 100).toFixed(1)}% | est_slippage=${spreadPct.toFixed(1)}% | est_fee=${feePct.toFixed(1)}%${washWarning}`
+    );
+  };
+
+  for (const category of targetCategories) {
+    const entries = tcaViable[category] ?? [];
+    const { track, bench } = splitTrackAndBench(entries, quotaPerCategory);
+    totalTrackFilled += track.length;
+    totalBenchFilled += bench.length;
+
+    console.log(
+      `\n${category} — track (${track.length}/${quotaPerCategory} filled)` +
+        `${track.length === 0 ? " — no qualifying candidates found" : ":"}`
+    );
+    for (const e of track) printEntry(e);
+
+    console.log(
+      `${category} — bench (${bench.length}/${benchQuotaPerCategory} filled)` +
+        `${bench.length === 0 ? " — no qualifying candidates found" : ":"}`
+    );
+    for (const e of bench) printEntry(e);
+
+    if (queueApprovals) {
+      for (const [tier, list] of [["track", track], ["bench", bench]] as const) {
+        for (const e of list) {
+          const { queued } = await queueApprovalRequest({
+            walletAddress: e.walletAddress,
+            requestedTier: tier,
+            source: "category_quota",
+            category,
+            scoreSnapshot: {
+              compositeScore: e.score,
+              pnlTStat: e.pnlTStat,
+              winRate: e.winRate,
+              tradeCount: e.tradeCount,
+              roi: e.roi,
+              washTradingSuspect: e.washTradingSuspect,
+            },
+            reason: `category quota (${category}): t_stat=${e.pnlTStat.toFixed(2)}, roi=${(e.roi * 100).toFixed(1)}%, ` +
+              `${e.tradeCount} trades, win_rate=${(e.winRate * 100).toFixed(1)}%`,
+          });
+          if (queued) totalQueued++;
+          else totalSkippedAlreadyQueued++;
+        }
+      }
+    }
+  }
+
+  console.log(
+    `\nTotal slots filled: ${totalTrackFilled} / ${quotaPerCategory * targetCategories.length} track, ` +
+      `${totalBenchFilled} / ${benchQuotaPerCategory * targetCategories.length} bench across ` +
       `${targetCategories.length} target categories.`
   );
+  if (queueApprovals) {
+    console.log(
+      `Queued ${totalQueued} new Telegram approval request(s); ${totalSkippedAlreadyQueued} candidate(s) ` +
+        `skipped (already at that status, already pending, or still within the rejection cooldown).`
+    );
+  }
 
   if (entryPriceRejected.length > 0) {
     console.log(
@@ -649,9 +746,10 @@ async function main() {
   }
 
   if (outsideTargetCategories.length > 0) {
+    const totalSlots = (quotaPerCategory + benchQuotaPerCategory) * targetCategories.length;
     console.log(
       `\n--- Outside the quota system (category not in [${targetCategories.join(", ")}] — ` +
-        `informational only, not counted toward the ${quotaPerCategory * targetCategories.length} slots) ---`
+        `informational only, not counted toward the ${totalSlots} track+bench slots) ---`
     );
     for (const e of outsideTargetCategories) {
       console.log(`  ${e.walletAddress} | category=${e.category} | t_stat=${e.pnlTStat.toFixed(2)} | roi=${(e.roi * 100).toFixed(2)}%`);
@@ -659,8 +757,12 @@ async function main() {
   }
 
   console.log(
-    "\nThis is a REPORT only — nothing was written to wallet_profile.status or config.TRACKED_TRADERS. " +
-      "Review and add manually if any of these look worth tracking."
+    queueApprovals
+      ? "\nCandidates above the track/bench line were queued into wallet_approval_request — Joey approves/" +
+          "rejects each via Telegram (send_wallet_approvals.py / telegram_approval_listener.py). Nothing is " +
+          "written to wallet_profile.status until she approves."
+      : "\nThis is a REPORT only — nothing was written to wallet_profile.status or wallet_approval_request. " +
+          "Pass --queue-approvals to send these candidates for Telegram approval."
   );
 }
 

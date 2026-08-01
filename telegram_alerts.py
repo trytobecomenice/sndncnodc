@@ -114,3 +114,54 @@ def send_telegram_alert(message):
     except (http.client.HTTPException, OSError) as e:
         logger.warning(f"Telegram alert failed: {e}")
         return False
+
+
+def send_telegram_message_with_buttons(message, inline_keyboard):
+    """Same best-effort send as send_telegram_alert, with a reply_markup
+    inline keyboard attached (Telegram's own shape: a list of rows, each row
+    a list of {"text", "callback_data"} dicts — see
+    https://core.telegram.org/bots/api#inlinekeyboardmarkup). Built for
+    send_wallet_approvals.py (2026-08-01, Telegram wallet-approval workflow)
+    so telegram_approval_listener.py can later match a button tap back to a
+    specific wallet_approval_request via its callback_data.
+
+    Unlike send_telegram_alert (fire-and-forget, returns bool), this reads
+    and parses the response body to return the sent message's id — the
+    caller needs it (db.mark_wallet_approval_request_sent) to know which
+    Telegram message a later edit/callback refers to. Returns None on any
+    failure (disabled, missing config, network error, non-2xx, unparseable
+    body) — same "degrade silently, never raise into the caller" contract as
+    send_telegram_alert.
+    """
+    if not config.ENABLE_TELEGRAM_ALERTS:
+        return None
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return None
+
+    body = json.dumps({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "reply_markup": {"inline_keyboard": inline_keyboard},
+    }).encode("utf-8")
+    try:
+        conn = http.client.HTTPSConnection("api.telegram.org", timeout=10)
+        try:
+            # Same IPv4-forcing scope as send_telegram_alert — see
+            # _force_ipv4_dns()'s docstring for why this EC2 box needs it.
+            with _force_ipv4_dns():
+                conn.request(
+                    "POST", f"/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    body=body, headers={"Content-Type": "application/json"},
+                )
+                response = conn.getresponse()
+            raw_body = response.read()
+            if not (200 <= response.status < 300):
+                logger.warning(f"Telegram button message failed: HTTP {response.status}")
+                return None
+            payload = json.loads(raw_body)
+            return payload.get("result", {}).get("message_id")
+        finally:
+            conn.close()
+    except (http.client.HTTPException, OSError, ValueError) as e:
+        logger.warning(f"Telegram button message failed: {e}")
+        return None
