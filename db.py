@@ -757,6 +757,21 @@ def get_tracked_traders():
     AND, new as of this function actually being wired in, the authoritative
     membership filter for which trades get copied at all — see
     bot.py main()'s `tracked_by_lower`.
+
+    Deliberately does NOT filter on circuit_breaker_muted (found live,
+    2026-08-01, the first time this source was actually flipped on with a
+    real muted wallet present): under TRACKED_TRADERS_SOURCE="static", a
+    muted wallet stays in wallet_addresses and keeps getting POLLED (its
+    trades still fetched every cycle) — only the actual copy is skipped,
+    via the separate skip_muted_trader check in main()'s trade loop. Muted
+    wallets still being polled is exactly what sweep_shadow_rehab() (Rule
+    37) depends on to get fresh data for its reinstatement test. An
+    earlier version of this query excluded muted wallets at the source
+    here, which would have silently starved Shadow Rehab of new data for
+    every muted wallet the moment "db" mode was ever turned on — the same
+    status='track' set as before, minus muted ones, is not equivalent to
+    static mode's behavior. Muting is enforced downstream, not by keeping a
+    wallet out of the tracked set entirely.
     """
     if config.TRACKED_TRADERS_SOURCE != "db":
         return dict(config.TRACKED_TRADERS)
@@ -765,7 +780,7 @@ def get_tracked_traders():
     try:
         cur = conn.execute(
             "SELECT wallet_address, nickname FROM wallet_profile "
-            "WHERE status = 'track' AND circuit_breaker_muted = 0"
+            "WHERE status = 'track'"
         )
         rows = cur.fetchall()
     finally:
