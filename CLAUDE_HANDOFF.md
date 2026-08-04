@@ -8,8 +8,8 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 
 ## Non-negotiable operating rules
 
-- Copy Bot and Weather Bot are separate systems. Never mix their code, runtime imports, tables,
-  capital, PnL, or risk decisions.
+- This repository is Copy Bot only. Other bots live in separate workspaces; do not add their code,
+  schema, dependencies, documentation, capital, PnL, or deployment controls here.
 - Both systems remain paper-only. Do not flip `LIVE_MODE` or introduce private-key custody.
 - TypeScript/Drizzle owns schema and migrations; Python performs CRUD only.
 - Preserve unrelated dirty-worktree changes. Do not bundle them into a task commit.
@@ -136,6 +136,30 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
    when the roster count looks diversified.
 
 ## Change log
+
+### 2026-08-05 — Copy Bot repository separation
+
+1. **When:** 2026-08-05 HKT.
+2. **Files adjusted:**
+   - Removed the secondary-bot package and its dedicated documentation from this repository.
+   - `packages/db/src/schema.ts` and the generated forward migration — removed the obsolete
+     secondary-domain table definitions; the destructive SQL was not applied to AWS.
+   - `pnpm-lock.yaml`, `README.md`, `.claudeprompt`, `ROADMAP.md`,
+     `apps/dashboard/next.config.ts`, two Copy Bot research comments, `docs/CURRENT_STATE.md`, and
+     `CLAUDE_HANDOFF.md` — made repository scope Copy-Bot-only.
+3. **What changed:**
+   - Upgraded isolation from separate processes to separate source, dependencies, docs, schema,
+     database ownership, and deployment scope.
+   - Preserved historical Drizzle migrations because rewriting applied migration history would
+     break existing journals; the latest forward migration removes the obsolete tables for
+     databases where it is deliberately applied.
+   - Did not change the separately maintained bot workspace or any of its code, DB, logs,
+     scheduler, credentials, or runtime.
+   - Verification: Python `unittest discover` 662/662; Copy Trading Vitest 259/259; Copy Trading
+     and DB `tsc --noEmit` clean; migration SQL parsed successfully in an in-memory SQLite DB;
+     dashboard ESLint clean. Dashboard production build reached compilation but could not fetch
+     Google Geist fonts because the sandbox has no Google Fonts network access.
+   - Did not stage `.env`, keys, credentials, or unrelated dirty-worktree files.
 
 ### 2026-08-05 — External GitHub strategy audit (research only)
 

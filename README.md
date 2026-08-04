@@ -23,22 +23,16 @@ understanding what you're changing — see `docs/copy-trading/RISK_MANAGEMENT.md
 | Understand what's running and why, from zero | `docs/copy-trading/SYSTEM_ARCHITECTURE.md` |
 | Know exactly what risk rules are enforced, and why | `docs/copy-trading/RISK_MANAGEMENT.md` |
 | Get the engineering-level detail (file/function names, DB ownership, runbooks) | `docs/copy-trading/SAFETY.md` |
-| Understand the (planned, architecture-only) Weather Bot | `docs/weather/WEATHER_ARCHITECTURE.md` + `docs/weather/WEATHER_RISK_MANAGEMENT.md` |
 | Get oriented as a new operator/contributor | `docs/OPERATOR_ONBOARDING.md` |
 | See what's done, what's in flight, and what's explicitly on hold | `docs/CURRENT_STATE.md` |
 
-## The two systems in this repo
+## The system in this repo
 
-1. **Copy Bot** (built, running today) — Python (`bot.py`, `config.py`, `db.py`,
-   `bullpen_client.py`, `risk_manager.py`) plus a TypeScript "research brain"
-   (`packages/copy-trading`) that scores candidate wallets. This is the system every doc above
-   describes.
-2. **Weather Bot** (architecture documented, no code yet) — a separate, intentionally isolated
-   arbitrage bot that will eventually share this repo's dashboard and database, but has no logic
-   yet (`packages/weather/` is an empty scaffold). Full design — data flow, schema, scheduling,
-   and risk rules — is written up in `docs/weather/WEATHER_ARCHITECTURE.md` /
-   `docs/weather/WEATHER_RISK_MANAGEMENT.md` ahead of any implementation. Never mix its logic with the
-   Copy Bot's.
+This repository contains only the **Copy Bot**: Python (`bot.py`, `config.py`, `db.py`,
+`bullpen_client.py`, `risk_manager.py`) plus a TypeScript research package
+(`packages/copy-trading`) that scores candidate wallets. Other trading systems are maintained in
+separate workspaces and are outside this repository's code, schema, documentation, deployment,
+and operating scope.
 
 ## Running it
 
@@ -67,7 +61,6 @@ polymarket-copybot/
     ├── db/            ← the database schema (Drizzle/TypeScript) — the one place table shape is defined
     ├── bullpen-client/ ← TypeScript twin of bullpen_client.py
     ├── copy-trading/   ← wallet-scanning/scoring research scripts
-    ├── weather/        ← empty scaffold, not built
     └── shared/         ← empty scaffold, not built
 ```
 

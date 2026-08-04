@@ -22,8 +22,7 @@ built-in web dashboard (`dashboard.py`) that read those same JSON files.
 That bot worked, but it's not what a much bigger spec (the "Hermes" build prompt) calls for:
 a full research system that scans Polymarket's leaderboard, scores wallets, keeps a "decision
 journal" explaining every choice, and improves its own rules over time — all shown on a proper
-Next.js dashboard. A second, separate project (a weather-market arbitrage bot) is also planned
-to eventually share the same dashboard and database.
+Next.js dashboard.
 
 ### What today's work actually did
 
@@ -33,8 +32,8 @@ foundation to grow from**:
 1. **Pulled the "talk to bullpen" logic out of `bot.py`** into its own file, `bullpen_client.py`
    — no behavior change, just a cleaner separation, verified by restarting the live bot and
    confirming identical output.
-2. **Designed a real database** (21 tables) covering both the copy-trading research system and
-   the future weather bot, written as a Drizzle (TypeScript) schema.
+2. **Designed a real database** covering the copy-trading research system, written as a Drizzle
+   (TypeScript) schema.
 3. **Built `db.py`** — a small Python module that lets `bot.py` read and write that database
    using plain SQL, instead of JSON files.
 4. **Wrote a one-time migration script** (`migrate_to_sqlite.py`) that copies everything from
@@ -77,20 +76,17 @@ polymarket-copybot/
     ├── db/                   ← the database's blueprint (schema) + a ready-to-use client
     ├── bullpen-client/       ← TypeScript twin of bullpen_client.py
     ├── copy-trading/         ← the "research brain" scripts (scanLeaderboard.ts today)
-    ├── weather/               ← empty scaffold, for the weather bot (not built yet)
     └── shared/                ← empty scaffold, for things like Telegram alerts (not built yet)
 ```
 
 **`apps/` = things you actually run and deploy.** Right now there's exactly one: the Next.js
-dashboard. If we ever build the weather bot's own web view, it would likely live here too, or
-share this same app.
+dashboard.
 
 **`packages/` = shared building blocks that other things depend on, but that aren't
 "deployed" by themselves.** Think of `packages/db` as the single, agreed-upon blueprint for
-what the database looks like — both the dashboard and the future scoring scripts import it so
-they're always talking about the same tables in the same way. `packages/bullpen-client` is a
-small reusable tool (talk to the `bullpen` CLI safely) that both `copy-trading` and the future
-`weather` package will use, so that logic only has to be written once.
+what the database looks like — both the dashboard and the scoring scripts import it so they're
+always talking about the same tables in the same way. `packages/bullpen-client` is a small
+reusable tool used by `copy-trading` to talk to the `bullpen` CLI safely.
 
 This split matters because of `workspace:*` — inside each `package.json` in `apps/dashboard` or
 `packages/copy-trading`, you'll see dependencies like `"@copybot/db": "workspace:*"`. That tells
@@ -298,11 +294,5 @@ built yet.
 
 So you know exactly where things stand: `monitorTrades.ts` / `scoreTrades.ts` (the broader trade
 observer and decision engine described in the spec), `paperUpdatePnl.ts`, `reviewOutcomes.ts`,
-`updateRules.ts` (the self-improving rules engine), `dailyReport.ts` (Telegram summaries), the
-remaining 8 dashboard pages, and the entire weather arbitrage bot — `packages/weather/src/` is a
-literal empty folder right now, not even a `package.json` yet, so it isn't wired into the pnpm
-workspace at all. Every one of these already has `package.json` script entries and/or database
-tables waiting for it (the weather tables alone: `weather_station`,
-`weather_historical_observation`, `weather_forecast_snapshot`, `weather_market_mapping`,
-`weather_probability_estimate`, `weather_position`, `weather_pnl_snapshot` — all defined in
-`packages/db/src/schema.ts`, none read or written by any code yet).
+`updateRules.ts` (the self-improving rules engine), `dailyReport.ts` (Telegram summaries), and the
+remaining 8 dashboard pages.

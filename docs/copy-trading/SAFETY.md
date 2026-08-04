@@ -22,7 +22,7 @@ mechanics.
 version one must not place real trades, must not ask for or store private keys, and must not
 sign transactions. All Polymarket/Polygon auth and execution is delegated entirely to the
 external `bullpen` CLI, which owns keys outside this codebase — neither `bot.py` nor the TS
-research layer (`packages/copy-trading`, `packages/weather`) ever touches a private key
+research layer (`packages/copy-trading`) ever touches a private key
 directly.
 
 **System costs & trade-offs:** see Rule 1.
@@ -196,28 +196,6 @@ a halt today still means looking directly at one of those three places.
 
 ---
 
-## 5. Weather bot (planned): Wunderground scraping risk
-
-**What it does:** the weather arbitrage bot's data pipeline (`packages/weather`, not yet built)
-is planned to use Open-Meteo and NOAA/NWS (`api.weather.gov`) as primary, ToS-compliant, free
-data sources, with Wunderground scraping as a secondary source.
-
-**How it works mechanically:** when built, the Wunderground ingester (`ingestWunderground.ts`)
-must live in its own isolated file, rate-limited and cache-first so a historical backfill is a
-one-time pull rather than repeated hits, and easy to disable independently of the other two
-ingesters.
-
-**System costs & trade-offs:** Wunderground's ToS restricts scraping. This is used anyway, by
-explicit product decision, reserved ONLY for stations/markets whose settlement source is a
-Wunderground-only personal weather station not covered by either NOAA/NWS or Open-Meteo — i.e.
-accepted narrowly, not as a general data-sourcing strategy.
-
-**Why it exists:** flagged here explicitly so this is a knowingly-accepted compliance risk, not
-an oversight discovered later. Isolating it to its own file/ingester is what keeps the risk
-scoped and independently disable-able if the trade-off stops looking acceptable.
-
----
-
 ## 6. Why private keys never belong in this app
 
 **What it does:** `bullpen` owns 100% of on-chain interaction and credential storage outside
@@ -261,7 +239,7 @@ of 2026-07-22** — wired into `bot.py`'s poll loop, `bullpen tracker feed` no l
   (`polymarket-copybot/1.0 (+personal research bot)`) — required: the API 403s on Python's
   default `urllib`/`http.client` User-Agent string specifically, confirmed live by testing both
   back to back against the identical URL. This is a truthful header, not browser impersonation —
-  same line already held for Wunderground (`docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 5).
+  this codebase uses the same truthful-identification policy for external API calls.
 - `validate_direct_feed.py` (new file): joins `bullpen tracker feed` output against
   `fetch_all_wallets_concurrent()` output by `transaction_hash` (confirmed live to be the literal
   same value in both sources — an exact key, not a fuzzy heuristic). Read-only: never calls any
@@ -834,7 +812,7 @@ scores.
     argv-free wrapper (this script takes no arguments) that logs a one-line summary.
 - Tests: 13 new in `reviewOutcomes.test.ts` (`buildOutcomeReviewRow`'s skip/win/loss/fallback/
   copy-through cases, `filterUnreviewedTrades`'s set-difference cases). 117 TS tests passing in
-  `@copybot/copy-trading` (was 104); 85 in `@copybot/weather` unaffected; `tsc --noEmit` clean.
+  `@copybot/copy-trading` (was 104); `tsc --noEmit` clean.
 - **Live-verified against the real DB**: 16 pre-existing closed `paper_trade` rows (all from before
   the score-snapshot prerequisites shipped) all got an `outcome_review` row on the first run, all
   correctly showing `contributing_score_factors_json = NULL` — the exact "honest limitation"

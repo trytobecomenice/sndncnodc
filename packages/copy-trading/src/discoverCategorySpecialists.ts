@@ -312,9 +312,7 @@ const ROLLING_WINDOW_DAYS = 90; // same window scoreWalletCategories.ts uses
 // DEFAULT_TARGET_CATEGORIES reuses CATEGORY_TAG_SLUGS directly (politics,
 // sports, crypto, pop-culture — each independently verified live against a
 // real event, see that constant's own comment) rather than inventing a
-// parallel list — there is no "Science/Weather" category anywhere in this
-// system; Weather is a wholly separate bot/product (packages/weather) with
-// its own EV/Kelly pipeline, unrelated to Polymarket-tag-based domains.
+// parallel list. Other strategy domains are outside this repository's scope.
 const DEFAULT_QUOTA_PER_CATEGORY = 5;
 const DEFAULT_TARGET_CATEGORIES = CATEGORY_TAG_SLUGS;
 

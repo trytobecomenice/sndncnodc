@@ -69,10 +69,8 @@ function stats(values: number[]): { min: number; max: number; mean: number; stdd
 // =============================================================================
 // STRATEGY-TIER CLASSIFICATION (2026-07-24)
 // =============================================================================
-// Six of the seven requested strategy profiles (Weather Stat-Arb deliberately
-// excluded — see the strategy-tiered-discovery plan: packages/weather already
-// trades those exact markets independently, a real coexistence question not
-// solved here), using ONLY data this pipeline already computes. NO hold-time/
+// Six requested copy-trading strategy profiles, using ONLY data this pipeline already computes.
+// Non-copy-trading strategies are outside this repository's scope. NO hold-time/
 // execution-speed data exists anywhere in this codebase (RealizedClose
 // carries no timestamps) — "Whale"/"Scalper" below are approximated via
 // dollar conviction + trade frequency, stated as approximations, not

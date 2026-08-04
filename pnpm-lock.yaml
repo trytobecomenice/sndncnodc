@@ -119,34 +119,6 @@ importers:
         specifier: ^5.7.0
         version: 5.9.3
 
-  packages/weather:
-    dependencies:
-      '@copybot/bullpen-client':
-        specifier: workspace:*
-        version: link:../bullpen-client
-      '@copybot/db':
-        specifier: workspace:*
-        version: link:../db
-      drizzle-orm:
-        specifier: ^0.38.0
-        version: 0.38.4(@libsql/client@0.14.0)(@types/react@19.2.17)(react@19.2.4)
-      geo-tz:
-        specifier: ^8.1.8
-        version: 8.1.8
-    devDependencies:
-      '@types/node':
-        specifier: ^20.19.0
-        version: 20.19.43
-      tsx:
-        specifier: ^4.19.0
-        version: 4.23.1
-      typescript:
-        specifier: ^5.7.0
-        version: 5.9.3
-      vitest:
-        specifier: ^4.1.10
-        version: 4.1.10(@types/node@20.19.43)(vite@8.1.5(@types/node@20.19.43)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.23.1))
-
 packages:
 
   '@alloc/quick-lru@5.2.0':
@@ -2119,10 +2091,6 @@ packages:
   gensync@1.0.0-beta.2:
     resolution: {integrity: sha512-3hN7NaskYvMDLQY55gnW3NQ+mesEAepTqlg+VEbj7zzqEMBVNhzcGYYeqFo/TlYz6eQiFcp1HcsCZO+nGgS8zg==}
     engines: {node: '>=6.9.0'}
-
-  geo-tz@8.1.8:
-    resolution: {integrity: sha512-i+5koPn3/fzDkEROczIu3QqCEg0uQi2xugDjaVaarK0djuJorLeKHtWrscIGhnsbpPMHc5cLluaRxu3HXtU1ZA==}
-    engines: {node: '>=16'}
 
   geobuf@3.0.2:
     resolution: {integrity: sha512-ASgKwEAQQRnyNFHNvpd5uAwstbVYmiTW0Caw3fBb509tNTqXyAAPMyFs5NNihsLZhLxU1j/kjFhkhLWA9djuVg==}
@@ -5007,13 +4975,6 @@ snapshots:
   generator-function@2.0.1: {}
 
   gensync@1.0.0-beta.2: {}
-
-  geo-tz@8.1.8:
-    dependencies:
-      '@turf/boolean-point-in-polygon': 7.3.5
-      '@turf/helpers': 7.3.5
-      geobuf: 3.0.2
-      pbf: 3.3.0
 
   geobuf@3.0.2:
     dependencies:

@@ -43,8 +43,6 @@ AWSCLIV2.pkg
 # env
 .env
 
-# Orchestrator runtime state (machine-local cadence bookkeeping, not source)
-packages/weather/data/
 .env.local
 
 # Go OMS (oms/) build artifacts -- source is oms/**/*.go, never the compiled binary

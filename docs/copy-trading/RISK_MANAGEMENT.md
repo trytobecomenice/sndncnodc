@@ -836,8 +836,7 @@ poll loop.**
   this Python installation's SSL certificate bundle was broken (fixed via python.org's own
   standard `Install Certificates.command`), and the API 403s on Python's default `urllib`
   User-Agent string specifically — fixed with a plainly self-identifying header (`polymarket-
-  copybot/1.0 (+personal research bot)`), not browser impersonation (same line already held for
-  Wunderground, Rule 5 of `docs/weather/WEATHER_RISK_MANAGEMENT.md`).
+  copybot/1.0 (+personal research bot)`), not browser impersonation.
 - **Speed, investigated properly rather than assumed**: bumping thread-pool size (10 → 30 workers)
   barely moved total time — the real cost is per-request TLS/connection setup, confirmed by direct
   comparison (fresh connection ~0.7-0.9s per request; a reused connection ~0.2-0.4s). Fixed via a
@@ -1654,10 +1653,7 @@ information edge is category-specific (a crypto specialist has no proven edge in
 that's accidentally all political analysts is one correlated bet dressed up as 20 independent ones,
 and breaks the independence assumption position-sizing math (Kelly included) implicitly relies on.
 
-**Correction worth stating plainly**: an earlier version of this request referenced a
-"Science/Weather" category — no such category exists in this system. `packages/weather` is a wholly
-separate bot/product (temperature-threshold markets, its own EV/Kelly pipeline) — not a Polymarket-
-tag-based copy-trading domain. The quota uses the four categories that actually exist.
+The quota deliberately uses only the four Copy Bot categories that actually exist.
 
 **How it works mechanically:**
 - `filterSignificantByCategory(results, zCritical, targetCategories)` replaces the old
@@ -2007,11 +2003,7 @@ honestly relabeled rather than falsely claimed:
   own $0.98 ceiling alone wouldn't catch a candidate sitting at $0.90 every time.
 - **Pop-Culture Specialist** — `category=pop-culture`, no additional constraint
 
-A candidate can match multiple tiers (returned as an array, never forced into one label). A
-"Weather Model Arbitrage" tier was explicitly requested but dropped: `packages/weather` is a
-separate, already-live bot trading temperature markets independently — adding it here risked two of
-this project's own systems trading the same market against each other. Revisit only with an
-explicit coexistence plan.
+A candidate can match multiple tiers (returned as an array, never forced into one label).
 
 **Part B — the actual tracked-wallet curation.** Comparing the 7 kept + 1 new candidate against the
 live `config.TRACKED_TRADERS` (20 entries) surfaced that one candidate (`0x7f9e2d1d...`) was already
@@ -3960,9 +3952,8 @@ BEFORE pass 1 and drops any candidate whose `nextRescoreDueAt` is still in
 the future (a wallet never scored, or with no row at all, is always due —
 new candidates can never be starved). This is a **single, frequently-
 scheduled job**, not three separately-scheduled ones — the self-throttling
-lives in the data (`nextRescoreDueAt`), not in cron's timing, matching the
-Weather Bot's own `launchd`-based scheduling precedent rather than
-inventing a new mechanism. **Known, accepted limitation**: a manual
+lives in the data (`nextRescoreDueAt`), not in cron's timing.
+**Known, accepted limitation**: a manual
 `TRACKED_TRADERS` promotion doesn't force an immediate re-score — the
 wallet becomes Tier 1 (and gets the right cadence) starting next run, but
 if it was last scored as Tier 3 with a due date a week out, it keeps that
@@ -4461,8 +4452,7 @@ liquidity, and weak traders, rather than being a full multi-factor execution eng
   ceiling is done (Rule 11); the Phase 2 scoring concepts (Rule 12) are logged, not built.
 - Optional live-trading rollout, only after review — **still fully pending**;
   `TRACKED_TRADERS_SOURCE` also stays `"static"` until a scored wallet batch is reviewed (Rule 2).
-- Not yet started: the weather arbitrage bot (separate, isolated system — see
-  `docs/CURRENT_STATE.md`); remaining Next.js dashboard pages (only Overview exists today);
+- Not yet started: remaining Next.js dashboard pages (only Overview exists today);
   `reviewOutcomes.ts`/`updateRules.ts` (the score-vs-actual-outcome validation loop that would let
   scoring rules self-tune from real data instead of hand-picked thresholds).
 - Confidence-weighted position sizing — **done** (Rule 15, 2026-07-22): `FIXED_TRADE_USD` replaced

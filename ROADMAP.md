@@ -28,11 +28,6 @@ stays a narrative writeup of what's shipped; this is the working list of what's 
 
 ## Phase 3 — Future
 
-- **Unified Capital Allocation (Sharpe-ratio based, across trading bots)** — the copy
-  bot and Weather Bot are currently two fully separate capital silos. Once both have
-  enough real track record, allocate capital between them by risk-adjusted return —
-  the same idea as the existing per-wallet Sharpe-based capital multiplier
-  (`scoreWallets.ts`'s `computeCapitalMultiplier`), one level up.
 - **UMA Oracle Dispute Check** — Polymarket markets resolve via UMA's optimistic
   oracle and can be formally disputed. No current check exists for "this market's
   resolution is currently contested" before treating a settlement price as final —

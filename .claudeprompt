@@ -2,34 +2,22 @@
 
 These rules are mandatory for this workspace.
 
-## 0) STRICT DOMAIN ISOLATION — READ THIS FIRST
-- This repository contains two distinct domains: **Copy Bot** (Polymarket wallet tracking, paper
-  trading, trade history, circuit-breaker behavior) and **Weather Bot** (weather-market
-  arbitrage, architecture documented, code in progress).
-- **Keep these domains separated at all times. Never mix Copy Bot logic with Weather Bot logic,
-  and never let their database tables or schema evolve as if they were one system.** Formal
-  "100% Dependency Isolation" definition (see `docs/weather/WEATHER_RISK_MANAGEMENT.md` Rule 2
-  for full detail):
-  1. **Zero runtime imports** between `packages/weather` and `packages/copy-trading`, either
-     direction — they run as separate OS processes, never shared in-memory state.
-  2. **Isolated third-party dependencies** — a dependency needed only by one domain (e.g.
-     Playwright for weather) is declared only in that domain's `package.json`, never the other's.
-  3. **Table-level logic boundary** — weather code touches only `weather_*` tables; Copy Bot code
-     touches only its own tables. Sharing the physical `data/app.db` file and the `@copybot/db`
-     Drizzle client/schema is intentional, approved infrastructure — sharing *business logic* or
-     table access across domains is not.
-- Verify this holds (a plain repo-wide grep for cross-package imports/table references is
-  sufficient) any time new code is added to either domain — don't assume it stays true silently.
+## 0) STRICT REPOSITORY SCOPE — READ THIS FIRST
+- This repository contains only the **Copy Bot**: Polymarket wallet tracking, paper trading,
+  trade history, wallet research, and circuit-breaker behavior.
+- Other trading systems are maintained in separate workspaces. Do not add their code, runtime
+  imports, tables, migrations, dependencies, documentation, capital, PnL, or deployment controls
+  to this repository.
+- Verify this boundary with a repository-wide search whenever new packages, schema, or deployment
+  wiring are added.
 
-## 1) System Overview & Two-Part Architecture
-- This repository contains two distinct domains:
-  - Copy Bot: Polymarket wallet tracking, paper trading, trade history, and circuit-breaker behavior.
-  - Weather Bot: future arbitrage work, planned separately and intentionally isolated.
-- Keep these domains separated at all times. Never mix Copy Bot logic with Weather Bot logic, and never let their database tables or schema evolve as if they were one system. (See §0 above — this is the same rule, restated here because it was this file's original placement.)
+## 1) System Overview
+- Copy Bot covers Polymarket wallet tracking, paper trading, trade history, wallet research, and
+  circuit-breaker behavior.
+- Keep this repository single-purpose. Work for any other bot belongs in its own workspace.
 
 ## 2) Core Logic & Data Flow
 - The Copy Bot is driven by Python entrypoints such as bot.py, db.py, bullpen_client.py, and config.py. It polls Polymarket data through the bullpen CLI and uses the shared SQLite database for state and trade history.
-- The Weather Bot is not yet implemented; any weather-related work must remain isolated in packages/weather and its own schema/tables.
 - State and history come from two sources:
   - Polymarket data: bullpen CLI.
   - Persistent state/trade logs: data/app.db.

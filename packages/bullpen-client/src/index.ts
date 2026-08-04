@@ -1,7 +1,7 @@
 // TS twin of bullpen_client.py (repo root). Mirrors its exact subprocess
 // semantics — exit-code-aware error extraction, single-shot-by-default
 // retries, timeout-as-unknown-fill-state — so the new TS research/scoring
-// layer (packages/copy-trading, packages/weather) shells out to the same
+// layer (packages/copy-trading) shells out to the same
 // `bullpen` CLI the same way bot.py does. Keep the two in sync; this file
 // has no logic of its own beyond what bullpen_client.py already documents.
 
