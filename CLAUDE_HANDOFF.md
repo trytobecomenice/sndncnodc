@@ -111,8 +111,10 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
   staged nor pushed.
 - The fixed paper bot started as the single PID `75742` at 03:44:42 HKT. The first cycle had a
   one-time catch-up from IDs already evicted before the fix: 78 stale-market skips and 2 dust
-  `paper_sell` events. Those two sells covered only `$0.0882` cost basis and rounded to `$0.00`
-  PnL; no DB row was manually rewritten. Treat them as restart-contaminated observations.
+  `paper_sell` events. Those two sells covered only `$0.0133` cost basis and rounded to `$0.00`
+  PnL. Across the broken restart and this catch-up, all 18 replay sells together covered `$0.0882`
+  cost basis / `$0.00` rounded PnL. No DB row was manually rewritten; treat all 18 as
+  restart-contaminated observations.
 - After that catch-up, steady-state replay stopped: between the first and second TTP sweeps there
   were only 2 ordinary `skip_extreme_tail_entry_price` events, zero sells, and zero errors.
 - TTP marks completed at 03:45:13 and 03:50:38 HKT, a 5m25s interval versus the broken 8m02s.
@@ -198,5 +200,6 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
    - Restarted one paper-mode process (PID `75742`) with DB roster, OMS mirror, and dedup cap 500.
    - Verified TTP at 03:45:13 and 03:50:38 HKT, equity `$1,801.36`, 56 positions, kill switch off,
      and zero post-start errors.
-   - Replay churn stopped after one bounded catch-up. Two dust sells from that catch-up had
-     `$0.0882` combined cost basis and `$0.00` rounded PnL; left auditable, not manually hidden.
+   - Replay churn stopped after one bounded catch-up. Its 2 dust sells had `$0.0133` cost basis;
+     all 18 replay sells across both restarts had `$0.0882` combined cost basis and `$0.00`
+     rounded PnL. They were left auditable, not manually hidden.

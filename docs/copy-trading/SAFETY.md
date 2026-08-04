@@ -4299,7 +4299,8 @@ fast-forwarded with the production-only DB-roster and OMS-mirror overrides prese
 as exactly one paper-mode process (PID `75742`). TTP marks at 03:45:13 and 03:50:38 HKT were 5m25s
 apart; the interval contained only 2 ordinary extreme-tail skips, zero sells, and zero errors.
 Prometheus reported equity `$1,801.36`, 56 positions, and `kill_switch_active=0`. The first startup
-cycle's bounded residual catch-up did include 2 dust sells (`$0.0882` combined cost basis,
-`$0.00` rounded PnL); they remain visible as restart-contaminated audit evidence rather than being
-manually removed. After final documentation sync, both temporary pause/lock files were removed and
-normal watchdog/autodeploy operation resumed.
+cycle's bounded residual catch-up did include 2 dust sells (`$0.0133` combined cost basis,
+`$0.00` rounded PnL). Across both restarts, all 18 replay sells covered `$0.0882` cost basis /
+`$0.00` rounded PnL; they remain visible as restart-contaminated audit evidence rather than being
+manually removed. After final documentation sync, both temporary pause/lock files were removed
+and normal watchdog/autodeploy operation resumed.

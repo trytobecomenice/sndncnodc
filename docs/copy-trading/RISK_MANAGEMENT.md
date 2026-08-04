@@ -4422,11 +4422,13 @@ was gracefully stopped behind the existing watchdog pause sentinel while the fix
 live funds, wallet status, schema, or manual position edits were involved. Commit `93c193b` passed
 662 local tests and 655 tracked tests on EC2, then started as one paper-mode process. Its first
 cycle had one bounded catch-up from IDs already evicted before the fix (78 stale-market skips and
-2 dust sells covering `$0.0882` cost basis / `$0.00` rounded PnL); these are explicitly treated as
-restart-contaminated observations and were not manually hidden. The next five minutes contained
-only 2 ordinary extreme-tail skips, zero sells, and zero errors. TTP marks at 03:45:13 and 03:50:38
-HKT were 5m25s apart, versus the broken 8m02s; final equity was `$1,801.36`, 56 open positions,
-and the kill switch remained off. The watchdog/autodeploy controls were then returned to normal.
+2 dust sells covering `$0.0133` cost basis / `$0.00` rounded PnL). Across the broken restart and
+this catch-up, all 18 replay sells covered `$0.0882` combined cost basis / `$0.00` rounded PnL;
+these are explicitly treated as restart-contaminated observations and were not manually hidden.
+The next five minutes contained only 2 ordinary extreme-tail skips, zero sells, and zero errors.
+TTP marks at 03:45:13 and 03:50:38 HKT were 5m25s apart, versus the broken 8m02s; final equity was
+`$1,801.36`, 56 open positions, and the kill switch remained off. The watchdog/autodeploy controls
+were then returned to normal.
 
 ## What is intentionally still simple
 
