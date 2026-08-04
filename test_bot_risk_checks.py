@@ -495,9 +495,14 @@ class TestComputeWalletEvTStatistic(unittest.TestCase):
         self.assertIsNone(bot.compute_wallet_ev_t_statistic([]))
         self.assertIsNone(bot.compute_wallet_ev_t_statistic([0.5]))
 
-    def test_zero_variance_returns_none(self):
-        # Every return identical -- stdev is 0, t-stat undefined.
-        self.assertIsNone(bot.compute_wallet_ev_t_statistic([0.1, 0.1, 0.1]))
+    def test_zero_variance_positive_is_decisive(self):
+        self.assertEqual(bot.compute_wallet_ev_t_statistic([0.1, 0.1, 0.1]), float("inf"))
+
+    def test_zero_variance_negative_is_decisive(self):
+        self.assertEqual(bot.compute_wallet_ev_t_statistic([-1.0] * 10), float("-inf"))
+
+    def test_zero_variance_all_zero_is_neutral(self):
+        self.assertIsNone(bot.compute_wallet_ev_t_statistic([0.0, 0.0, 0.0]))
 
 
 class TestCheckCircuitBreakerEvBased(unittest.TestCase):

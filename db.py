@@ -430,7 +430,16 @@ def save_state(state):
         conn.close()
 
 
-def load_shadow_positions():
+_SHADOW_STRATEGIES = {"shadow_rehab", "shadow_challenger"}
+
+
+def _validate_shadow_strategy(strategy):
+    if strategy not in _SHADOW_STRATEGIES:
+        raise ValueError(f"unsupported shadow strategy: {strategy!r}")
+    return strategy
+
+
+def load_shadow_positions(strategy="shadow_rehab"):
     """Shadow Rehab (2026-07-27, Rule 37): same shape/keying as
     load_state()'s positions (wallet|market_slug|outcome -> shares/
     cost_basis_usd/avg_entry_price/buy_count), but sourced from
@@ -441,12 +450,14 @@ def load_shadow_positions():
     before this was added) -- a wrong number here can only affect a
     future rehab decision, never real capital.
     """
+    strategy = _validate_shadow_strategy(strategy)
     conn = _connect()
     try:
         cur = conn.execute(
             "SELECT wallet_address, market_slug, outcome, our_shares, cost_basis_usd, "
             "avg_entry_price, buy_count FROM paper_trade "
-            "WHERE status = 'open' AND strategy = 'shadow_rehab' AND is_demo_data = 0"
+            "WHERE status = 'open' AND strategy = ? AND is_demo_data = 0",
+            (strategy,),
         )
         shadow_positions = {}
         for row in cur.fetchall():
@@ -462,7 +473,7 @@ def load_shadow_positions():
         conn.close()
 
 
-def save_shadow_positions(shadow_positions):
+def save_shadow_positions(shadow_positions, strategy="shadow_rehab"):
     """Diffs shadow_positions against strategy='shadow_rehab' rows -- same
     insert/update/fail-safe-close pattern as save_state()'s positions
     handling, deliberately scoped to just this one dict (no
@@ -470,11 +481,13 @@ def save_shadow_positions(shadow_positions):
     linkage: shadow trades aren't real copy decisions in the Rule 22
     sense, they're a simulation).
     """
+    strategy = _validate_shadow_strategy(strategy)
     conn = _connect()
     try:
         cur = conn.execute(
             "SELECT id, wallet_address, market_slug, outcome FROM paper_trade "
-            "WHERE status = 'open' AND strategy = 'shadow_rehab' AND is_demo_data = 0"
+            "WHERE status = 'open' AND strategy = ? AND is_demo_data = 0",
+            (strategy,),
         )
         existing = {
             (r["wallet_address"], r["market_slug"], r["outcome"]): r["id"] for r in cur.fetchall()
@@ -502,9 +515,9 @@ def save_shadow_positions(shadow_positions):
                 conn.execute(
                     "INSERT INTO paper_trade (id, strategy, wallet_address, market_slug, outcome, "
                     "our_size_usd, cost_basis_usd, our_shares, avg_entry_price, buy_count, status, "
-                    "opened_at) VALUES (?, 'shadow_rehab', ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)",
+                    "opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)",
                     (
-                        _new_id(), trader, market_slug, outcome, cost_basis, cost_basis,
+                        _new_id(), strategy, trader, market_slug, outcome, cost_basis, cost_basis,
                         shares, avg_entry, buy_count, _now_ts(),
                     ),
                 )
@@ -554,6 +567,51 @@ def get_shadow_rehab_returns(wallet_address, limit=None):
         conn.close()
 
 
+def get_shadow_returns(wallet_address, strategy, limit=None, min_cost_basis_usd=0.0):
+    """Generic realized-return reader for isolated shadow ledgers.
+
+    Challenger qualification uses ``shadow_challenger`` with the same
+    non-dust floor as the real circuit breaker. ``get_shadow_rehab_returns``
+    stays unchanged for backward compatibility and its rolling-window use.
+    """
+    strategy = _validate_shadow_strategy(strategy)
+    conn = _connect()
+    try:
+        query = (
+            "SELECT realized_pnl_usd, cost_basis_usd FROM paper_trade "
+            "WHERE lower(wallet_address) = ? AND strategy = ? AND status = 'closed' "
+            "AND is_demo_data = 0 AND cost_basis_usd >= ? ORDER BY closed_at ASC"
+        )
+        params = [wallet_address.lower(), strategy, min_cost_basis_usd]
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        return [
+            row["realized_pnl_usd"] / row["cost_basis_usd"]
+            for row in rows if row["cost_basis_usd"] and row["realized_pnl_usd"] is not None
+        ]
+    finally:
+        conn.close()
+
+
+def abandon_open_shadow_positions(wallet_address, strategy, reason):
+    """Close an isolated shadow ledger without fabricating realized PnL."""
+    strategy = _validate_shadow_strategy(strategy)
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE paper_trade SET status='closed', closed_at=?, close_reason=?, "
+            "realized_pnl_usd=NULL WHERE lower(wallet_address)=? AND strategy=? "
+            "AND status='open' AND is_demo_data=0",
+            (_now_ts(), reason, wallet_address.lower(), strategy),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
 # event_type (+ side, for the ambiguous skip_wide_spread case) -> DecisionJournal
 # decisionType. Only events that represent an actual copy/skip decision on a
 # BUY signal are journaled here — SELL-side events are position management,
@@ -566,7 +624,7 @@ def _decision_type_for_event(event_type, side):
     if event_type == "skip_wide_spread" and side == "BUY":
         return "skip"
     # Portfolio-risk gates (risk_manager.py) — all BUY-only by construction.
-    if event_type in ("skip_risk_kill_switch", "skip_risk_exposure_ceiling",
+    if event_type in ("skip_risk_kill_switch", "skip_risk_drawdown_warning", "skip_risk_exposure_ceiling",
                       "skip_risk_event_cap", "skip_risk_event_unresolved"):
         return "skip"
     # "Disciplined Taker" price ceiling (bot.py's check_slippage_ceiling) —
@@ -598,6 +656,9 @@ _CLOSE_REASON_BY_EVENT = {
     "paper_sell": ("source_sell", False, "bot_filtered"),
     "live_sell": ("source_sell", False, "bot_filtered"),
     "shadow_rehab_sell": ("source_sell", False, "shadow_rehab"),
+    "shadow_rehab_resolved": ("resolved", True, "shadow_rehab"),
+    "shadow_challenger_sell": ("source_sell", False, "shadow_challenger"),
+    "shadow_challenger_resolved": ("resolved", True, "shadow_challenger"),
 }
 
 
@@ -690,6 +751,16 @@ def append_log(event):
         # can otherwise sit undiscovered for hours.
         telegram_alerts.send_telegram_alert(
             f"\U0001F6A8 Kill switch TRIGGERED: {'; '.join(event.get('reasons', []))}"
+        )
+    elif event_type == "risk_drawdown_warning_triggered":
+        telegram_alerts.send_telegram_alert(
+            f"⚠️ Copy Bot drawdown warning: equity ${event.get('equity', 0):.2f}, "
+            f"drawdown ${event.get('drawdown_usd', 0):.2f}. New BUYs paused; exits continue."
+        )
+    elif event_type == "risk_drawdown_warning_cleared":
+        telegram_alerts.send_telegram_alert(
+            f"✅ Copy Bot drawdown warning cleared: equity ${event.get('equity', 0):.2f}. "
+            f"New BUYs resumed."
         )
     elif event_type == "error":
         _maybe_send_throttled_error_alert(event)
@@ -794,6 +865,30 @@ def get_tracked_traders():
             f"or set TRACKED_TRADERS_SOURCE back to 'static' in config.py."
         )
     return {row["wallet_address"]: (row["nickname"] or row["wallet_address"]) for row in rows}
+
+
+def get_monitored_noncopying_traders():
+    """Return challenger/retiring wallets that must stay on the feed.
+
+    Challengers generate isolated shadow evidence; retiring wallets accept
+    no new BUYs but remain monitored so existing real positions still see
+    source SELLs. Values include the explicit mode for bot.py's router.
+    """
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT wallet_address, nickname, status FROM wallet_profile "
+            "WHERE status IN ('challenger', 'retiring')"
+        ).fetchall()
+        return {
+            row["wallet_address"]: {
+                "nickname": row["nickname"] or row["wallet_address"],
+                "mode": row["status"],
+            }
+            for row in rows
+        }
+    finally:
+        conn.close()
 
 
 def get_wallet_composite_scores():
@@ -981,7 +1076,7 @@ def get_pool_refill_candidates(exclude_addresses_lower, min_composite_score, lim
         query = (
             "SELECT wallet_address, nickname, composite_score, win_rate, "
             "trade_count_all_time, category FROM wallet_profile "
-            "WHERE composite_score >= ? ORDER BY composite_score DESC"
+            "WHERE composite_score >= ? AND status = 'watch' ORDER BY composite_score DESC"
         )
         rows = conn.execute(query, (min_composite_score,)).fetchall()
     finally:
@@ -990,6 +1085,119 @@ def get_pool_refill_candidates(exclude_addresses_lower, min_composite_score, lim
     excluded = {a.lower() for a in exclude_addresses_lower}
     candidates = [dict(r) for r in rows if r["wallet_address"].lower() not in excluded]
     return candidates[:limit] if limit else candidates
+
+
+def set_wallet_status(wallet_address, status, reason, now=None):
+    now_ts = int((now or datetime.now(timezone.utc)).timestamp())
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE wallet_profile SET status = ?, status_reason = ?, status_changed_at = ?, "
+            "updated_at = ? WHERE lower(wallet_address) = ?",
+            (status, reason, now_ts, now_ts, wallet_address.lower()),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def get_wallets_by_status(status):
+    conn = _connect()
+    try:
+        return [dict(row) for row in conn.execute(
+            "SELECT wallet_address, nickname, status, status_reason, status_changed_at, "
+            "composite_score, win_rate, trade_count_all_time, category, circuit_breaker_muted "
+            "FROM wallet_profile WHERE status = ? ORDER BY composite_score DESC",
+            (status,),
+        ).fetchall()]
+    finally:
+        conn.close()
+
+
+def get_active_tracked_count():
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT count(*) AS n FROM wallet_profile "
+            "WHERE status = 'track' AND circuit_breaker_muted = 0"
+        ).fetchone()
+        return int(row["n"])
+    finally:
+        conn.close()
+
+
+def get_replacement_wallet_candidate():
+    """Worst muted tracked wallet, ranked by realized copy PnL then EV."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT wp.wallet_address, wp.nickname, count(pt.id) AS trade_count, "
+            "COALESCE(sum(pt.realized_pnl_usd), 0) AS realized_pnl_usd, "
+            "avg(pt.realized_pnl_usd / nullif(pt.cost_basis_usd, 0)) AS ev_pct "
+            "FROM wallet_profile wp LEFT JOIN paper_trade pt "
+            "ON lower(pt.wallet_address) = lower(wp.wallet_address) "
+            "AND pt.strategy = 'bot_filtered' AND pt.status = 'closed' "
+            "WHERE wp.status = 'track' AND wp.circuit_breaker_muted = 1 "
+            "GROUP BY wp.wallet_address ORDER BY realized_pnl_usd ASC, ev_pct ASC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def has_pending_wallet_approval(wallet_address, source=None):
+    conn = _connect()
+    try:
+        query = "SELECT 1 FROM wallet_approval_request WHERE lower(wallet_address) = ? AND status = 'pending'"
+        params = [wallet_address.lower()]
+        if source:
+            query += " AND source = ?"
+            params.append(source)
+        return conn.execute(query, params).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def create_wallet_approval_request(wallet_address, requested_tier, source,
+                                   score_snapshot, reason, category=None, now=None):
+    now_ts = int((now or datetime.now(timezone.utc)).timestamp())
+    conn = _connect()
+    try:
+        row_id = _new_id()
+        conn.execute(
+            "INSERT INTO wallet_approval_request (id, wallet_address, requested_tier, source, "
+            "category, score_snapshot_json, reason, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (row_id, wallet_address.lower(), requested_tier, source, category,
+             json.dumps(score_snapshot), reason, now_ts),
+        )
+        conn.commit()
+        return row_id
+    finally:
+        conn.close()
+
+
+def retire_completed_wallets():
+    """Move retiring wallets to watch once no real position remains open."""
+    now = _now_ts()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT wp.wallet_address FROM wallet_profile wp WHERE wp.status = 'retiring' "
+            "AND NOT EXISTS (SELECT 1 FROM paper_trade pt WHERE pt.strategy = 'bot_filtered' "
+            "AND pt.status = 'open' AND lower(pt.wallet_address) = lower(wp.wallet_address))"
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE wallet_profile SET status='watch', status_reason=?, status_changed_at=?, "
+                "updated_at=? WHERE wallet_address=?",
+                ("retirement complete: no open Copy Bot positions", now, now, row["wallet_address"]),
+            )
+        conn.commit()
+        return [row["wallet_address"] for row in rows]
+    finally:
+        conn.close()
 
 
 # --- Portfolio-risk state (bot_risk_state / bot_market_event) ----------------
@@ -1226,6 +1434,85 @@ def realized_pnl_today(now=None):
             (*_REALIZED_PNL_EVENT_TYPES, start_of_day),
         )
         return float(cur.fetchone()["total"])
+    finally:
+        conn.close()
+
+
+def realized_pnl_since(start_timestamp):
+    """Realized Copy Bot PnL whose ledger event was recorded at/after an epoch."""
+    conn = _connect()
+    try:
+        placeholders = ", ".join("?" for _ in _REALIZED_PNL_EVENT_TYPES)
+        row = conn.execute(
+            f"SELECT COALESCE(SUM(json_extract(payload_json, '$.pnl_usd')), 0) AS total "
+            f"FROM bot_event_log WHERE event_type IN ({placeholders}) AND timestamp >= ?",
+            (*_REALIZED_PNL_EVENT_TYPES, int(start_timestamp)),
+        ).fetchone()
+        return float(row["total"])
+    finally:
+        conn.close()
+
+
+def get_or_create_evaluation_epoch(now=None):
+    """Return the immutable clean-forward-test epoch, creating it atomically once.
+
+    Stored in bot_risk_state instead of config so deployments/restarts never
+    silently reset the clean cohort. Historical rows remain untouched.
+    """
+    epoch = int((now or datetime.now(timezone.utc)).timestamp())
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT value_json FROM bot_risk_state WHERE key = 'clean_evaluation_epoch'"
+        ).fetchone()
+        if row:
+            return int(json.loads(row["value_json"]))
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_risk_state (key, value_json, updated_at) VALUES (?, ?, ?)",
+            ("clean_evaluation_epoch", json.dumps(epoch), epoch),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT value_json FROM bot_risk_state WHERE key = 'clean_evaluation_epoch'"
+        ).fetchone()
+        return int(json.loads(row["value_json"]))
+    finally:
+        conn.close()
+
+
+def get_closed_trade_stats_since(start_timestamp, strategy="bot_filtered"):
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT count(*) AS closed_count, "
+            "sum(CASE WHEN realized_pnl_usd > 0 THEN 1 ELSE 0 END) AS wins "
+            "FROM paper_trade WHERE strategy = ? AND status = 'closed' "
+            "AND closed_at >= ? AND is_demo_data = 0",
+            (strategy, int(start_timestamp)),
+        ).fetchone()
+        count = int(row["closed_count"] or 0)
+        wins = int(row["wins"] or 0)
+        return {"closed_count": count, "win_rate": (wins / count if count else None)}
+    finally:
+        conn.close()
+
+
+def record_pnl_snapshot(scope, realized_pnl_usd, unrealized_pnl_usd,
+                        open_positions_count, closed_trades_count, win_rate,
+                        strategy="bot_filtered", wallet_address=None, now=None):
+    """Append a five-minute mark-to-market snapshot for dashboards/audits."""
+    captured_at = int((now or datetime.now(timezone.utc)).timestamp())
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO pnl_snapshot (id, captured_at, scope, strategy, wallet_address, "
+            "realized_pnl_usd, unrealized_pnl_usd, open_positions_count, "
+            "closed_trades_count, win_rate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (_new_id(), captured_at, scope, strategy, wallet_address,
+             realized_pnl_usd, unrealized_pnl_usd, open_positions_count,
+             closed_trades_count, win_rate),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -1477,7 +1764,8 @@ def resolve_wallet_approval_request(request_id, resolved_status):
     conn = _connect()
     try:
         cur = conn.execute(
-            "SELECT wallet_address, requested_tier, status FROM wallet_approval_request WHERE id = ?",
+            "SELECT wallet_address, requested_tier, source, score_snapshot_json, status "
+            "FROM wallet_approval_request WHERE id = ?",
             (request_id,),
         )
         row = cur.fetchone()
@@ -1490,11 +1778,46 @@ def resolve_wallet_approval_request(request_id, resolved_status):
             (resolved_status, now, request_id),
         )
         if resolved_status == "approved":
+            snapshot = json.loads(row["score_snapshot_json"] or "{}")
+            replacement = snapshot.get("replacementWalletAddress")
+            if row["source"] == "challenger_shadow" and replacement:
+                # One-in-one-out is transactional. Retiring blocks new BUYs
+                # but stays on the monitored feed until its final real
+                # position exits; retire_completed_wallets() then moves it
+                # to watch.
+                conn.execute(
+                    "UPDATE wallet_profile SET status = 'retiring', status_reason = ?, "
+                    "status_changed_at = ?, updated_at = ? WHERE lower(wallet_address) = ? "
+                    "AND status = 'track'",
+                    (f"replaced by approved challenger {row['wallet_address']}", now, now,
+                     replacement.lower()),
+                )
+            if row["requested_tier"] == "track":
+                conn.execute(
+                    "UPDATE wallet_profile SET status = ?, status_reason = ?, status_changed_at = ?, "
+                    "updated_at = ?, circuit_breaker_muted = 0, mute_reason = NULL, muted_at = NULL "
+                    "WHERE wallet_address = ?",
+                    (row["requested_tier"], "approved via Telegram wallet-approval workflow", now, now,
+                     row["wallet_address"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE wallet_profile SET status = ?, status_reason = ?, status_changed_at = ?, "
+                    "updated_at = ? WHERE wallet_address = ?",
+                    (row["requested_tier"], "approved via Telegram wallet-approval workflow", now, now,
+                     row["wallet_address"]),
+                )
+        elif row["source"] == "challenger_shadow":
             conn.execute(
-                "UPDATE wallet_profile SET status = ?, status_reason = ?, status_changed_at = ? "
-                "WHERE wallet_address = ?",
-                (row["requested_tier"], "approved via Telegram wallet-approval workflow", now,
-                 row["wallet_address"]),
+                "UPDATE wallet_profile SET status = 'watch', status_reason = ?, "
+                "status_changed_at = ?, updated_at = ? WHERE wallet_address = ?",
+                ("challenger promotion rejected via Telegram", now, now, row["wallet_address"]),
+            )
+            conn.execute(
+                "UPDATE paper_trade SET status='closed', closed_at=?, close_reason=?, "
+                "realized_pnl_usd=NULL WHERE lower(wallet_address)=? "
+                "AND strategy='shadow_challenger' AND status='open' AND is_demo_data=0",
+                (now, "challenger_promotion_rejected", row["wallet_address"].lower()),
             )
         conn.commit()
         return True

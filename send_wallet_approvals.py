@@ -57,6 +57,18 @@ def format_candidate_message(request):
         lines.append(f"roi: {snapshot['roi']*100:.1f}%")
     if snapshot.get("washTradingSuspect"):
         lines.append("⚠ WASH-TRADING SUSPECT — review before approving")
+    if request.get("source") == "challenger_shadow":
+        lines.append("\n🧪 CLEAN SHADOW EVIDENCE")
+        lines.append(f"shadow closes: {snapshot.get('tradeCount', 0)}")
+        if snapshot.get("shadowAgeDays") is not None:
+            lines.append(f"shadow age: {snapshot['shadowAgeDays']:.1f} days")
+        if snapshot.get("meanReturn") is not None:
+            lines.append(f"mean return/trade: {snapshot['meanReturn']*100:.2f}%")
+        if snapshot.get("lowerConfidenceBound") is not None:
+            lines.append(f"one-sided LCB: {snapshot['lowerConfidenceBound']*100:.2f}%")
+        replacement = snapshot.get("replacementNickname") or snapshot.get("replacementWalletAddress")
+        if replacement:
+            lines.append(f"one-in-one-out: retires {replacement}")
     lines.append(f"\n{request['reason']}")
     return "\n".join(lines)
 

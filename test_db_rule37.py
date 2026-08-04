@@ -107,6 +107,14 @@ class TestShadowPositionPersistence(_TempDbTestCase):
         loaded = db.load_shadow_positions()
         self.assertEqual(loaded, shadow_positions)
 
+    def test_challenger_ledger_is_separate_from_rehab(self):
+        challenger = {"0xabc|some-market|Yes": {
+            "shares": 10.0, "cost_basis_usd": 5.0, "avg_entry_price": 0.5, "buy_count": 1,
+        }}
+        db.save_shadow_positions(challenger, "shadow_challenger")
+        self.assertEqual(db.load_shadow_positions("shadow_challenger"), challenger)
+        self.assertEqual(db.load_shadow_positions("shadow_rehab"), {})
+
     def test_real_bot_filtered_positions_never_appear_in_shadow_load(self):
         self._insert_paper_trade("0xabc", "some-market", "Yes", strategy="bot_filtered")
         self.assertEqual(db.load_shadow_positions(), {})
@@ -188,6 +196,20 @@ class TestMaybeClosePaperTradeStrategyScoping(_TempDbTestCase):
         rows = {r["strategy"]: r["status"] for r in conn.execute("SELECT * FROM paper_trade").fetchall()}
         conn.close()
         self.assertEqual(rows["shadow_rehab"], "closed")
+        self.assertEqual(rows["bot_filtered"], "open")
+
+    def test_shadow_challenger_sell_only_closes_challenger_row(self):
+        self._insert_paper_trade("0xabc", "m1", "Yes", strategy="bot_filtered", status="open")
+        self._insert_paper_trade("0xabc", "m1", "Yes", strategy="shadow_challenger", status="open")
+        db.append_log({
+            "event_type": "shadow_challenger_sell", "trader_address": "0xabc", "timestamp": "t",
+            "market_slug": "m1", "outcome": "Yes", "our_shares_remaining": 0.0,
+            "pnl_usd": 1.0,
+        })
+        conn = sqlite3.connect(self.tmp_path)
+        rows = dict(conn.execute("SELECT strategy,status FROM paper_trade").fetchall())
+        conn.close()
+        self.assertEqual(rows["shadow_challenger"], "closed")
         self.assertEqual(rows["bot_filtered"], "open")
 
     def test_paper_sell_only_closes_the_real_row(self):

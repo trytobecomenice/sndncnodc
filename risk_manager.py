@@ -202,7 +202,7 @@ def depth_capped_trade_size_usd(trade_size_usd, book_depth_usd, depth_fraction):
 
 
 def check_buy(positions, market_to_event, event_slug, trade_usd, kill_switch, wallet_address=None,
-               wallet_ev_stats=None):
+               wallet_ev_stats=None, drawdown_warning=None):
     """The pre-BUY risk gate. Returns (ok, skip_event_type, reason):
     (True, None, None) if the BUY may proceed, otherwise ok=False with the
     bot_event_log event_type to log and a human-readable reason.
@@ -231,6 +231,15 @@ def check_buy(positions, market_to_event, event_slug, trade_usd, kill_switch, wa
             f"kill switch latched since {kill_switch.get('triggered_at', '?')}: "
             f"{'; '.join(reasons) if reasons else 'unknown trigger'} — run "
             f"reset_kill_switch.py after review to resume buying"
+        )
+
+    if drawdown_warning and config.DRAWDOWN_WARNING_PAUSE_BUYS:
+        return False, "skip_risk_drawdown_warning", (
+            f"drawdown warning active since {drawdown_warning.get('triggered_at', '?')}: "
+            f"equity ${drawdown_warning.get('equity', 0):.2f} is "
+            f"${drawdown_warning.get('drawdown_usd', 0):.2f} below peak — "
+            f"new BUYs resume automatically after drawdown recovers below "
+            f"{config.DRAWDOWN_WARNING_RECOVERY_FRACTION:.0%} of the hard limit"
         )
 
     if config.MAX_TOTAL_EXPOSURE_USD is not None:
@@ -364,3 +373,39 @@ def evaluate_equity(equity, prior_hwm):
             f"exceeding max drawdown ${config.MAX_DRAWDOWN_FROM_PEAK_USD:.2f}"
         )
     return hwm, triggers
+
+
+def evaluate_drawdown_warning(equity, hwm, current_warning=None, now_iso=None):
+    """Return ``(new_warning, transition)`` for the reversible pre-kill gate.
+
+    ``transition`` is ``"triggered"``, ``"cleared"``, or ``None``. The
+    warning enters at DRAWDOWN_WARNING_FRACTION of the hard drawdown limit
+    and clears only after recovery below DRAWDOWN_WARNING_RECOVERY_FRACTION,
+    providing hysteresis so BUYs do not flap on/off around one price tick.
+    A disabled hard drawdown limit disables this warning too.
+    """
+    limit = config.MAX_DRAWDOWN_FROM_PEAK_USD
+    if limit is None or hwm is None:
+        return None, "cleared" if current_warning else None
+
+    drawdown = max(0.0, hwm - equity)
+    trigger_at = limit * config.DRAWDOWN_WARNING_FRACTION
+    recover_below = limit * config.DRAWDOWN_WARNING_RECOVERY_FRACTION
+
+    if current_warning:
+        if drawdown <= recover_below:
+            return None, "cleared"
+        updated = dict(current_warning)
+        updated.update({"equity": equity, "hwm": hwm, "drawdown_usd": drawdown})
+        return updated, None
+
+    if drawdown >= trigger_at:
+        return {
+            "triggered_at": now_iso,
+            "equity": equity,
+            "hwm": hwm,
+            "drawdown_usd": drawdown,
+            "warning_threshold_usd": trigger_at,
+            "recovery_threshold_usd": recover_below,
+        }, "triggered"
+    return None, None

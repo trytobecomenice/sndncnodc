@@ -4421,6 +4421,39 @@ TTP marks at 03:45:13 and 03:50:38 HKT were 5m25s apart, versus the broken 8m02s
 `$1,801.36`, 56 open positions, and the kill switch remained off. The watchdog/autodeploy controls
 were then returned to normal.
 
+## 51. Clean forward-test controls and evidence-gated roster replacement (2026-08-05)
+
+**Trigger:** the production audit found that headline `+$639.74` realized PnL was not robust: one
+2026-07-31 resolution batch contributed `+$699.63`, while 2026-08-01 through 2026-08-04 contributed
+`-$59.89`; `strict-7` alone contributed `+$907.65`. It also found `strict-5` active despite 40/40
+losses because ten identical -100% saved returns have zero variance and the old t-stat helper
+returned `None`.
+
+**Circuit-breaker correction:** zero-variance negative/positive windows now return decisive
+`-inf`/`+inf` evidence; all-zero stays neutral. Startup re-evaluates every persisted tracked-wallet
+window before polling and persists any newly required mute, so a restart/manual roster change
+cannot bypass the same rule applied after a fresh close.
+
+**Clean epoch and PnL:** the first upgraded startup atomically creates
+`bot_risk_state.clean_evaluation_epoch`. Historical rows remain untouched. Every TTP sweep writes
+two `pnl_snapshot` rows: full `portfolio`, and `clean_epoch`, whose realized closes and open marks
+begin at that immutable timestamp.
+
+**Pre-kill warning:** at 75% of the hard drawdown allowance, a persisted warning pauses new BUYs
+and sends Telegram once; exits continue. It clears automatically only after recovery below 60%,
+providing hysteresis. The hard kill switch remains unchanged and dominant.
+
+**Challenger replacement:** scored, never-before-tracked wallets may enter `challenger`, which is
+polled but routed only to `strategy='shadow_challenger'`. Promotion requires at least 7 days, 20
+non-dust closes, and a positive one-sided lower confidence bound after the same simulated
+slippage/fees as paper copying. The system then queues Telegram approval; approval atomically sets
+the challenger to `track` and the worst muted tracked wallet to `retiring`. Retiring blocks BUYs
+but stays polled for exits until no real position remains, then becomes `watch`.
+
+**Rollout:** code and tests were completed on 2026-08-05, but production activation is deliberately
+deferred to the controlled checklist in `docs/TODO_2026-08-06.md` because EC2 has intentional
+uncommitted `config.py` overrides and the new startup audit changes roster state.
+
 ## What is intentionally still simple
 
 The current setup is conservative by design — it focuses on avoiding obvious bad fills, bad

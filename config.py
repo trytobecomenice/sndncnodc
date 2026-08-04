@@ -378,6 +378,12 @@ MAX_BUYS_PER_TRADER_OUTCOME = 2
 MUTE_EV_MIN_SAMPLES = 10
 MUTE_MIN_TRADE_COST_USD = 1.0
 
+# Startup circuit-breaker audit (2026-08-05): persisted recent returns are
+# re-evaluated before the first poll. This closes the restart/manual-state
+# gap where a wallet can be status='track' with a decisively negative saved
+# window but no fresh close arrives to call check_circuit_breaker().
+REEVALUATE_CIRCUIT_BREAKERS_ON_STARTUP = True
+
 # Shadow Rehab (2026-07-27, Rule 37 -- the roadmap item Rule 35 deferred).
 # A muted wallet's mute was previously permanent: check_circuit_breaker()
 # only ever LATCHES a mute, and process_trade() blocks all new real BUYs
@@ -434,6 +440,13 @@ TRAILING_TP_DRAWDOWN_PCT = 0.10
 # trade copies by minutes and hammer the API. The sweep is time-gated inside
 # the poll loop; worst case a pullback is noticed this many seconds late.
 TRAILING_TP_CHECK_INTERVAL_SECONDS = 300
+
+# Five-minute mark-to-market observability reuses the 300-second TTP sweep
+# above, so it adds no market-data calls. The warning is a reversible soft
+# BUY pause; SELL and closeout paths remain available.
+DRAWDOWN_WARNING_FRACTION = 0.75
+DRAWDOWN_WARNING_RECOVERY_FRACTION = 0.60
+DRAWDOWN_WARNING_PAUSE_BUYS = True
 
 # How often the resolved-market sweep runs (see run_closeout_sweep in
 # bot.py). Each sweep checks every open position's market for resolution
@@ -1144,6 +1157,18 @@ POOL_REFILL_CANDIDATE_FETCH_MULTIPLIER = 4
 # 50 is a quick-look sample, not a full history -- enough to see a
 # repeated-quote pattern if one exists, not meant to be exhaustive.
 POOL_REFILL_ACTIVITY_SAMPLE_SIZE = 50
+
+# Challenger pipeline (2026-08-05): scored, never-before-tracked wallets are
+# shadow-copied before a Telegram promotion request can exist. Qualification
+# needs both elapsed time and enough non-dust closed observations; the lower
+# confidence bound must be positive after copy slippage/fees because those are
+# already included in shadow_challenger realized PnL.
+CHALLENGER_MIN_AGE_DAYS = 7
+CHALLENGER_MIN_CLOSED_TRADES = 20
+CHALLENGER_LCB_Z = 1.645
+CHALLENGER_POOL_MULTIPLIER = 2
+CHALLENGER_POOL_MAX = 10
+ROSTER_REFRESH_INTERVAL_SECONDS = 300
 
 # --- Phase 1 observability (2026-07-31): Prometheus metrics + Telegram
 # alerts -- see docs/copy-trading/SAFETY.md Sec.54. Built directly in

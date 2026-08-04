@@ -1414,6 +1414,44 @@ def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_
                         "error": f"closeout redeem failed: {e}"})
 
 
+def run_shadow_closeout_sweep(shadow_positions, shadow_kind):
+    """Resolve shadow ledgers when source redemptions never emit a SELL."""
+    if shadow_kind not in ("rehab", "challenger"):
+        raise ValueError(f"unsupported shadow kind: {shadow_kind!r}")
+    resolution_cache = {}
+    for key in list(shadow_positions):
+        if SHUTDOWN_REQUESTED:
+            return
+        pos = shadow_positions.get(key)
+        parts = key.split("|")
+        if not pos or len(parts) != 3:
+            continue
+        trader, market_slug, outcome = parts
+        if market_slug not in resolution_cache:
+            try:
+                resolution_cache[market_slug] = _parse_market_resolution(
+                    polymarket_simulator.fetch_market_metadata(market_slug)
+                )
+            except Exception:
+                resolution_cache[market_slug] = None
+        final_prices = resolution_cache[market_slug]
+        if final_prices is None or outcome.lower() not in final_prices:
+            continue
+        final_price = final_prices[outcome.lower()]
+        proceeds_usd = pos["shares"] * final_price
+        pnl_usd = proceeds_usd - pos["cost_basis_usd"]
+        del shadow_positions[key]
+        append_log({"timestamp": now_iso(),
+                    "event_type": f"shadow_{shadow_kind}_resolved",
+                    "trader_address": trader, "market_slug": market_slug,
+                    "outcome": outcome, "final_price": final_price,
+                    "our_shares_closed": pos["shares"],
+                    "our_shares_remaining": 0.0,
+                    "proceeds_usd": proceeds_usd,
+                    "cost_basis_usd": pos["cost_basis_usd"],
+                    "pnl_usd": pnl_usd, "mode": "paper"})
+
+
 def sweep_pending_executions(positions, source_positions, source_cost_basis,
                               tracked_by_lower, risk_state, wallet_scores, wallet_ev_stats=None):
     """Rule 29's TTL/rebound/whale-hold sweep (2026-07-24) — runs every poll
@@ -2108,11 +2146,13 @@ def _handle_matched_whale_event(event, positions, source_positions, source_cost_
 # startup and threads the result through as `tracked_by_lower` everywhere
 # below that used to read config.TRACKED_TRADERS directly.
 from db import (  # noqa: E402
-    load_state, save_state, append_log, get_tracked_traders, get_wallet_composite_scores,
+    load_state, save_state, append_log, get_tracked_traders, get_monitored_noncopying_traders,
+    get_wallet_composite_scores,
     get_wallet_realized_ev_stats,
     get_risk_value, set_risk_value, clear_risk_value, load_market_events, save_market_event,
     load_market_categories, save_market_category, get_active_rule_set_version,
-    realized_pnl_total, prune_event_log,
+    realized_pnl_total, realized_pnl_since, get_or_create_evaluation_epoch,
+    get_closed_trade_stats_since, record_pnl_snapshot, prune_event_log,
     create_pending_execution, get_pending_execution, get_pending_executions,
     update_pending_execution_anchor, update_pending_execution_lowest_seen,
     close_pending_execution,
@@ -2348,10 +2388,9 @@ def compute_wallet_ev_t_statistic(returns):
     decision; consistency with the established precedent, not a new
     inconsistency.
 
-    Returns None if there are fewer than 2 samples (stdev undefined) or
-    every return is identical (zero variance, division by zero) -- callers
-    treat None as "not enough evidence either way", same convention as
-    should_skip_category()'s own None handling.
+    Returns None if there are fewer than 2 samples. For zero variance,
+    identical negative/positive samples return -inf/+inf respectively;
+    only an all-zero sample remains neutral (None).
     """
     n = len(returns)
     if n < 2:
@@ -2364,6 +2403,14 @@ def compute_wallet_ev_t_statistic(returns):
     # representation error, which would otherwise blow stderr up toward
     # zero and t toward a meaningless, arbitrarily huge magnitude.
     if variance < 1e-12:
+        # Identical negative observations are not "no evidence". The old
+        # None branch left strict-5 active after ten consecutive -100%
+        # returns because its variance was exactly zero. Preserve the
+        # undefined/neutral result only when the identical mean is zero.
+        if mean < 0:
+            return float("-inf")
+        if mean > 0:
+            return float("inf")
         return None
     stderr = (variance / n) ** 0.5
     return mean / stderr
@@ -2379,7 +2426,7 @@ def _shadow_wallet_cost_basis_usd(trader, shadow_positions):
 
 
 def _execute_shadow_buy(base_event, key, trader, market_slug, outcome, price, shadow_positions,
-                         wallet_ev_stats=None):
+                         wallet_ev_stats=None, shadow_kind="rehab"):
     """Shadow Rehab (2026-07-27, Rule 37): books a hypothetical copy of a
     MUTED wallet's real buy into an isolated ledger
     (paper_trade.strategy="shadow_rehab" once persisted via
@@ -2414,9 +2461,12 @@ def _execute_shadow_buy(base_event, key, trader, market_slug, outcome, price, sh
     shadow buys are simply skipped (existing open shadow positions are left
     alone to resolve naturally) until they close and free up room.
     """
+    if shadow_kind not in ("rehab", "challenger"):
+        raise ValueError(f"unsupported shadow kind: {shadow_kind!r}")
+    event_prefix = f"shadow_{shadow_kind}"
     cap = risk_manager.wallet_exposure_cap_usd(trader, wallet_ev_stats)
     if cap is not None and _shadow_wallet_cost_basis_usd(trader, shadow_positions) >= cap:
-        append_log({**base_event, "event_type": "skip_shadow_rehab_wallet_cap",
+        append_log({**base_event, "event_type": f"skip_{event_prefix}_wallet_cap",
                     "reason": f"shadow cost basis at/above wallet cap ${cap:.2f}"})
         return
 
@@ -2443,7 +2493,7 @@ def _execute_shadow_buy(base_event, key, trader, market_slug, outcome, price, sh
     pos["buy_count"] = pos.get("buy_count", 0) + 1
     shadow_positions[key] = pos
 
-    append_log({**base_event, "event_type": "shadow_rehab_buy",
+    append_log({**base_event, "event_type": f"{event_prefix}_buy",
                 "our_trade_usd": trade_usd, "our_shares": our_shares})
 
 
@@ -2542,6 +2592,60 @@ def maybe_snapshot_daily_portfolio(positions, prices_by_key, tracked_traders, mu
     )
 
 
+def record_periodic_pnl_snapshots(positions, prices_by_key, evaluation_epoch, now=None):
+    """Persist overall and clean-epoch mark-to-market rows every TTP sweep."""
+    now = now or datetime.now(timezone.utc)
+    total_realized = realized_pnl_total()
+    total_breakdown = risk_manager.compute_equity_breakdown(
+        positions, prices_by_key, total_realized,
+    )
+    all_stats = get_closed_trade_stats_since(0)
+    record_pnl_snapshot(
+        scope="portfolio", realized_pnl_usd=total_realized,
+        unrealized_pnl_usd=total_breakdown["total_unrealized_pnl"],
+        open_positions_count=len(positions),
+        closed_trades_count=all_stats["closed_count"], win_rate=all_stats["win_rate"],
+        now=now,
+    )
+
+    clean_positions = {
+        key: pos for key, pos in positions.items()
+        if int(pos.get("opened_at") or 0) >= int(evaluation_epoch)
+    }
+    clean_prices = {key: price for key, price in prices_by_key.items() if key in clean_positions}
+    clean_realized = realized_pnl_since(evaluation_epoch)
+    clean_unrealized = risk_manager.compute_unrealized_pnl(clean_positions, clean_prices)
+    clean_stats = get_closed_trade_stats_since(evaluation_epoch)
+    record_pnl_snapshot(
+        scope="clean_epoch", realized_pnl_usd=clean_realized,
+        unrealized_pnl_usd=clean_unrealized,
+        open_positions_count=len(clean_positions),
+        closed_trades_count=clean_stats["closed_count"], win_rate=clean_stats["win_rate"],
+        now=now,
+    )
+    return total_breakdown
+
+
+def update_drawdown_warning(risk_state, equity, hwm):
+    warning, transition = risk_manager.evaluate_drawdown_warning(
+        equity, hwm, risk_state.get("drawdown_warning"), now_iso=now_iso(),
+    )
+    risk_state["drawdown_warning"] = warning
+    if transition == "triggered":
+        set_risk_value("drawdown_warning", warning)
+        append_log({"timestamp": now_iso(), "event_type": "risk_drawdown_warning_triggered",
+                    **warning})
+    elif transition == "cleared":
+        clear_risk_value("drawdown_warning")
+        append_log({"timestamp": now_iso(), "event_type": "risk_drawdown_warning_cleared",
+                    "equity": equity, "hwm": hwm,
+                    "drawdown_usd": max(0.0, hwm - equity)})
+    elif warning:
+        # Keep the persisted mark current without re-alerting every 5 min.
+        set_risk_value("drawdown_warning", warning)
+    return warning, transition
+
+
 def check_circuit_breaker(trader, nickname, pnl_usd, cost_basis_usd, trader_performance, muted_traders):
     """EV-based circuit breaker (2026-07-26, Rule 35 rewrite -- replaces
     the original consecutive-loss-streak / win-rate-floor design
@@ -2612,6 +2716,40 @@ def check_circuit_breaker(trader, nickname, pnl_usd, cost_basis_usd, trader_perf
             logger.warning(f"Trader {nickname} muted: {reason} - Performance check failed.")
 
 
+def reevaluate_circuit_breakers_on_startup(trader_performance, muted_traders, tracked_by_lower):
+    """Reapply the mute rule to persisted windows before the first poll.
+
+    A restart or manual DB roster change must not leave a decisively
+    negative wallet active merely because no new close arrives after boot.
+    Returns the addresses newly muted during this audit.
+    """
+    if not config.REEVALUATE_CIRCUIT_BREAKERS_ON_STARTUP:
+        return []
+    newly_muted = []
+    for key, perf in trader_performance.items():
+        key = key.lower()
+        if key in muted_traders or key not in tracked_by_lower:
+            continue
+        returns = list(perf.get("recent_returns") or [])[-config.MUTE_EV_MIN_SAMPLES:]
+        if len(returns) < config.MUTE_EV_MIN_SAMPLES:
+            continue
+        t_stat = compute_wallet_ev_t_statistic(returns)
+        if t_stat is None or t_stat > -config.CATEGORY_SKIP_Z_CRITICAL:
+            continue
+        nickname = tracked_by_lower[key][1]
+        reason = (
+            f"startup re-evaluation: statistically significant negative edge "
+            f"(t={t_stat:.2f}) over last {len(returns)} real (non-dust) trades"
+        )
+        muted_traders[key] = {"muted_at": now_iso(), "reason": reason}
+        newly_muted.append(key)
+        append_log({"timestamp": now_iso(), "event_type": "trader_muted_startup_audit",
+                    "trader_address": key, "trader_nickname": nickname,
+                    "t_statistic": t_stat, "sample_count": len(returns), "reason": reason})
+        logger.warning(f"Trader {nickname} muted during startup audit: {reason}")
+    return newly_muted
+
+
 def _execute_buy(base_event, key, trader, market_slug, outcome, price, trade_usd,
                   event_slug, score_breakdown, positions, risk_state, price_source=None,
                   wallet_ev_stats=None):
@@ -2648,6 +2786,7 @@ def _execute_buy(base_event, key, trader, market_slug, outcome, price, trade_usd
         positions, risk_state["market_to_event"], event_slug,
         trade_usd, risk_state["kill_switch"], wallet_address=trader,
         wallet_ev_stats=wallet_ev_stats,
+        drawdown_warning=risk_state.get("drawdown_warning"),
     )
     if not risk_ok:
         append_log({**base_event, "event_type": risk_event_type, "reason": risk_reason})
@@ -2814,9 +2953,50 @@ def _execute_buy(base_event, key, trader, market_slug, outcome, price, trade_usd
     return decision_journal_id
 
 
+def _close_shadow_on_source_sell(base_event, key, market_slug, outcome, price,
+                                 fraction_sold, shadow_positions, shadow_kind):
+    if shadow_positions is None:
+        return False
+    shadow_pos = shadow_positions.get(key)
+    if not shadow_pos or shadow_pos.get("shares", 0) <= 0:
+        return False
+
+    shadow_shares_closed = shadow_pos["shares"] * fraction_sold
+    shadow_cost_basis_closed = shadow_pos["cost_basis_usd"] * fraction_sold
+    shadow_effective_price = price
+    shadow_exit_fee_usd = 0.0
+    shadow_shortfall = measure_paper_shortfall(
+        market_slug, outcome, "SELL", shadow_shares_closed, price,
+        shares=shadow_shares_closed,
+    )
+    if shadow_shortfall.get("shortfall_status") == "ok":
+        shadow_effective_price = shadow_shortfall["executable_price"]
+        shadow_exit_fee_usd = shadow_shortfall.get("trading_fee_usd", 0.0) \
+            + shadow_shortfall.get("network_fee_usd", 0.0)
+    shadow_proceeds_usd = shadow_shares_closed * shadow_effective_price - shadow_exit_fee_usd
+    shadow_pnl_usd = shadow_proceeds_usd - shadow_cost_basis_closed
+
+    shadow_pos["shares"] -= shadow_shares_closed
+    shadow_pos["cost_basis_usd"] -= shadow_cost_basis_closed
+    if shadow_pos["shares"] <= 1e-9:
+        del shadow_positions[key]
+    else:
+        shadow_positions[key] = shadow_pos
+
+    append_log({**base_event, **shadow_shortfall,
+                "event_type": f"shadow_{shadow_kind}_sell",
+                "fraction_sold": fraction_sold,
+                "our_shares_closed": shadow_shares_closed,
+                "our_shares_remaining": shadow_positions.get(key, {}).get("shares", 0.0),
+                "proceeds_usd": shadow_proceeds_usd,
+                "cost_basis_usd": shadow_cost_basis_closed,
+                "pnl_usd": shadow_pnl_usd})
+    return True
+
+
 def process_trade(trade, positions, source_positions, source_cost_basis, trader_performance,
                   muted_traders, tracked_by_lower, risk_state, wallet_scores, shadow_positions=None,
-                  wallet_ev_stats=None):
+                  wallet_ev_stats=None, wallet_mode="track", challenger_positions=None):
     trader = trade["user_address"]
     nickname = nickname_for(trader, tracked_by_lower)
     market_slug = trade.get("market_slug") or ""
@@ -2951,6 +3131,23 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
         # and keeps the door open for widening the pilot later without a
         # backfill gap.
         source_cost_basis[key] = source_cost_basis.get(key, 0.0) + (source_size_usd or 0.0)
+
+        # Challenger/retiring routing is decided from wallet_profile.status
+        # by main()'s periodically-refreshed roster. Challengers can only
+        # enter the isolated shadow_challenger ledger; retiring wallets are
+        # kept on the feed solely so existing positions still receive SELLs.
+        if wallet_mode == "challenger":
+            if challenger_positions is not None:
+                _execute_shadow_buy(
+                    dict(base_event), key, trader, market_slug, outcome, price,
+                    challenger_positions, wallet_ev_stats=wallet_ev_stats,
+                    shadow_kind="challenger",
+                )
+            return
+        if wallet_mode == "retiring":
+            append_log({**base_event, "event_type": "skip_retiring_trader_buy",
+                        "reason": "wallet is retiring; exits remain monitored but new BUYs are blocked"})
+            return
 
         # Circuit breaker (kill switch). Checked first -- blocks all new BUY
         # signals from this trader regardless of any other setting, but
@@ -3190,38 +3387,17 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
         # orphaned. Always paper-priced (measure_paper_shortfall) even
         # when config.LIVE_MODE is on -- a shadow trade is inherently a
         # simulation regardless of the real bot's mode.
-        if config.ENABLE_SHADOW_REHAB and shadow_positions is not None:
-            shadow_pos = shadow_positions.get(key)
-            if shadow_pos and shadow_pos.get("shares", 0) > 0:
-                shadow_shares_closed = shadow_pos["shares"] * fraction_sold
-                shadow_cost_basis_closed = shadow_pos["cost_basis_usd"] * fraction_sold
-                shadow_effective_price = price
-                shadow_exit_fee_usd = 0.0
-                shadow_shortfall = measure_paper_shortfall(
-                    market_slug, outcome, "SELL", shadow_shares_closed, price,
-                    shares=shadow_shares_closed,
-                )
-                if shadow_shortfall.get("shortfall_status") == "ok":
-                    shadow_effective_price = shadow_shortfall["executable_price"]
-                    shadow_exit_fee_usd = shadow_shortfall.get("trading_fee_usd", 0.0) \
-                        + shadow_shortfall.get("network_fee_usd", 0.0)
-                shadow_proceeds_usd = shadow_shares_closed * shadow_effective_price - shadow_exit_fee_usd
-                shadow_pnl_usd = shadow_proceeds_usd - shadow_cost_basis_closed
-
-                shadow_pos["shares"] -= shadow_shares_closed
-                shadow_pos["cost_basis_usd"] -= shadow_cost_basis_closed
-                if shadow_pos["shares"] <= 1e-9:
-                    del shadow_positions[key]
-                else:
-                    shadow_positions[key] = shadow_pos
-
-                append_log({**base_event, **shadow_shortfall, "event_type": "shadow_rehab_sell",
-                            "fraction_sold": fraction_sold,
-                            "our_shares_closed": shadow_shares_closed,
-                            "our_shares_remaining": shadow_positions.get(key, {}).get("shares", 0.0),
-                            "proceeds_usd": shadow_proceeds_usd,
-                            "cost_basis_usd": shadow_cost_basis_closed,
-                            "pnl_usd": shadow_pnl_usd})
+        if config.ENABLE_SHADOW_REHAB:
+            _close_shadow_on_source_sell(
+                base_event, key, market_slug, outcome, price, fraction_sold,
+                shadow_positions, "rehab",
+            )
+        _close_shadow_on_source_sell(
+            base_event, key, market_slug, outcome, price, fraction_sold,
+            challenger_positions, "challenger",
+        )
+        if wallet_mode == "challenger":
+            return
 
         pos = positions.get(key)
         if not pos or pos["shares"] <= 0:
@@ -3507,14 +3683,21 @@ def main():
         logger.warning(f"Prometheus metrics server failed to start on port "
                         f"{config.METRICS_PORT}: {e} — continuing without it.")
 
-    # get_tracked_traders() is where config.TRACKED_TRADERS_SOURCE actually
-    # takes effect (see config.py and db.py's docstring on it). Fetched once
-    # here, not per-poll: picking up a new scan:wallets run requires a
-    # restart, matching MIN_TRACKED_TRADERS' "fail loudly at startup" design
-    # rather than a tracked list that can silently change mid-session.
+    # Track wallets execute normal paper copies. Challenger and retiring
+    # wallets are also polled, but main() routes them to shadow-only or
+    # exit-only handling. The roster is refreshed every five minutes below
+    # so a daily challenger enrollment or Telegram approval does not need a
+    # process restart.
     tracked_traders = get_tracked_traders()
     tracked_by_lower = {addr.lower(): (addr, nick) for addr, nick in tracked_traders.items()}
-    wallet_addresses = list(tracked_traders.keys())
+    monitored_traders = get_monitored_noncopying_traders()
+    monitored_by_lower = {
+        addr.lower(): (addr, detail["nickname"], detail["mode"])
+        for addr, detail in monitored_traders.items()
+    }
+    all_by_lower = dict(tracked_by_lower)
+    all_by_lower.update({key: (value[0], value[1]) for key, value in monitored_by_lower.items()})
+    wallet_addresses = [value[0] for value in all_by_lower.values()]
 
     # Published to bot_risk_state (2026-07-27) so the Next.js dashboard has
     # a real, always-current answer to "which wallets are actually being
@@ -3523,8 +3706,7 @@ def main():
     # recommendation, not whether bot.py's config.TRACKED_TRADERS actually
     # includes this wallet); confirmed live that they'd drifted apart
     # (only 2 of 17 real tracked wallets happened to have status='track').
-    # Same restart-to-pick-up-changes freshness as tracked_traders itself
-    # above -- no separate refresh needed.
+    # Refreshed alongside the DB roster below.
     set_risk_value("tracked_traders", {addr.lower(): nick for addr, nick in tracked_traders.items()})
 
     # Confidence-weighted position sizing (2026-07-22) — see config.py's
@@ -3564,6 +3746,7 @@ def main():
     # resolve-once-and-cache shape as market_to_event.
     risk_state = {
         "kill_switch": get_risk_value("kill_switch"),
+        "drawdown_warning": get_risk_value("drawdown_warning"),
         "equity_hwm": get_risk_value("equity_hwm"),
         "market_to_event": load_market_events(),
         "market_to_category": load_market_categories(),
@@ -3593,11 +3776,13 @@ def main():
         # guard exists for in the first place.
         "resolved_markets": set(),
     }
+    evaluation_epoch = get_or_create_evaluation_epoch()
     METRIC_KILL_SWITCH_ACTIVE.set(1 if risk_state["kill_switch"] else 0)
 
     logger.info(f"Copybot starting — mode={'LIVE' if config.LIVE_MODE else 'PAPER'}, "
                 f"source={config.TRACKED_TRADERS_SOURCE}, "
-                f"tracking {len(tracked_traders)} trader(s), "
+                f"tracking {len(tracked_traders)} trader(s), monitoring "
+                f"{len(monitored_traders)} challenger/retiring wallet(s), "
                 f"${config.MIN_TRADE_USD}-${config.MAX_TRADE_USD}/trade (base ${config.BASE_TRADE_USD} "
                 f"if unscored), polling every {config.POLL_INTERVAL_SECONDS}s")
     if risk_state["kill_switch"]:
@@ -3605,6 +3790,13 @@ def main():
         logger.warning(f"WARNING: drawdown kill switch is LATCHED (since {ks.get('triggered_at')}: "
                        f"{'; '.join(ks.get('reasons', []))}) — all new BUYs are halted. "
                        f"Run reset_kill_switch.py after review to resume buying.")
+    if risk_state["drawdown_warning"]:
+        warning = risk_state["drawdown_warning"]
+        logger.warning(
+            f"WARNING: drawdown soft pause is active — equity "
+            f"${warning.get('equity', 0):.2f}, drawdown ${warning.get('drawdown_usd', 0):.2f}; "
+            f"new BUYs paused, exits continue."
+        )
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
@@ -3632,6 +3824,7 @@ def main():
     # strategy="bot_filtered" only, see load_shadow_positions()'s own
     # docstring for why this never touches real risk/exposure).
     shadow_positions = load_shadow_positions()
+    challenger_positions = load_shadow_positions("shadow_challenger")
 
     def persist():
         seen_flat = [
@@ -3642,6 +3835,13 @@ def main():
                     "source_positions": source_positions, "source_cost_basis": source_cost_basis,
                     "trader_performance": trader_performance, "muted_traders": muted_traders})
         save_shadow_positions(shadow_positions)
+        save_shadow_positions(challenger_positions, "shadow_challenger")
+
+    newly_muted = reevaluate_circuit_breakers_on_startup(
+        trader_performance, muted_traders, tracked_by_lower,
+    )
+    if newly_muted:
+        persist()
 
     # load_state() (db.py) is now the sole source of truth regardless of
     # whether state.json exists on disk — bootstrap purely off whether it
@@ -3670,9 +3870,42 @@ def main():
     last_closeout_sweep = 0.0
     last_zombie_sweep = 0.0
     last_prune_sweep = 0.0
+    last_roster_refresh = time.time()
 
     while not SHUTDOWN_REQUESTED:
         try:
+            if time.time() - last_roster_refresh >= config.ROSTER_REFRESH_INTERVAL_SECONDS:
+                refreshed_tracked = get_tracked_traders()
+                refreshed_monitored = get_monitored_noncopying_traders()
+                tracked_traders = refreshed_tracked
+                monitored_traders = refreshed_monitored
+                tracked_by_lower = {
+                    addr.lower(): (addr, nick) for addr, nick in tracked_traders.items()
+                }
+                monitored_by_lower = {
+                    addr.lower(): (addr, detail["nickname"], detail["mode"])
+                    for addr, detail in monitored_traders.items()
+                }
+                all_by_lower = dict(tracked_by_lower)
+                all_by_lower.update({
+                    key: (value[0], value[1]) for key, value in monitored_by_lower.items()
+                })
+                challenger_ledger_wallets = set(tracked_by_lower) | {
+                    key for key, value in monitored_by_lower.items() if value[2] == "challenger"
+                }
+                for position_key_value in list(challenger_positions):
+                    wallet_key = position_key_value.split("|", 1)[0].lower()
+                    if wallet_key not in challenger_ledger_wallets:
+                        challenger_positions.pop(position_key_value, None)
+                wallet_addresses = [value[0] for value in all_by_lower.values()]
+                wallet_scores = get_wallet_composite_scores()
+                wallet_ev_stats = get_wallet_realized_ev_stats()
+                set_risk_value(
+                    "tracked_traders",
+                    {addr.lower(): nick for addr, nick in tracked_traders.items()},
+                )
+                last_roster_refresh = time.time()
+
             # Direct Polymarket API, no bullpen/auth involved (Rule 14,
             # 2026-07-22 cutover) — a single wallet's fetch failure is
             # already handled inside fetch_direct_feed (logged, doesn't
@@ -3741,7 +3974,12 @@ def main():
                 # decides whether a given trader is currently worth copying
                 # (see docs/copy-trading/SAFETY.md's ownership-boundary section).
                 trader_addr = trade.get("user_address") or ""
-                if trader_addr.lower() not in tracked_by_lower:
+                trader_key = trader_addr.lower()
+                if trader_key in tracked_by_lower:
+                    wallet_mode = "track"
+                elif trader_key in monitored_by_lower:
+                    wallet_mode = monitored_by_lower[trader_key][2]
+                else:
                     append_log({"timestamp": now_iso(), "event_type": "skip_untracked_trader",
                                 "source_trade_id": tid, "trader_address": trader_addr,
                                 "reason": f"trader not in active tracked-traders source "
@@ -3751,9 +3989,10 @@ def main():
 
                 try:
                     process_trade(trade, positions, source_positions, source_cost_basis,
-                                  trader_performance, muted_traders, tracked_by_lower,
+                                  trader_performance, muted_traders, all_by_lower,
                                   risk_state, wallet_scores, shadow_positions=shadow_positions,
-                                  wallet_ev_stats=wallet_ev_stats)
+                                  wallet_ev_stats=wallet_ev_stats, wallet_mode=wallet_mode,
+                                  challenger_positions=challenger_positions)
                 except Exception as e:
                     append_log({"timestamp": now_iso(), "event_type": "error",
                                 "source_trade_id": tid,
@@ -3872,6 +4111,7 @@ def main():
                         if new_hwm != risk_state["equity_hwm"]:
                             risk_state["equity_hwm"] = new_hwm
                             set_risk_value("equity_hwm", new_hwm)
+                        update_drawdown_warning(risk_state, equity, new_hwm)
                         if triggers and not risk_state["kill_switch"]:
                             kill_switch = {"triggered_at": now_iso(), "reasons": triggers,
                                            "equity": equity, "hwm": new_hwm}
@@ -3895,6 +4135,9 @@ def main():
                     # Idempotent (db.has_snapshot_for_today()), so checking
                     # every ~5 minutes here is cheap and never double-writes.
                     try:
+                        record_periodic_pnl_snapshots(
+                            positions, prices_by_key, evaluation_epoch,
+                        )
                         maybe_snapshot_daily_portfolio(positions, prices_by_key, tracked_traders, muted_traders)
                     except Exception as e:
                         append_log({"timestamp": now_iso(), "event_type": "error",
@@ -3903,7 +4146,9 @@ def main():
             if not SHUTDOWN_REQUESTED and now - last_closeout_sweep >= config.CLOSEOUT_INTERVAL_SECONDS:
                 last_closeout_sweep = now
                 try:
-                    run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_lower)
+                    run_closeout_sweep(positions, trader_performance, muted_traders, all_by_lower)
+                    run_shadow_closeout_sweep(shadow_positions, "rehab")
+                    run_shadow_closeout_sweep(challenger_positions, "challenger")
                 except Exception as e:
                     append_log({"timestamp": now_iso(), "event_type": "error",
                                 "error": f"closeout sweep failed: {e}"})

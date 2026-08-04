@@ -4,7 +4,7 @@
 the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEMENT.md` and
 `docs/copy-trading/SAFETY.md` for the full rationale and implementation history.
 
-**Last live verification:** 2026-08-05 03:50 HKT / 2026-08-04 19:50 UTC.
+**Last live verification:** 2026-08-05 04:54 HKT / 2026-08-04 20:54 UTC.
 
 ## Non-negotiable operating rules
 
@@ -25,7 +25,8 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 ### Deployment and control plane
 
 - EC2 host alias: `polymarket-copybot` (`/home/ubuntu/polymarket-copybot`).
-- Git commit live: `93c193b` (`fix(copybot): stop paginated feed replay churn`).
+- Git commit live: `736d3e0` (`refactor(copybot): separate weather bot workspace`); paper bot PID
+  remained `75742` during the 04:54 HKT read-only audit.
 - `LIVE_MODE=False`.
 - EC2 `config.py` has two intentional-but-uncommitted overrides:
   - `TRACKED_TRADERS_SOURCE="db"`
@@ -128,14 +129,42 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
    autodeploy currently runs from a dirty production worktree.
 2. Add an explicit, low-cost health marker for each successful TTP/equity sweep. Today success is
    inferred from `last_priced_at` and snapshot movement, while failures log directly.
-3. Decide how a newly Telegram-approved wallet triggers a safe roster reload; DB approval alone
-   does not change the in-memory poll list.
+3. Deploy and live-verify the new five-minute roster refresh; the implementation now picks up a
+   Telegram-approved wallet without restart, but is not production-active yet.
 4. Investigate why Shadow Rehab has grown the 4.6 GB DB so quickly and enforce retention/compaction
    without changing normal Copy Bot risk accounting.
 5. Review concentration: historical PnL can still be dominated by a small number of wallets even
    when the roster count looks diversified.
 
 ## Change log
+
+### 2026-08-05 — Quant controls 1–4 implementation checkpoint
+
+1. **When:** 2026-08-05 04:51–05:20 HKT.
+2. **Files adjusted:**
+   - `bot.py`, `risk_manager.py`, `db.py`, `config.py` — startup circuit-breaker audit, clean
+     evaluation epoch, five-minute PnL snapshots, drawdown warning gate, dynamic roster routing,
+     and isolated challenger/retiring execution modes.
+   - `manage_challengers.py`, `send_wallet_approvals.py`, `packages/db/src/schema.ts` — clean
+     shadow evidence, Telegram one-in-one-out proposal detail, and lifecycle documentation.
+   - `test_quant_p0.py`, `test_db_quant_p0.py`, three existing Python test files — regression
+     coverage for zero variance, hysteresis, epoch persistence, isolated ledgers, and atomic swaps.
+   - `docs/copy-trading/RISK_MANAGEMENT.md`, `docs/TODO_2026-08-06.md`, and this handoff.
+3. **What changed:**
+   - Corrected the exact strict-5 zero-variance failure and added startup re-evaluation.
+   - Added immutable clean-cohort reporting without deleting/reclassifying historical PnL.
+   - Added a BUY-only 75% drawdown soft pause with 60% recovery hysteresis; hard kill unchanged.
+   - Added paper-only challengers requiring 7 days, 20 closes, and positive lower confidence bound
+     before Telegram can approve a transactional one-in-one-out replacement.
+   - Kept `$3–$10` trade sizing unchanged, per Joey's instruction.
+   - Local verification at checkpoint: `python3 -m unittest discover` — **674 passed**; Python
+     compile checks and the package TypeScript checks also passed.
+   - **Not deployed to AWS yet**: follow `docs/TODO_2026-08-06.md`; EC2 remains paper-only on the
+     previous production process until that controlled preflight is complete.
+   - Before the GitHub push, EC2 `data/autodeploy.lock` was intentionally installed so the push
+     cannot replace the running production process overnight. Remove it only inside tomorrow's
+     controlled deployment window.
+   - `.env`, keys, credentials, and unrelated dirty-worktree files were not staged.
 
 ### 2026-08-05 — Copy Bot repository separation
 

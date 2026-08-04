@@ -36,7 +36,8 @@ class _TempDbTestCase(unittest.TestCase):
         conn.execute(
             "CREATE TABLE wallet_profile (id TEXT PRIMARY KEY, "
             "wallet_address TEXT NOT NULL UNIQUE, nickname TEXT, status TEXT NOT NULL DEFAULT 'watch', "
-            "status_reason TEXT, status_changed_at INTEGER, created_at INTEGER, updated_at INTEGER)"
+            "status_reason TEXT, status_changed_at INTEGER, circuit_breaker_muted INTEGER DEFAULT 0, "
+            "mute_reason TEXT, muted_at INTEGER, created_at INTEGER, updated_at INTEGER)"
         )
         conn.commit()
         conn.close()
@@ -145,6 +146,28 @@ class TestMarkWalletApprovalRequestSent(_TempDbTestCase):
 
 
 class TestResolveWalletApprovalRequest(_TempDbTestCase):
+    def test_challenger_approval_is_transactional_one_in_one_out(self):
+        self._insert_wallet_profile("0xnew", status="challenger")
+        self._insert_wallet_profile("0xold", status="track")
+        conn = self._raw_conn()
+        conn.execute("UPDATE wallet_profile SET circuit_breaker_muted=1 WHERE wallet_address='0xold'")
+        conn.execute(
+            "INSERT INTO wallet_approval_request (id,wallet_address,requested_tier,source,category,"
+            "score_snapshot_json,reason,status,created_at) VALUES "
+            "('req-swap','0xnew','track','challenger_shadow',NULL,?,'passed','pending',?)",
+            ('{"replacementWalletAddress":"0xold"}', int(time.time())),
+        )
+        conn.commit()
+        conn.close()
+
+        self.assertTrue(db.resolve_wallet_approval_request("req-swap", "approved"))
+        conn = self._raw_conn()
+        statuses = dict(conn.execute(
+            "SELECT wallet_address,status FROM wallet_profile WHERE wallet_address IN ('0xnew','0xold')"
+        ).fetchall())
+        conn.close()
+        self.assertEqual(statuses, {"0xnew": "track", "0xold": "retiring"})
+
     def test_approve_flips_wallet_profile_status_to_requested_tier(self):
         self._insert_request("req-1", wallet_address="0xa", requested_tier="track")
         self._insert_wallet_profile("0xa", status="watch")

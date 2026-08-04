@@ -53,7 +53,9 @@ export const walletProfile = sqliteTable(
     id: id(),
     walletAddress: text("wallet_address").notNull().unique(),
     nickname: text("nickname"),
-    // track | watch | ignore — owned by the TS scorer/rule engine, NOT bot.py.
+    // track | challenger | retiring | watch | ignore. Scorers write watch/
+    // ignore recommendations; the Python challenger/Telegram workflow owns
+    // challenger -> track -> retiring lifecycle transitions.
     status: text("status").notNull().default("watch"),
     statusReason: text("status_reason"),
     statusChangedAt: integer("status_changed_at", { mode: "timestamp" }),
@@ -139,15 +141,16 @@ export const walletApprovalRequest = sqliteTable(
     // 'track' | 'bench' — the status this request would flip wallet_profile
     // to on approval.
     requestedTier: text("requested_tier").notNull(),
-    // 'global_pool' (scoreWallets.ts's top-N pool) | 'category_quota'
-    // (discoverCategorySpecialists.ts's Rule 24 quota) — which pipeline
-    // proposed this candidate, for audit/debugging.
+    // 'global_pool' | 'category_quota' | 'challenger_shadow' — which
+    // pipeline proposed this candidate, for audit/debugging.
     source: text("source").notNull(),
     // Null for global_pool candidates (that system isn't category-scoped).
     category: text("category"),
     // Composite score / t-stat / win rate / trade count / roi snapshot at
     // proposal time — same "extra detail lives in a JSON blob" pattern as
     // wallet_profile.scoreBreakdownJson, not a wide bespoke column set.
+    // challenger_shadow additionally embeds the clean shadow evidence and
+    // replacementWalletAddress used for the transactional one-in-one-out.
     scoreSnapshotJson: text("score_snapshot_json").notNull(),
     // Human-readable justification, reused from decideStatus()'s own reason
     // string or the category-quota candidate's stats line — shown verbatim
