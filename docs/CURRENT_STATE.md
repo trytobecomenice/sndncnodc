@@ -1,5 +1,13 @@
 # Current State
 
+> **Production correction — 2026-08-05:** read `CLAUDE_HANDOFF.md` before using the older
+> point-in-time numbers below. A live EC2 audit confirmed that production uses the DB-backed
+> 17-wallet roster (12 unmuted), daily Copy Bot snapshots are current, the Telegram daily-scan
+> cron/listener and Go OMS are deployed, and the local developer `data/app.db` is not a current
+> mirror of production. The handoff records the exact verification time, P0 restart, a feed-replay
+> fault found during that restart, its safe containment/fix status, operational overrides, and
+> open risks. Treat the handoff's P0 deployment line as the current restart authority.
+
 **Audience note:** zero prior context assumed. This is a point-in-time snapshot — check the
 "Last reviewed" date below before trusting a number in here over the live system (`bot.out.log`,
 `data/app.db`, `bullpen status`).

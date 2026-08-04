@@ -535,10 +535,15 @@ DIRECT_API_PER_WALLET_LIMIT = 20
 # happened, an evicted-but-still-fetched trade_id would get treated as brand
 # new on the next bot.py restart — confirmed live: two restarts in one
 # session each triggered a burst of "new" copies of month-old,
-# already-resolved-market trades from quiet wallets. 100 is 5x headroom over
-# DIRECT_API_PER_WALLET_LIMIT (20) — comfortably more than one wallet could
-# ever need to never re-see its own already-processed trades.
-SEEN_TRADE_IDS_PER_WALLET_CAP = 100
+# already-resolved-market trades from quiet wallets.
+#
+# Raised 100 -> 500 on 2026-08-05 after a production restart exposed a second
+# interaction: fetch_wallet_trades() can page up to MAX_PAGES_PER_FETCH=10,
+# so one nominal `limit=20` poll can return 200 rows. A 100-id deque then
+# alternated which half it remembered, treating the other half as new on the
+# next cycle. 500 is 2.5x headroom over today's 20*10 maximum. Keep this cap
+# >= DIRECT_API_PER_WALLET_LIMIT * polymarket_data_api.MAX_PAGES_PER_FETCH.
+SEEN_TRADE_IDS_PER_WALLET_CAP = 500
 
 # Belt-and-suspenders guard (2026-07-31), alongside the _mark_trade_seen()
 # idempotency fix in bot.py: a BUY signal whose own reported timestamp is

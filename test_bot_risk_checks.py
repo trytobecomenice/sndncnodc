@@ -909,10 +909,13 @@ class TestFetchDirectFeed(unittest.TestCase):
 
     def test_returns_trades_in_the_same_shape_the_old_bullpen_feed_used(self):
         fake_result = {"trades": [{"trade_id": "abc", "user_address": "0x1"}], "errors": []}
-        with patch("bot.fetch_all_wallets_concurrent", return_value=fake_result), \
+        known = {"already-seen"}
+        with patch("bot.fetch_all_wallets_concurrent", return_value=fake_result) as mock_fetch, \
              patch("bot.append_log") as mock_log:
-            feed = bot.fetch_direct_feed(executor=None, wallet_addresses=["0x1"])
+            feed = bot.fetch_direct_feed(executor=None, wallet_addresses=["0x1"],
+                                         known_trade_ids=known)
         self.assertEqual(feed, {"trades": [{"trade_id": "abc", "user_address": "0x1"}]})
+        self.assertIs(mock_fetch.call_args.kwargs["known_trade_ids"], known)
         mock_log.assert_not_called()
 
     def test_per_wallet_errors_are_logged_not_raised(self):

@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import config
 import db
+import polymarket_data_api
 
 
 class TestSeenTradePerWalletCap(unittest.TestCase):
@@ -111,6 +112,12 @@ class TestSeenTradePerWalletCap(unittest.TestCase):
         state = db.load_state()
         entry = next(e for e in state["seen_trade_ids"] if e["trade_id"] == "t1")
         self.assertEqual(entry["wallet_address"], "0xabc")
+
+    def test_production_cap_covers_the_largest_paginated_poll(self):
+        config.SEEN_TRADE_IDS_PER_WALLET_CAP = self._saved_cap
+        largest_poll = (config.DIRECT_API_PER_WALLET_LIMIT
+                        * polymarket_data_api.MAX_PAGES_PER_FETCH)
+        self.assertGreaterEqual(config.SEEN_TRADE_IDS_PER_WALLET_CAP, largest_poll)
 
 
 if __name__ == "__main__":

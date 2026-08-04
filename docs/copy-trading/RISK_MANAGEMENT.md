@@ -4388,6 +4388,41 @@ no-op transitions), `test_telegram_alerts.py` (+7:
 authorization, offset persistence, `get_updates` failure->exception,
 full `handle_callback_query` scenarios) — 658 Python tests passing.
 
+## 50. Live-poll pagination boundary — stopping dedup replay churn (Rule 14 addendum, 2026-08-05)
+
+**Trigger:** the controlled P0 restart at 03:11 HKT exposed a production-only failure that the
+stale laptop DB could not show. In the first 14 minutes, the fresh process logged more than 2,500
+`skip_resolved_market_stale_trade` events, 1,100 `skip_sell_no_position` events, and 16 actual
+paper sells. The second TTP/equity mark arrived at 03:22:31 HKT, 8m02s after the first, despite the
+configured 300-second interval. There were zero exceptions: the main loop was not crashed, it was
+busy replaying old feed rows and persisting each apparent event.
+
+**Root cause:** Rule 14's Data API client auto-paginates up to 10 pages. The bot passes
+`DIRECT_API_PER_WALLET_LIMIT=20`, so a nominal per-wallet poll can return 200 rows, not 20. Rule
+51's later per-wallet dedup cap was set to 100 based on the one-page assumption. Processing the
+200 newest-to-oldest rows filled the deque with one half and evicted the other; the next poll saw
+the evicted half as new, processed it, and evicted the previously remembered half. This produced
+a permanent 100-vs-100 replay cycle. The resolved-market guard prevented most stale BUYs, but old
+SELL signals could still change paper positions and therefore contaminate strategy evaluation.
+
+**Fix:** `fetch_wallet_trades(..., known_trade_ids=...)` now stops requesting older offsets after
+a fetched page overlaps the running bot's already-seen boundary. The whole boundary page is still
+returned, then the existing main-loop dedup removes known rows; this preserves any genuine gap on
+that page. If a wallet really creates more than 20 new trades between polls, page 1 has no known
+ID and pagination continues until the first overlap, so burst protection is retained. Research
+and backfill callers omit the boundary and keep the original full-pagination behavior.
+
+`SEEN_TRADE_IDS_PER_WALLET_CAP` was raised from 100 to 500. Today's maximum paginated poll is
+20×10=200 records, so 500 provides 2.5× headroom and prevents a genuine large burst from creating
+the same eviction cycle. A regression test pins the invariant that the production cap must be at
+least `DIRECT_API_PER_WALLET_LIMIT * MAX_PAGES_PER_FETCH`.
+
+**Operational response:** because this was actively altering paper exits, the bot was gracefully
+stopped behind the existing watchdog pause sentinel while the fix was tested. No live funds,
+wallet status, schema, or manual position edits were involved. Deployment verification must show
+one process, bounded event counters, no errors, kill switch off, and consecutive TTP marks before
+the pause is cleared and P0 is declared complete.
+
 ## What is intentionally still simple
 
 The current setup is conservative by design — it focuses on avoiding obvious bad fills, bad

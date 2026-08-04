@@ -48,18 +48,16 @@ not one driven by a server hint. Other 4xx (400, 404, etc — genuine client-sid
 are NOT retried at all, since backing off and retrying an inherently-wrong request just wastes
 time without changing the outcome.
 
-PAGINATION (added 2026-07-22): Polymarket's own docs confirm `/activity` supports `offset`-based
-pagination (0-500 per page via `limit`, offset 0-5000 — "requests past the cap are rejected with a
-400"; beyond 5000 total, docs say to page inside additional `start`/`end` time windows, each with
-its own offset budget). `fetch_wallet_trades` now pages automatically: it keeps requesting
-subsequent offsets, concatenating results, as long as a page comes back FULL (== `limit` records,
-meaning there's plausibly more) and the page cap (`MAX_PAGES_PER_FETCH`) hasn't been hit — stopping
-naturally the first time a page returns fewer than `limit` records. This closes a real gap: at the
-previous fixed single-page `limit=20` used by bot.py's poll, a wallet making 21+ trades within one
-poll interval would have had the oldest of that burst silently, permanently missed (the next poll
-would only see the newest 20, never circling back). The 5000-total-offset cap is not a practical
-concern for a live tracking poll (asking "what's new since last time," not deep historical
-backfill) — it would only matter for an initial full-history backfill, not this use case.
+PAGINATION (added 2026-07-22; live-poll boundary added 2026-08-05): Polymarket's own docs confirm
+`/activity` supports `offset`-based pagination (0-500 per page via `limit`, offset 0-5000 —
+"requests past the cap are rejected with a 400"; beyond 5000 total, docs say to page inside
+additional `start`/`end` time windows, each with its own offset budget). `fetch_wallet_trades`
+pages automatically while pages are full, up to `MAX_PAGES_PER_FETCH`. A caller may additionally
+pass `known_trade_ids`: once a fetched page overlaps that already-processed boundary, pagination
+stops after that page. `bot.py` uses this on every live poll, preserving multi-page burst capture
+when a wallet really made 21+ new trades while avoiding a deep replay of the same old 200 rows on
+every ordinary cycle. Research/backfill callers omit the boundary and retain the original full
+pagination behavior.
 
 SPEED: per-request latency is dominated by TLS/connection setup, not
 request count or thread-pool size — confirmed live: bumping max_workers
@@ -200,7 +198,23 @@ def _fetch_one_page(wallet_address, limit, timeout, start, offset):
         raise RuntimeError(f"HTTP {status} after {rate_limit_attempt} backoff retr(y/ies): {body[:200]!r}")
 
 
-def fetch_wallet_trades(wallet_address, limit=DEFAULT_FETCH_LIMIT, timeout=DEFAULT_TIMEOUT_SECONDS, start=None):
+def _activity_trade_id(record):
+    """Returns the same stable fill id normalize_activity_record() exposes.
+
+    Kept as one helper because live pagination needs to recognize an
+    already-seen raw record before normalization, while downstream callers
+    still need the normalized trade_id. The two paths must never drift.
+    """
+    tx_hash = record.get("transactionHash", "")
+    asset = record.get("asset", "")
+    side = (record.get("side") or "").upper()
+    timestamp = record.get("timestamp")
+    return f"{tx_hash}:{asset}:{side}:{timestamp}"
+
+
+def fetch_wallet_trades(wallet_address, limit=DEFAULT_FETCH_LIMIT,
+                        timeout=DEFAULT_TIMEOUT_SECONDS, start=None,
+                        known_trade_ids=None):
     """Fetches one wallet's recent TRADE-type activity directly from
     Polymarket's own public Data API, over this thread's persistent
     connection (see module docstring). Returns the raw JSON list
@@ -208,6 +222,12 @@ def fetch_wallet_trades(wallet_address, limit=DEFAULT_FETCH_LIMIT, timeout=DEFAU
     normalize_activity_record), automatically paginated (see module
     docstring's PAGINATION section) so a wallet whose trade count within the
     requested window exceeds one page is never silently truncated.
+
+    `known_trade_ids` is an optional already-processed boundary for a live
+    newest-first poll. Once any row on a page is known, that complete page is
+    returned and no older offset is requested. Returning the complete boundary
+    page is deliberate: downstream dedup removes its known rows, while any
+    genuine gap on the same page remains visible instead of being skipped.
 
     `start` (optional, unix epoch seconds) filters server-side to trades at
     or after that time — confirmed live to work correctly (every returned
@@ -225,6 +245,8 @@ def fetch_wallet_trades(wallet_address, limit=DEFAULT_FETCH_LIMIT, timeout=DEFAU
     for _ in range(MAX_PAGES_PER_FETCH):
         page = _fetch_one_page(wallet_address, limit, timeout, start, offset)
         all_records.extend(page)
+        if known_trade_ids and any(_activity_trade_id(record) in known_trade_ids for record in page):
+            break  # reached the live poll's already-processed boundary
         if len(page) < limit:
             break  # short page -> no more data, stop paging
         offset += limit
@@ -264,10 +286,9 @@ def normalize_activity_record(record, wallet_address):
     poll (required for bot.py's seen_trade_ids dedup to work correctly).
     """
     tx_hash = record.get("transactionHash", "")
-    asset = record.get("asset", "")
     side = (record.get("side") or "").upper()
     timestamp = record.get("timestamp")
-    trade_id = f"{tx_hash}:{asset}:{side}:{timestamp}"
+    trade_id = _activity_trade_id(record)
 
     formatted_timestamp = None
     if timestamp is not None:
@@ -289,7 +310,7 @@ def normalize_activity_record(record, wallet_address):
 
 def fetch_all_wallets_concurrent(wallet_addresses, limit=DEFAULT_FETCH_LIMIT,
                                   max_workers=DEFAULT_MAX_WORKERS, timeout=DEFAULT_TIMEOUT_SECONDS,
-                                  executor=None, start=None):
+                                  executor=None, start=None, known_trade_ids=None):
     """Fetches every wallet's recent trade activity CONCURRENTLY via a
     thread pool. Pass a long-lived `executor` (created ONCE by the caller,
     reused across every poll cycle) to get the real connection-reuse speedup
@@ -313,7 +334,10 @@ def fetch_all_wallets_concurrent(wallet_addresses, limit=DEFAULT_FETCH_LIMIT,
     errors = []
 
     def _fetch_one(wallet_address):
-        raw = fetch_wallet_trades(wallet_address, limit=limit, timeout=timeout, start=start)
+        fetch_kwargs = {"limit": limit, "timeout": timeout, "start": start}
+        if known_trade_ids is not None:
+            fetch_kwargs["known_trade_ids"] = known_trade_ids
+        raw = fetch_wallet_trades(wallet_address, **fetch_kwargs)
         return [normalize_activity_record(r, wallet_address) for r in raw]
 
     def _run(exec_):

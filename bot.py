@@ -3311,7 +3311,7 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
                     "error": f"unrecognized side: {side}"})
 
 
-def fetch_direct_feed(executor, wallet_addresses):
+def fetch_direct_feed(executor, wallet_addresses, known_trade_ids=None):
     """Fetches recent trade activity for every tracked wallet directly from
     Polymarket's own public Data API (polymarket_data_api.py) — the tracking
     feed as of the 2026-07-22 cutover (docs/copy-trading/RISK_MANAGEMENT.md
@@ -3330,14 +3330,21 @@ def fetch_direct_feed(executor, wallet_addresses):
     as a normal error event; that wallet is simply retried on the very next
     cycle, same resilience shape as everything else in this loop.
 
+    `known_trade_ids` is the current in-memory dedup boundary. Passing it to
+    the API client stops per-wallet offset pagination once a page overlaps
+    already-processed history: a real >20-trade burst still pages until it
+    reaches that boundary, while an ordinary poll does not replay up to 200
+    old rows into the main loop (2026-08-05 P0).
+
     Returns {"trades": [...]} — same shape bullpen's tracker-feed response
     had, so every line downstream (dedup against seen_trade_ids, sort,
-    process_trade) is completely unchanged.
+    process_trade) remains unchanged.
     """
     result = fetch_all_wallets_concurrent(
         wallet_addresses,
         limit=config.DIRECT_API_PER_WALLET_LIMIT,
         executor=executor,
+        known_trade_ids=known_trade_ids,
     )
     for err in result["errors"]:
         append_log({"timestamp": now_iso(), "event_type": "error",
@@ -3644,7 +3651,8 @@ def main():
     bootstrap = not state["seen_trade_ids"]
     if bootstrap:
         try:
-            feed = fetch_direct_feed(direct_feed_executor, wallet_addresses)
+            feed = fetch_direct_feed(direct_feed_executor, wallet_addresses,
+                                     known_trade_ids=seen_set)
             trades = feed.get("trades", [])
             for t in trades:
                 tid = t.get("trade_id")
@@ -3670,7 +3678,8 @@ def main():
             # already handled inside fetch_direct_feed (logged, doesn't
             # raise), so this call itself can't fail the way the old
             # bullpen-backed fetch could.
-            feed = fetch_direct_feed(direct_feed_executor, wallet_addresses)
+            feed = fetch_direct_feed(direct_feed_executor, wallet_addresses,
+                                     known_trade_ids=seen_set)
             trades = feed.get("trades", [])
             new_trades = [t for t in trades if t.get("trade_id") not in seen_set]
             # SELL/redeem signals sort ahead of BUY signals within the same

@@ -126,6 +126,12 @@ class TestFetchAllWalletsConcurrent(unittest.TestCase):
         finally:
             executor.shutdown()
 
+    def test_forwards_the_live_known_trade_boundary_to_each_wallet_fetch(self):
+        known = {"known-trade-id"}
+        with patch("polymarket_data_api.fetch_wallet_trades", return_value=[]) as mock_fetch:
+            fetch_all_wallets_concurrent(["0xA"], known_trade_ids=known)
+        self.assertIs(mock_fetch.call_args.kwargs["known_trade_ids"], known)
+
 
 class TestStartParam(unittest.TestCase):
     def tearDown(self):
@@ -235,6 +241,46 @@ class TestPagination(unittest.TestCase):
             result = fetch_wallet_trades("0xABC", limit=2)
         self.assertEqual(mock_conn.request.call_count, 4)
         self.assertEqual(len(result), 8)  # 4 pages * 2 records
+
+    def test_known_trade_on_a_full_page_stops_before_older_offsets(self):
+        _thread_local.conn = None
+        mock_conn = MagicMock()
+        page1 = [
+            {"transactionHash": "0xNEW", "asset": "1", "side": "BUY", "timestamp": 20},
+            {"transactionHash": "0xKNOWN", "asset": "2", "side": "BUY", "timestamp": 10},
+        ]
+        page2 = [
+            {"transactionHash": "0xOLD", "asset": "3", "side": "BUY", "timestamp": 1},
+        ]
+        mock_conn.getresponse.side_effect = [_mock_response(200, page1), _mock_response(200, page2)]
+        known_id = normalize_activity_record(page1[1], "0xABC")["trade_id"]
+        with patch("http.client.HTTPSConnection", return_value=mock_conn):
+            result = fetch_wallet_trades("0xABC", limit=2, known_trade_ids={known_id})
+        self.assertEqual(result, page1)
+        self.assertEqual(mock_conn.request.call_count, 1)
+
+    def test_new_trade_burst_keeps_paging_until_the_known_boundary(self):
+        _thread_local.conn = None
+        mock_conn = MagicMock()
+        page1 = [
+            {"transactionHash": "0xNEW1", "asset": "1", "side": "BUY", "timestamp": 30},
+            {"transactionHash": "0xNEW2", "asset": "2", "side": "BUY", "timestamp": 20},
+        ]
+        page2 = [
+            {"transactionHash": "0xNEW3", "asset": "3", "side": "BUY", "timestamp": 15},
+            {"transactionHash": "0xKNOWN", "asset": "4", "side": "BUY", "timestamp": 10},
+        ]
+        page3 = [
+            {"transactionHash": "0xOLD", "asset": "5", "side": "BUY", "timestamp": 1},
+        ]
+        mock_conn.getresponse.side_effect = [
+            _mock_response(200, page1), _mock_response(200, page2), _mock_response(200, page3)
+        ]
+        known_id = normalize_activity_record(page2[1], "0xABC")["trade_id"]
+        with patch("http.client.HTTPSConnection", return_value=mock_conn):
+            result = fetch_wallet_trades("0xABC", limit=2, known_trade_ids={known_id})
+        self.assertEqual(result, page1 + page2)
+        self.assertEqual(mock_conn.request.call_count, 2)
 
 
 class TestRateLimitBackoff(unittest.TestCase):
