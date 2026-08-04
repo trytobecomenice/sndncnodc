@@ -4,7 +4,7 @@
 the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEMENT.md` and
 `docs/copy-trading/SAFETY.md` for the full rationale and implementation history.
 
-**Last live verification:** 2026-08-05 03:26 HKT / 2026-08-04 19:26 UTC.
+**Last live verification:** 2026-08-05 03:50 HKT / 2026-08-04 19:50 UTC.
 
 ## Non-negotiable operating rules
 
@@ -13,6 +13,8 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 - Both systems remain paper-only. Do not flip `LIVE_MODE` or introduce private-key custody.
 - TypeScript/Drizzle owns schema and migrations; Python performs CRUD only.
 - Preserve unrelated dirty-worktree changes. Do not bundle them into a task commit.
+- Never commit or push `.env`, API tokens, SSH/private keys, or credentials. Stage explicit file
+  names only; do not use `git add .` in this dirty worktree.
 - A local `data/app.db` is not production truth. For live trading status, query the EC2 DB at
   `/home/ubuntu/polymarket-copybot/data/app.db` over the `polymarket-copybot` SSH host.
 - Every completed change entry in this file must state: **When**, **Files adjusted**, and
@@ -23,7 +25,7 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 ### Deployment and control plane
 
 - EC2 host alias: `polymarket-copybot` (`/home/ubuntu/polymarket-copybot`).
-- Git commit live before the P0 restart: `7983a79` (`origin/main` matched).
+- Git commit live: `93c193b` (`fix(copybot): stop paginated feed replay churn`).
 - `LIVE_MODE=False`.
 - EC2 `config.py` has two intentional-but-uncommitted overrides:
   - `TRACKED_TRADERS_SOURCE="db"`
@@ -57,7 +59,8 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 ### Copy Bot book and PnL
 
 - `bot_filtered` closed: **634**, cumulative realized PnL **+$639.74**.
-- `bot_filtered` open: **56**, cost basis **$356.35**.
+- `bot_filtered` open: **56**, cost basis **$356.26** at 03:50 HKT.
+- HKT 2026-08-05 realized PnL at 03:50: **$0.00** (zero fully closed rows today).
 - All 56 normal open positions had a successful recent mark at the live check.
 - Positions with no successful mark for more than 24 hours: **0**.
 - The three apparently-broken Israel/Iran positions seen in the developer laptop DB were stale
@@ -79,7 +82,7 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 
 ## P0 live action — 2026-08-05
 
-### Outcome so far
+### Outcome — complete
 
 - Verified the production commit, services, crons, DB source, roster, PnL, snapshots, position
   marks, and zombie count directly on EC2.
@@ -100,10 +103,22 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
   dedup retained only 100. The two halves repeatedly evicted each other and replayed forever.
 - At 03:26 HKT the bot was gracefully stopped behind `data/watchdog_paused` to prevent further
   paper-ledger contamination. Telegram approval listener and OMS remained running.
-- Local P0 fix now stops live pagination at the first page overlapping known history and raises
-  the per-wallet dedup cap 100 -> 500. Full Python suite: **662 passed**. Git/AWS deployment is
-  still pending; do not remove the watchdog pause until the restart gate in
-  `docs/copy-trading/SAFETY.md` Sec.69 passes.
+- P0 fix stops live pagination at the first page overlapping known history and raises the
+  per-wallet dedup cap 100 -> 500. Local Python suite: **662 passed**; tracked AWS suite:
+  **655 passed**.
+- Commit `93c193b` was pushed to GitHub `main`, fast-forwarded onto AWS, and the two EC2-only
+  `config.py` overrides were preserved via a temporary stash/pop. `.env` and keys were neither
+  staged nor pushed.
+- The fixed paper bot started as the single PID `75742` at 03:44:42 HKT. The first cycle had a
+  one-time catch-up from IDs already evicted before the fix: 78 stale-market skips and 2 dust
+  `paper_sell` events. Those two sells covered only `$0.0882` cost basis and rounded to `$0.00`
+  PnL; no DB row was manually rewritten. Treat them as restart-contaminated observations.
+- After that catch-up, steady-state replay stopped: between the first and second TTP sweeps there
+  were only 2 ordinary `skip_extreme_tail_entry_price` events, zero sells, and zero errors.
+- TTP marks completed at 03:45:13 and 03:50:38 HKT, a 5m25s interval versus the broken 8m02s.
+  Final Prometheus check: equity `$1,801.36`, 56 open positions, kill switch `0`.
+- The watchdog pause and manual autodeploy lock were removed after the final documentation sync;
+  normal watchdog/autodeploy operation resumed.
 
 ## Open risks and next decisions
 
@@ -162,4 +177,26 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
    - Targeted tests: `python3 -m unittest test_polymarket_data_api test_db_seen_trade
      test_bot_risk_checks` — **310 passed**.
    - Full tests: `python3 -m unittest discover` — **662 passed**.
-   - Commit / GitHub / AWS deploy verification: pending; update before P0 completion.
+   - P0 implementation commit: `93c193b`; pushed to GitHub `main` and deployed to AWS.
+
+### 2026-08-05 03:50 HKT — P0 deployment and live restart gate
+
+1. **When:** 2026-08-05 03:38-03:50 HKT.
+2. **Files adjusted:**
+   - `CLAUDE_HANDOFF.md` — changed P0 from pending to live-verified and recorded final metrics.
+   - `docs/copy-trading/RISK_MANAGEMENT.md` — recorded the deployment outcome and dust-event
+     contamination boundary.
+   - `docs/copy-trading/SAFETY.md` — recorded the passed restart gate.
+   - EC2 `config.py` — no new strategy change; the existing DB-source and OMS overrides were
+     temporarily stashed, then restored unchanged around the fast-forward pull.
+   - EC2 `data/watchdog_paused` and `data/autodeploy.lock` — temporary deployment controls,
+     removed after verification.
+3. **What changed:**
+   - Pushed and deployed `93c193b` without committing `.env`, `.env.example`, keys, or unrelated
+     dirty-worktree files.
+   - AWS tests: `python3 -m unittest discover -p 'test_*.py'` — **655 passed**.
+   - Restarted one paper-mode process (PID `75742`) with DB roster, OMS mirror, and dedup cap 500.
+   - Verified TTP at 03:45:13 and 03:50:38 HKT, equity `$1,801.36`, 56 positions, kill switch off,
+     and zero post-start errors.
+   - Replay churn stopped after one bounded catch-up. Two dust sells from that catch-up had
+     `$0.0882` combined cost basis and `$0.00` rounded PnL; left auditable, not manually hidden.

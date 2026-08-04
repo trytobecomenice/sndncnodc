@@ -4417,11 +4417,16 @@ and backfill callers omit the boundary and keep the original full-pagination beh
 the same eviction cycle. A regression test pins the invariant that the production cap must be at
 least `DIRECT_API_PER_WALLET_LIMIT * MAX_PAGES_PER_FETCH`.
 
-**Operational response:** because this was actively altering paper exits, the bot was gracefully
-stopped behind the existing watchdog pause sentinel while the fix was tested. No live funds,
-wallet status, schema, or manual position edits were involved. Deployment verification must show
-one process, bounded event counters, no errors, kill switch off, and consecutive TTP marks before
-the pause is cleared and P0 is declared complete.
+**Operational response and live result:** because this was actively altering paper exits, the bot
+was gracefully stopped behind the existing watchdog pause sentinel while the fix was tested. No
+live funds, wallet status, schema, or manual position edits were involved. Commit `93c193b` passed
+662 local tests and 655 tracked tests on EC2, then started as one paper-mode process. Its first
+cycle had one bounded catch-up from IDs already evicted before the fix (78 stale-market skips and
+2 dust sells covering `$0.0882` cost basis / `$0.00` rounded PnL); these are explicitly treated as
+restart-contaminated observations and were not manually hidden. The next five minutes contained
+only 2 ordinary extreme-tail skips, zero sells, and zero errors. TTP marks at 03:45:13 and 03:50:38
+HKT were 5m25s apart, versus the broken 8m02s; final equity was `$1,801.36`, 56 open positions,
+and the kill switch remained off. The watchdog/autodeploy controls were then returned to normal.
 
 ## What is intentionally still simple
 
