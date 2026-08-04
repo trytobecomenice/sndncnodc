@@ -137,6 +137,25 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 
 ## Change log
 
+### 2026-08-05 — External GitHub strategy audit (research only)
+
+1. **When:** 2026-08-05 HKT.
+2. **Files adjusted:**
+   - `docs/research/GITHUB_POLYMARKET_REPO_AUDIT_2026-08-05.md` — created.
+   - `CLAUDE_HANDOFF.md` — added this handoff entry.
+3. **What changed:**
+   - Source-audited exact commits from `Drakkar-Software/OctoBot-Prediction-Market`,
+     `Anmoldureha/polymarket-trading-bot-strategies`, and
+     `llogiq33/Polymarket-Copy-Trade`.
+   - Found that OctoBot's repository is a GPL wrapper whose advertised profile-follow/arbitrage
+     features are still documented as in progress; llogiq33 contains only a README; and the
+     PolyHFT-style repo has no license plus material execution/test weaknesses.
+   - Imported no external source code and made no bot, AWS, DB, roster, `.env`, key or strategy
+     change. Proposed only a future clean-room, shadow-only arbitrage research path.
+   - External narrow tests: `python3 -m pytest tests/test_single_arbitrage.py
+     test_new_strategies.py -q` — **3 passed, 4 warnings**; these tests cover detection, not safe
+     execution.
+
 ### 2026-08-05 03:11 HKT — Codex P0 audit and Claude handoff
 
 1. **When:** 2026-08-05 02:40-03:11 HKT.
