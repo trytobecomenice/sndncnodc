@@ -17,6 +17,53 @@ import oms_client
 import polymarket_simulator
 
 
+class TestPanicProtocol(unittest.TestCase):
+    def test_hard_kill_invalidates_entry_intents_and_preserves_exits(self):
+        risk_state = {}
+        with patch("bot.set_risk_value") as set_value, \
+             patch("bot.invalidate_all_pending_executions", return_value=2) as invalidate, \
+             patch("bot.get_pending_exit_orders", return_value=[{"id": "sell-1"}]), \
+             patch("bot.append_log") as append_log, \
+             patch.object(bot.METRIC_KILL_SWITCH_ACTIVE, "set"):
+            kill = bot.engage_panic_protocol(
+                risk_state, ["positions_not_a_mapping"]
+            )
+
+        self.assertIs(risk_state["kill_switch"], kill)
+        self.assertEqual(kill["trigger_type"], "panic_local_risk_invariant")
+        set_value.assert_called_once_with("kill_switch", kill)
+        invalidate.assert_called_once()
+        event = append_log.call_args.args[0]
+        self.assertEqual(event["event_type"], "risk_panic_protocol_triggered")
+        self.assertEqual(event["pending_entry_intents_invalidated"], 2)
+        self.assertEqual(event["live_entry_orders_canceled"], 0)
+        self.assertEqual(event["pending_exit_orders_preserved"], 1)
+
+    def test_entry_invalidation_failure_is_persisted_in_kill_reasons(self):
+        risk_state = {}
+        with patch("bot.set_risk_value") as set_value, \
+             patch("bot.invalidate_all_pending_executions", side_effect=RuntimeError("db down")), \
+             patch("bot.get_pending_exit_orders", return_value=[]), \
+             patch("bot.append_log"), \
+             patch.object(bot.METRIC_KILL_SWITCH_ACTIVE, "set"):
+            kill = bot.engage_panic_protocol(risk_state, ["bad_state"])
+
+        self.assertEqual(set_value.call_count, 2)
+        self.assertIn("pending_entry_invalidation_failed:db down", kill["reasons"])
+
+    def test_journal_failure_uses_direct_critical_alert_fallback(self):
+        with patch("bot.set_risk_value"), \
+             patch("bot.invalidate_all_pending_executions", return_value=0), \
+             patch("bot.get_pending_exit_orders", return_value=[]), \
+             patch("bot.append_log", side_effect=RuntimeError("journal down")), \
+             patch("bot.telegram_alerts.send_telegram_alert") as alert, \
+             patch.object(bot.METRIC_KILL_SWITCH_ACTIVE, "set"):
+            bot.engage_panic_protocol({}, ["state invalid"])
+
+        alert.assert_called_once()
+        self.assertIn("manual reconciliation required", alert.call_args.args[0])
+
+
 class TestMarkTradeSeen(unittest.TestCase):
     """_mark_trade_seen() (2026-07-31) — per-wallet dedup, replacing a single
     global deque(maxlen=2000). Confirmed live: the old design let one busy

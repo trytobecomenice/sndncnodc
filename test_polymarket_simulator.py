@@ -323,6 +323,8 @@ class TestFetchOrderBook(unittest.TestCase):
             book = fetch_order_book("some-token")
         self.assertEqual(book["book_timestamp_ms"], int(raw["timestamp"]))
         self.assertEqual(book["book_hash"], "0xbookhash")
+        self.assertIsInstance(book["received_timestamp_ms"], int)
+        self.assertIsInstance(book["received_monotonic_ns"], int)
 
     def test_empty_last_trade_price_does_not_discard_valid_book(self):
         # Live regression, 2026-08-05: Polymarket returned "" for this

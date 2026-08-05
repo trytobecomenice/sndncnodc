@@ -1069,10 +1069,34 @@ EQUITY_MARK_MIN_ENTRY_PRICE = 0.02
 # EQUITY_MARK_MIN_ENTRY_PRICE/TCA_MIN_ENTRY_PRICE, not re-derived.
 PER_TRADE_ENTRY_PRICE_FLOOR = 0.02
 
+# --- Passive shadow recorder / execution-integrity interlock ----------------
+# Both switches default OFF. The first production collection must be an
+# explicit operator decision after a burst benchmark on the t3.small; merely
+# deploying the code must not start a recorder or change BUY eligibility.
+# Measurement is signal-triggered only: no 10ms timer, asyncio polling loop,
+# or active book-freshness scan is created by either feature.
+ENABLE_PASSIVE_SHADOW_RECORDER = os.environ.get(
+    "ENABLE_PASSIVE_SHADOW_RECORDER", "false"
+).lower() in ("1", "true", "yes")
+ENABLE_PASSIVE_ENTRY_INTERLOCK = os.environ.get(
+    "ENABLE_PASSIVE_ENTRY_INTERLOCK", "false"
+).lower() in ("1", "true", "yes")
+
+# Initial SLOs are conservative engineering judgments, not claimed alpha-
+# optimal thresholds. Shadow evidence must report their would-have-blocked
+# rate before ENABLE_PASSIVE_ENTRY_INTERLOCK is enabled in production.
+ENTRY_INTERLOCK_MAX_SCHEDULER_LAG_MS = 250.0
+ENTRY_INTERLOCK_MAX_BOOK_AGE_MS = 5_000.0
+ENTRY_INTERLOCK_MAX_DECISION_QUEUE_AGE_MS = 250.0
+ENTRY_INTERLOCK_RECOVERY_WINDOW_MS = 5_000
+ENTRY_INTERLOCK_MIN_RECOVERY_SAMPLES = 3
+SHADOW_JOURNAL_QUEUE_CAPACITY = 1_024
+
 # Files (all inside this project directory)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADE_LOG_PATH = os.path.join(BASE_DIR, "trades_log.json")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
+SHADOW_JOURNAL_PATH = os.path.join(BASE_DIR, "data", "shadow_events_v1.jsonl")
 
 # Shared SQLite DB (packages/db owns the schema/migrations; db.py only ever
 # does SELECT/INSERT/UPDATE/DELETE against it, never CREATE/ALTER TABLE).

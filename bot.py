@@ -59,6 +59,14 @@ import polymarket_simulator
 import oms_client
 import telegram_alerts
 from prometheus_client import Gauge, start_http_server
+from entry_interlock import (
+    IntegrityThresholds,
+    entry_interlock_state_from_risk_value,
+    evaluate_entry_interlock,
+)
+from passive_integrity import measure_passive_integrity
+from shadow_capture import build_passive_shadow_event
+from shadow_replay import BoundedJournalWriter, JsonlEventJournal
 
 
 def now_iso():
@@ -645,6 +653,23 @@ def get_market_bid_ask(market_slug, outcome):
     return best_bid, best_ask, None
 
 
+def fetch_book_depth_snapshot(market_slug, outcome):
+    """Return (visible ask USD depth, the already-fetched public book).
+
+    The second value lets passive shadow capture reuse this exact read. It
+    must never issue a duplicate request merely for watchdog measurement.
+    """
+    try:
+        _, book = polymarket_simulator.fetch_order_book_for_outcome(market_slug, outcome)
+    except Exception:
+        return None, None
+
+    asks = book.get("asks") or []
+    if not asks:
+        return None, book
+    return sum(price * size for price, size in asks), book
+
+
 def fetch_book_depth_usd(market_slug, outcome):
     """Visible ASK-side depth in USD (sum of price*size across every level
     the book returns) for risk_manager.depth_capped_trade_size_usd() —
@@ -657,15 +682,106 @@ def fetch_book_depth_usd(market_slug, outcome):
     price-fetch helper in this file (get_market_ask_price/get_market_bid_ask
     above).
     """
-    try:
-        _, book = polymarket_simulator.fetch_order_book_for_outcome(market_slug, outcome)
-    except Exception:
-        return None
+    depth_usd, _ = fetch_book_depth_snapshot(market_slug, outcome)
+    return depth_usd
 
-    asks = book.get("asks") or []
-    if not asks:
+
+def _entry_integrity_thresholds():
+    return IntegrityThresholds(
+        max_event_loop_lag_ms=config.ENTRY_INTERLOCK_MAX_SCHEDULER_LAG_MS,
+        max_market_data_age_ms=config.ENTRY_INTERLOCK_MAX_BOOK_AGE_MS,
+        max_decision_queue_age_ms=config.ENTRY_INTERLOCK_MAX_DECISION_QUEUE_AGE_MS,
+        recovery_window_ms=config.ENTRY_INTERLOCK_RECOVERY_WINDOW_MS,
+        min_recovery_samples=config.ENTRY_INTERLOCK_MIN_RECOVERY_SAMPLES,
+    )
+
+
+def record_passive_shadow_decision(trade, book, copy_size_usd, writer, risk_state,
+                                   decision_monotonic_ns=None, decision_timestamp_ms=None):
+    """Measure, interlock, and enqueue one BUY signal without active polling.
+
+    `book` is the snapshot process_trade already fetched for depth sizing.
+    This function performs no network call. It returns whether the journal
+    accepted the event; queue overflow is an integrity breach before the
+    real BUY gate runs.
+    """
+    if writer is None:
         return None
-    return sum(price * size for price, size in asks)
+    decision_monotonic_ns = decision_monotonic_ns or time.monotonic_ns()
+    decision_timestamp_ms = decision_timestamp_ms or (time.time_ns() // 1_000_000)
+    book = book or {}
+    measurement = measure_passive_integrity(
+        trade, book, decision_monotonic_ns, decision_timestamp_ms
+    )
+
+    enforce = config.ENABLE_PASSIVE_ENTRY_INTERLOCK
+    state_key = "_entry_interlock_state" if enforce else "_shadow_interlock_state"
+    state = risk_state[state_key]
+    starting_status = state.status
+    health_before = writer.health()
+    previous_drops = risk_state.get("_shadow_writer_last_dropped", 0)
+    previous_errors = risk_state.get("_shadow_writer_last_errors", 0)
+    audit_healthy = (
+        health_before.running
+        and health_before.dropped_events == previous_drops
+        and health_before.write_errors == previous_errors
+    )
+    sample = measurement.to_interlock_sample(
+        sequence_coherent=(
+            book.get("book_timestamp_ms") is not None
+            and book.get("book_hash") is not None
+        ),
+        minimum_audit_available=audit_healthy,
+    )
+    proposed = evaluate_entry_interlock(state, sample, _entry_integrity_thresholds()).state
+
+    event = build_passive_shadow_event(
+        trade,
+        book,
+        copy_size_usd,
+        measurement,
+        proposed.active,
+        decision_timestamp_ms,
+        decision_monotonic_ns,
+    )
+    accepted = writer.submit(event)
+    final_state = proposed
+    if not accepted:
+        failed_sample = measurement.to_interlock_sample(
+            sequence_coherent=sample.sequence_coherent,
+            minimum_audit_available=False,
+        )
+        final_state = evaluate_entry_interlock(
+            proposed, failed_sample, _entry_integrity_thresholds()
+        ).state
+
+    health_after = writer.health()
+    risk_state["_shadow_writer_last_dropped"] = health_after.dropped_events
+    risk_state["_shadow_writer_last_errors"] = health_after.write_errors
+    risk_state[state_key] = final_state
+
+    if enforce:
+        risk_state["entry_interlock"] = final_state.risk_value()
+        METRIC_ENTRY_INTERLOCK_ACTIVE.set(1 if final_state.active else 0)
+        if final_state.status != starting_status:
+            if final_state.active:
+                set_risk_value("entry_interlock", final_state.risk_value())
+                append_log({
+                    "timestamp": now_iso(),
+                    "event_type": "risk_entry_interlock_triggered",
+                    "reasons": list(final_state.reasons),
+                    "passive_integrity": measurement.__dict__,
+                    "source_trade_id": trade.get("trade_id"),
+                })
+            else:
+                clear_risk_value("entry_interlock")
+                append_log({
+                    "timestamp": now_iso(),
+                    "event_type": "risk_entry_interlock_cleared",
+                    "passive_integrity": measurement.__dict__,
+                    "source_trade_id": trade.get("trade_id"),
+                })
+    return accepted
 
 
 def compute_slippage_floor_price(mid_price, live_edge_pct, protection_fraction=None):
@@ -2159,7 +2275,7 @@ from db import (  # noqa: E402
     get_closed_trade_stats_since, record_pnl_snapshot, prune_event_log,
     create_pending_execution, get_pending_execution, get_pending_executions,
     update_pending_execution_anchor, update_pending_execution_lowest_seen,
-    close_pending_execution,
+    close_pending_execution, invalidate_all_pending_executions,
     get_unconsumed_whale_events, mark_whale_event_consumed,
     get_unconsumed_whale_events_without_registry_match, upsert_token_registry_row,
     compute_live_edge_pct, create_pending_exit_order, get_pending_exit_orders,
@@ -2171,6 +2287,69 @@ from db import (  # noqa: E402
     has_snapshot_for_today, record_daily_snapshot, realized_pnl_today,
 )
 import risk_manager  # noqa: E402
+
+
+def engage_panic_protocol(risk_state, reasons):
+    """Latch hard kill, stop entry intents, preserve exits, and alert.
+
+    Current live BUY execution uses market/FAK semantics and does not leave
+    resting entry orders. The only resting exchange orders managed here are
+    SELL exits, so cancel-all would increase risk by trapping positions.
+    """
+    reasons = [str(reason) for reason in reasons] or ["unknown_local_risk_invariant_failure"]
+    reason_text = "; ".join(reasons)
+    kill_switch = {
+        "triggered_at": now_iso(),
+        "reasons": reasons,
+        "trigger_type": "panic_local_risk_invariant",
+    }
+    risk_state["kill_switch"] = kill_switch
+    set_risk_value("kill_switch", kill_switch)
+    METRIC_KILL_SWITCH_ACTIVE.set(1)
+
+    try:
+        invalidated = invalidate_all_pending_executions(
+            f"panic protocol: {reason_text}"
+        )
+    except Exception as e:
+        invalidated = 0
+        reasons.append(f"pending_entry_invalidation_failed:{e}")
+        # Persist the complete failure context too. The first write above
+        # latches the kill before any other operation; this second write
+        # ensures the operator can see if the stop-entry step itself failed.
+        kill_switch["reasons"] = reasons
+        set_risk_value("kill_switch", kill_switch)
+    try:
+        preserved_exits = len(get_pending_exit_orders(status="pending"))
+    except Exception:
+        preserved_exits = None
+
+    panic_event = {
+        "timestamp": now_iso(),
+        "event_type": "risk_panic_protocol_triggered",
+        "reasons": reasons,
+        "pending_entry_intents_invalidated": invalidated,
+        "live_entry_orders_canceled": 0,
+        "live_entry_cancel_note": "current BUY path leaves no resting entry orders",
+        "pending_exit_orders_preserved": preserved_exits,
+    }
+    try:
+        append_log(panic_event)
+    except Exception as alert_log_error:
+        # A damaged DB is one of the exact situations this path is for.
+        # Telegram is the independent last-resort operator channel.
+        logger.exception(f"panic event journal/alert failed: {alert_log_error}")
+        telegram_alerts.send_telegram_alert(
+            f"🚨 CRITICAL Copy Bot PANIC: {'; '.join(reasons)}. Hard kill requested; "
+            f"{invalidated} pending entry intent(s) invalidated; exit orders preserved. "
+            f"Event journal failed ({alert_log_error}); manual reconciliation required."
+        )
+    logger.critical(
+        f"PANIC PROTOCOL — hard kill latched; invalidated {invalidated} pending entry intent(s); "
+        f"preserved {preserved_exits if preserved_exits is not None else 'unknown'} exit order(s): "
+        f"{reason_text}"
+    )
+    return kill_switch
 
 
 def resolve_market_event(market_slug):
@@ -3001,7 +3180,8 @@ def _close_shadow_on_source_sell(base_event, key, market_slug, outcome, price,
 
 def process_trade(trade, positions, source_positions, source_cost_basis, trader_performance,
                   muted_traders, tracked_by_lower, risk_state, wallet_scores, shadow_positions=None,
-                  wallet_ev_stats=None, wallet_mode="track", challenger_positions=None):
+                  wallet_ev_stats=None, wallet_mode="track", challenger_positions=None,
+                  shadow_journal_writer=None):
     trader = trade["user_address"]
     nickname = nickname_for(trader, tracked_by_lower)
     market_slug = trade.get("market_slug") or ""
@@ -3253,8 +3433,17 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
         # ENABLE_ZOMBIE_POSITION_DUMP). Skipped entirely when trade_usd is
         # already non-positive — no point spending a network call sizing a
         # copy that's about to be skipped anyway.
+        decision_book = None
         if trade_usd > 0:
-            book_depth_usd = fetch_book_depth_usd(market_slug, outcome)
+            if shadow_journal_writer is None:
+                # Preserve the existing hot path (and its established test
+                # seam) while capture is disabled. Enabling shadow capture
+                # reuses the same one REST read and never duplicates it.
+                book_depth_usd = fetch_book_depth_usd(market_slug, outcome)
+            else:
+                book_depth_usd, decision_book = fetch_book_depth_snapshot(
+                    market_slug, outcome
+                )
             depth_capped_usd = risk_manager.depth_capped_trade_size_usd(
                 trade_usd, book_depth_usd, config.TRADE_SIZE_DEPTH_FRACTION
             )
@@ -3327,6 +3516,15 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
                                   f"kelly_fraction={kelly_fraction}) — no assumed edge, no trade",
                         "score_breakdown": score_breakdown})
             return
+
+        if shadow_journal_writer is not None:
+            record_passive_shadow_decision(
+                trade,
+                decision_book,
+                trade_usd,
+                shadow_journal_writer,
+                risk_state,
+            )
 
         # Rule 29 (2026-07-24): tracked wallets in
         # config.LIMIT_ORDER_TRACKED_WALLETS never take the immediate-copy
@@ -3782,6 +3980,50 @@ def main():
         # guard exists for in the first place.
         "resolved_markets": set(),
     }
+    current_monotonic_ms = time.monotonic_ns() // 1_000_000
+    risk_state["_entry_interlock_state"] = entry_interlock_state_from_risk_value(
+        risk_state["entry_interlock"], current_monotonic_ms
+    )
+    risk_state["_shadow_interlock_state"] = entry_interlock_state_from_risk_value(
+        None, current_monotonic_ms
+    )
+    risk_state["_shadow_writer_last_dropped"] = 0
+    risk_state["_shadow_writer_last_errors"] = 0
+
+    shadow_journal_writer = None
+    if config.ENABLE_PASSIVE_SHADOW_RECORDER:
+        try:
+            shadow_journal_writer = BoundedJournalWriter(
+                JsonlEventJournal(config.SHADOW_JOURNAL_PATH),
+                queue_capacity=config.SHADOW_JOURNAL_QUEUE_CAPACITY,
+            )
+        except Exception as e:
+            append_log({
+                "timestamp": now_iso(),
+                "event_type": "error",
+                "error": f"passive shadow recorder failed to start: {e}",
+            })
+    if config.ENABLE_PASSIVE_ENTRY_INTERLOCK and shadow_journal_writer is None:
+        startup_interlock = {
+            "active": True,
+            "status": "interlocked",
+            "reasons": ["minimum_audit_unavailable"],
+        }
+        risk_state["entry_interlock"] = startup_interlock
+        risk_state["_entry_interlock_state"] = entry_interlock_state_from_risk_value(
+            startup_interlock, current_monotonic_ms
+        )
+        set_risk_value("entry_interlock", startup_interlock)
+        append_log({
+            "timestamp": now_iso(),
+            "event_type": "risk_entry_interlock_triggered",
+            "reasons": startup_interlock["reasons"],
+        })
+    metadata_defects = risk_manager.validate_local_portfolio_invariants(
+        {}, kill_switch=risk_state["kill_switch"], equity_hwm=risk_state["equity_hwm"]
+    )
+    if metadata_defects:
+        engage_panic_protocol(risk_state, metadata_defects)
     evaluation_epoch = get_or_create_evaluation_epoch()
     METRIC_KILL_SWITCH_ACTIVE.set(1 if risk_state["kill_switch"] else 0)
     METRIC_ENTRY_INTERLOCK_ACTIVE.set(1 if risk_state["entry_interlock"] else 0)
@@ -3815,7 +4057,24 @@ def main():
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
-    state = load_state()
+    try:
+        state = load_state()
+    except Exception as e:
+        message = f"risk state load failed; bot cannot evaluate positions: {e}"
+        try:
+            engage_panic_protocol(risk_state, [message])
+        except Exception:
+            telegram_alerts.send_telegram_alert(
+                f"🚨 CRITICAL Copy Bot PANIC: {message}. Bot startup aborted; manual review required."
+            )
+        raise
+    position_defects = risk_manager.validate_local_portfolio_invariants(
+        state.get("positions"),
+        kill_switch=risk_state["kill_switch"],
+        equity_hwm=risk_state["equity_hwm"],
+    )
+    if position_defects:
+        engage_panic_protocol(risk_state, position_defects)
     # Per-wallet dedup (2026-07-31, replacing a single global
     # deque(maxlen=2000)) — see config.SEEN_TRADE_IDS_PER_WALLET_CAP's
     # docstring for the bug this fixes: a busy wallet's volume evicting a
@@ -4007,7 +4266,8 @@ def main():
                                   trader_performance, muted_traders, all_by_lower,
                                   risk_state, wallet_scores, shadow_positions=shadow_positions,
                                   wallet_ev_stats=wallet_ev_stats, wallet_mode=wallet_mode,
-                                  challenger_positions=challenger_positions)
+                                  challenger_positions=challenger_positions,
+                                  shadow_journal_writer=shadow_journal_writer)
                 except Exception as e:
                     append_log({"timestamp": now_iso(), "event_type": "error",
                                 "source_trade_id": tid,
@@ -4215,6 +4475,11 @@ def main():
             time.sleep(1)
 
     persist()
+    if shadow_journal_writer is not None:
+        try:
+            shadow_journal_writer.close(timeout=5)
+        except Exception as e:
+            logger.error(f"passive shadow recorder failed to drain cleanly: {e}")
     direct_feed_executor.shutdown(wait=False)
     logger.info("Copybot stopped cleanly (state saved).")
 

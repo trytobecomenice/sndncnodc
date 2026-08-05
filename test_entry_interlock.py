@@ -7,6 +7,7 @@ from entry_interlock import (
     IntegritySample,
     IntegrityThresholds,
     InterlockStatus,
+    entry_interlock_state_from_risk_value,
     evaluate_entry_interlock,
 )
 
@@ -74,6 +75,20 @@ class TestEntryInterlock(unittest.TestCase):
         ).state
         self.assertEqual(state.risk_value()["status"], "interlocked")
         self.assertEqual(state.risk_value()["reasons"], ["sequence_not_coherent"])
+
+    def test_active_state_restarts_recovery_window_from_current_monotonic_clock(self):
+        state = entry_interlock_state_from_risk_value(
+            {"active": True, "status": "interlocked", "reasons": ["stale"]},
+            observed_monotonic_ms=5_000,
+        )
+        self.assertTrue(state.active)
+        self.assertEqual(state.changed_at_monotonic_ms, 5_000)
+        self.assertEqual(state.recovery_started_monotonic_ms, None)
+
+    def test_malformed_persisted_value_restores_fail_closed(self):
+        state = entry_interlock_state_from_risk_value({"active": "maybe"}, 5_000)
+        self.assertTrue(state.active)
+        self.assertEqual(state.reasons, ("persisted_entry_interlock_state_malformed",))
 
 
 if __name__ == "__main__":

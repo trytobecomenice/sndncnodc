@@ -148,6 +148,48 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 
 ## Change log
 
+### 2026-08-06 — Passive signal capture, observer-safe integrity checks, and panic protocol
+
+1. **When:** 2026-08-06 00:45–01:27 HKT.
+2. **Files adjusted:**
+   - `polymarket_data_api.py`, `polymarket_simulator.py`, and their tests — stamp source rows and
+     REST books once at receipt with wall and monotonic clocks, retain canonicalized source input,
+     and pass those values forward without adding a polling task.
+   - `passive_integrity.py`, `entry_interlock.py`, and their tests — calculate queue age and book
+     freshness only when a BUY decision is already being evaluated; restore malformed persisted
+     interlock state fail-closed after restart.
+   - `shadow_capture.py`, `shadow_replay.py`, and their tests — turn the real polling signal and the
+     same already-fetched depth book into a replayable shadow event, including the actual continuous
+     Kelly copy size as one bounded extra executable-VWAP tier.
+   - `bot.py`, `config.py`, `risk_manager.py`, `db.py`, `test_bot_passive_shadow.py`,
+     `test_bot_risk_checks.py`, `test_db_pending_execution.py`, and `test_risk_manager.py` — wire the
+     opt-in recorder into the real polling BUY path, connect its passive samples to the optional
+     entry interlock, validate local portfolio invariants, and add a persistent panic path.
+   - `docs/research/SHADOW_REPLAY_ARCHITECTURE_2026-08-06.md`, `docs/TODO_2026-08-06.md`, and this
+     handoff — record the exact completed boundary, production safety decision, and next evidence
+     gate.
+3. **What changed:**
+   - There is no 10 ms watchdog, `asyncio.sleep()` sampler, active queue scan, or duplicate book
+     request. Queue age is `decision_monotonic - signal_enqueued_monotonic`; book age combines
+     server age at local receipt with monotonic local residence. The writer thread blocks on its
+     queue when idle and the producer uses non-blocking submission.
+   - Malformed optional execution-integrity state remains a recoverable BUY interlock. Malformed
+     core position/kill-switch/equity-HWM state latches the persistent hard kill, invalidates every
+     delayed BUY intent, preserves SELL exits, and sends a CRITICAL Telegram alert. The current
+     FAK/market BUY path leaves no managed resting entry orders, so a dangerous cancel-all is not
+     used; the alert requires manual venue position/order reconciliation.
+   - `ENABLE_PASSIVE_SHADOW_RECORDER` and `ENABLE_PASSIVE_ENTRY_INTERLOCK` both default false.
+     Disabled production keeps the old book-depth hot path; enabling capture reuses the exact one
+     REST book already fetched for sizing. The shadow module has no order/key/network dependency.
+   - Git remotes on both the developer workspace and AWS were changed from the redirecting old URL
+     to `https://github.com/trytobecomenice/sndncnodc.git`; both resolved HEAD
+     `4e6cd276522344bd0332bd42124d2db6a133f33c` at verification.
+   - AWS read-only preflight found 53 open normal positions and zero invalid shares, cost bases, or
+     entry prices; no pending BUY intents, no pending exits, no active kill/interlock row, and a
+     numeric equity HWM. No AWS process, DB row, environment setting, or deployment was changed.
+   - Verification: focused suite **471 passed**; full workspace suite **727 passed**; compile and
+     `git diff --check` passed. `.env`, keys, and unrelated dirty-worktree files remain excluded.
+
 ### 2026-08-06 — Phase A shadow journal/replay and BUY interlock foundation
 
 1. **When:** 2026-08-06 HKT, after the architecture decision below.

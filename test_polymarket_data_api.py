@@ -92,6 +92,19 @@ class TestNormalizeActivityRecord(unittest.TestCase):
         self.assertEqual(result["market_title"], "")
         self.assertEqual(result["outcome"], "")
 
+    def test_passive_receive_metadata_is_optional_and_preserved(self):
+        result = normalize_activity_record(
+            REAL_TRADE_RECORD,
+            "0xabc",
+            received_timestamp_ms=1234,
+            enqueued_monotonic_ns=5678,
+            raw_payload='{"side":"BUY"}',
+        )
+        self.assertEqual(result["_received_timestamp_ms"], 1234)
+        self.assertEqual(result["_enqueued_monotonic_ns"], 5678)
+        self.assertEqual(result["_raw_payload"], '{"side":"BUY"}')
+        self.assertEqual(result["_source_timestamp_ms"], REAL_TRADE_RECORD["timestamp"] * 1000)
+
 
 class TestFetchAllWalletsConcurrent(unittest.TestCase):
     def test_one_wallet_failing_does_not_abort_the_batch(self):
@@ -112,6 +125,8 @@ class TestFetchAllWalletsConcurrent(unittest.TestCase):
             result = fetch_all_wallets_concurrent(["0xA", "0xB"])
         self.assertEqual(len(result["trades"]), 2)
         self.assertEqual(result["errors"], [])
+        self.assertIn("_enqueued_monotonic_ns", result["trades"][0])
+        self.assertEqual(result["trades"][0]["_raw_payload_format"], "canonicalized_api_record")
 
     def test_accepts_an_externally_provided_executor(self):
         # The whole point of make_persistent_executor(): bot.py must be able

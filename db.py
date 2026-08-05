@@ -765,6 +765,23 @@ def append_log(event):
             f"✅ Copy Bot drawdown warning cleared: equity ${event.get('equity', 0):.2f}. "
             f"New BUYs resumed."
         )
+    elif event_type == "risk_entry_interlock_triggered":
+        telegram_alerts.send_telegram_alert(
+            f"🚨 Copy Bot execution-integrity interlock: "
+            f"{'; '.join(str(reason) for reason in event.get('reasons', [])) or 'unknown reason'}. "
+            f"New BUYs paused; exits continue."
+        )
+    elif event_type == "risk_entry_interlock_cleared":
+        telegram_alerts.send_telegram_alert(
+            "✅ Copy Bot execution-integrity interlock recovered. New BUYs resumed."
+        )
+    elif event_type == "risk_panic_protocol_triggered":
+        telegram_alerts.send_telegram_alert(
+            f"🚨 CRITICAL Copy Bot PANIC: "
+            f"{'; '.join(str(reason) for reason in event.get('reasons', [])) or 'unknown invariant failure'}. "
+            f"Hard kill latched; {event.get('pending_entry_intents_invalidated', 0)} pending entry "
+            f"intent(s) invalidated; exit orders preserved. Manual position/order reconciliation required."
+        )
     elif event_type == "error":
         _maybe_send_throttled_error_alert(event)
 
@@ -1671,6 +1688,21 @@ def close_pending_execution(pending_execution_id, status, invalidated_reason=Non
             (status, invalidated_reason, filled_at, pending_execution_id),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def invalidate_all_pending_executions(reason):
+    """Atomically stop every not-yet-executed BUY intent during panic."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE pending_execution SET status = 'invalidated', invalidated_reason = ? "
+            "WHERE status = 'pending'",
+            (reason,),
+        )
+        conn.commit()
+        return cur.rowcount
     finally:
         conn.close()
 

@@ -167,6 +167,38 @@ class TestPendingExecutionCrud(_TempDbTestCase):
         row = db.get_pending_execution("0xTrader", "some-market", "Yes", status="invalidated")
         self.assertEqual(row["invalidated_reason"], "whale_sold")
 
+    def test_panic_bulk_invalidates_only_pending_entry_intents(self):
+        first = db.create_pending_execution(
+            wallet_address="0xA", market_slug="m1", outcome="Yes",
+            source_trade_id="t1", category="crypto", anchor_price=0.4,
+            whale_shares_at_creation=10.0, target_usd=5.0,
+            expires_at=int(time.time()) + 3600,
+        )
+        second = db.create_pending_execution(
+            wallet_address="0xB", market_slug="m2", outcome="No",
+            source_trade_id="t2", category="sports", anchor_price=0.6,
+            whale_shares_at_creation=20.0, target_usd=7.0,
+            expires_at=int(time.time()) + 3600,
+        )
+        expired = db.create_pending_execution(
+            wallet_address="0xC", market_slug="m3", outcome="Yes",
+            source_trade_id="t3", category="other", anchor_price=0.5,
+            whale_shares_at_creation=5.0, target_usd=3.0,
+            expires_at=int(time.time()) + 3600,
+        )
+        db.close_pending_execution(expired, "expired")
+
+        changed = db.invalidate_all_pending_executions("panic test")
+
+        self.assertEqual(changed, 2)
+        self.assertEqual(db.get_pending_executions(status="pending"), [])
+        rows = db.get_pending_executions(status="invalidated")
+        self.assertEqual({row["id"] for row in rows}, {first, second})
+        self.assertTrue(all(row["invalidated_reason"] == "panic test" for row in rows))
+        self.assertIsNotNone(
+            db.get_pending_execution("0xC", "m3", "Yes", status="expired")
+        )
+
 
 class TestSourceCostBasisRoundTrip(_TempDbTestCase):
     def test_save_state_writes_cost_basis_and_load_state_reads_it_back(self):

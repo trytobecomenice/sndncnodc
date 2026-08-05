@@ -253,7 +253,8 @@ def fetch_wallet_trades(wallet_address, limit=DEFAULT_FETCH_LIMIT,
     return all_records
 
 
-def normalize_activity_record(record, wallet_address):
+def normalize_activity_record(record, wallet_address, received_timestamp_ms=None,
+                              enqueued_monotonic_ns=None, raw_payload=None):
     """Converts one Polymarket /activity TRADE record into the exact dict
     shape bot.py's process_trade() already expects from bullpen's tracker
     feed (see bot.py's process_trade() for the authoritative field list) —
@@ -294,7 +295,7 @@ def normalize_activity_record(record, wallet_address):
     if timestamp is not None:
         formatted_timestamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(timestamp))
 
-    return {
+    normalized = {
         "trade_id": trade_id,
         "transaction_hash": tx_hash,
         "user_address": record.get("proxyWallet") or wallet_address,
@@ -306,6 +307,20 @@ def normalize_activity_record(record, wallet_address):
         "size_usd": record.get("usdcSize"),
         "timestamp": formatted_timestamp,
     }
+    # Passive timing metadata for the shadow recorder. Underscore-prefixed
+    # fields are deliberately ignored by the legacy trading logic. They are
+    # captured in the existing fetch worker at the moment the parsed API row
+    # becomes available, so queue age later needs no polling thread.
+    if received_timestamp_ms is not None:
+        normalized["_received_timestamp_ms"] = int(received_timestamp_ms)
+    if enqueued_monotonic_ns is not None:
+        normalized["_enqueued_monotonic_ns"] = int(enqueued_monotonic_ns)
+    if raw_payload is not None:
+        normalized["_raw_payload"] = raw_payload
+        normalized["_raw_payload_format"] = "canonicalized_api_record"
+    if timestamp is not None:
+        normalized["_source_timestamp_ms"] = int(float(timestamp) * 1000)
+    return normalized
 
 
 def fetch_all_wallets_concurrent(wallet_addresses, limit=DEFAULT_FETCH_LIMIT,
@@ -338,7 +353,26 @@ def fetch_all_wallets_concurrent(wallet_addresses, limit=DEFAULT_FETCH_LIMIT,
         if known_trade_ids is not None:
             fetch_kwargs["known_trade_ids"] = known_trade_ids
         raw = fetch_wallet_trades(wallet_address, **fetch_kwargs)
-        return [normalize_activity_record(r, wallet_address) for r in raw]
+        normalized = []
+        for record in raw:
+            received_timestamp_ms = time.time_ns() // 1_000_000
+            enqueued_monotonic_ns = time.monotonic_ns()
+            try:
+                raw_payload = json.dumps(
+                    record, sort_keys=True, separators=(",", ":"), allow_nan=False
+                )
+            except (TypeError, ValueError):
+                # Do not break the tracking feed because an optional
+                # research copy of a malformed row could not serialize.
+                raw_payload = None
+            normalized.append(normalize_activity_record(
+                record,
+                wallet_address,
+                received_timestamp_ms=received_timestamp_ms,
+                enqueued_monotonic_ns=enqueued_monotonic_ns,
+                raw_payload=raw_payload,
+            ))
+        return normalized
 
     def _run(exec_):
         futures = {exec_.submit(_fetch_one, addr): addr for addr in wallet_addresses}

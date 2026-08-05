@@ -402,6 +402,8 @@ def fetch_order_book(token_id, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness
     """
     path = f"/book?token_id={token_id}"
     data = _fetch_json(CLOB_API_HOST, path, timeout)
+    received_timestamp_ms = time.time_ns() // 1_000_000
+    received_monotonic_ns = time.monotonic_ns()
 
     book_timestamp_ms = data.get("timestamp")
     if book_timestamp_ms is not None and not ignore_staleness:
@@ -456,6 +458,8 @@ def fetch_order_book(token_id, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness
         "last_trade_price": last_trade_price,
         "book_timestamp_ms": parsed_book_timestamp_ms,
         "book_hash": book_hash,
+        "received_timestamp_ms": received_timestamp_ms,
+        "received_monotonic_ns": received_monotonic_ns,
     }
 
 

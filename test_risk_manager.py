@@ -37,6 +37,67 @@ class ConfigPatchingTestCase(unittest.TestCase):
             setattr(config, name, value)
 
 
+class TestLocalPortfolioInvariants(unittest.TestCase):
+    def test_valid_local_state_has_no_defects(self):
+        positions = {
+            "0xabc|market|Yes": {
+                "shares": 10.0,
+                "cost_basis_usd": 4.0,
+                "avg_entry_price": 0.4,
+            }
+        }
+        self.assertEqual(
+            risk_manager.validate_local_portfolio_invariants(
+                positions,
+                kill_switch={"reasons": ["operator_pause"]},
+                equity_hwm=125.0,
+            ),
+            [],
+        )
+
+    def test_malformed_position_and_metadata_fail_validation(self):
+        defects = risk_manager.validate_local_portfolio_invariants(
+            {
+                "bad-key": {"shares": 1, "cost_basis_usd": 1},
+                "0xabc|market|Yes": {
+                    "shares": 0,
+                    "cost_basis_usd": float("nan"),
+                    "avg_entry_price": 2,
+                },
+            },
+            kill_switch=True,
+            equity_hwm=-1,
+        )
+        self.assertIn("position_key_malformed:'bad-key'", defects)
+        self.assertIn("position_shares_invalid:0xabc|market|Yes", defects)
+        self.assertIn("position_cost_basis_usd_invalid:0xabc|market|Yes", defects)
+        self.assertIn("position_avg_entry_price_invalid:0xabc|market|Yes", defects)
+        self.assertIn("kill_switch_not_a_mapping", defects)
+        self.assertIn("equity_hwm_invalid", defects)
+
+    def test_non_mapping_positions_fail_validation(self):
+        self.assertEqual(
+            risk_manager.validate_local_portfolio_invariants([]),
+            ["positions_not_a_mapping"],
+        )
+
+    def test_malformed_truthy_kill_switch_blocks_without_crashing(self):
+        ok, event_type, reason = risk_manager.check_buy(
+            {}, {}, "event", 5.0, True
+        )
+        self.assertFalse(ok)
+        self.assertEqual(event_type, "skip_risk_kill_switch")
+        self.assertIn("malformed/unknown trigger", reason)
+
+    def test_empty_kill_switch_mapping_also_fails_closed(self):
+        ok, event_type, reason = risk_manager.check_buy(
+            {}, {}, "event", 5.0, {}
+        )
+        self.assertFalse(ok)
+        self.assertEqual(event_type, "skip_risk_kill_switch")
+        self.assertIn("malformed/unknown trigger", reason)
+
+
 class TestExposure(ConfigPatchingTestCase):
     def test_total_exposure_sums_cost_basis(self):
         positions = {"a|m1|Yes": pos(5.0), "b|m2|No": pos(10.0)}

@@ -81,6 +81,44 @@ class EntryInterlockState:
         }
 
 
+def entry_interlock_state_from_risk_value(value, observed_monotonic_ms):
+    """Restore persisted active/healthy state conservatively after restart.
+
+    Monotonic timestamps cannot cross a process restart, so an active value
+    restarts its recovery window from the current monotonic observation. A
+    malformed present value remains interlocked instead of becoming an
+    accidental fail-open.
+    """
+    observed_monotonic_ms = int(observed_monotonic_ms)
+    if value is None:
+        return EntryInterlockState(
+            status=InterlockStatus.HEALTHY,
+            changed_at_monotonic_ms=observed_monotonic_ms,
+            last_observed_monotonic_ms=observed_monotonic_ms,
+        )
+    if isinstance(value, dict):
+        explicitly_healthy = value.get("active") is False and value.get("status") == "healthy"
+        if explicitly_healthy:
+            return EntryInterlockState(
+                status=InterlockStatus.HEALTHY,
+                changed_at_monotonic_ms=observed_monotonic_ms,
+                last_observed_monotonic_ms=observed_monotonic_ms,
+            )
+        raw_reasons = value.get("reasons")
+        if isinstance(raw_reasons, (list, tuple)) and raw_reasons:
+            reasons = tuple(str(reason) for reason in raw_reasons)
+        else:
+            reasons = ("persisted_entry_interlock_state_malformed",)
+    else:
+        reasons = ("persisted_entry_interlock_state_malformed",)
+    return EntryInterlockState(
+        status=InterlockStatus.INTERLOCKED,
+        changed_at_monotonic_ms=observed_monotonic_ms,
+        last_observed_monotonic_ms=observed_monotonic_ms,
+        reasons=reasons,
+    )
+
+
 @dataclass(frozen=True)
 class InterlockTransition:
     previous_status: InterlockStatus

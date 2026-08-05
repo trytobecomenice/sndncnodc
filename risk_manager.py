@@ -29,7 +29,67 @@ accepted tradeoff at current stakes; the per-trade checks (ceiling / event
 cap / latched-switch lookup) are all instant.
 """
 
+import math
+
 import config
+
+
+def validate_local_portfolio_invariants(positions, kill_switch=None, equity_hwm=None):
+    """Return local risk-state defects that require persistent hard kill.
+
+    This validates only state this process actually owns. It does not claim
+    exchange reconciliation; custody/open-order truth needs a separately
+    authenticated venue query before it can be called verified.
+    """
+    defects = []
+    if not isinstance(positions, dict):
+        return ["positions_not_a_mapping"]
+
+    total_cost_basis = 0.0
+    for key, position in positions.items():
+        if not isinstance(key, str) or len(key.split("|")) != 3:
+            defects.append(f"position_key_malformed:{key!r}")
+            continue
+        if not isinstance(position, dict):
+            defects.append(f"position_not_a_mapping:{key}")
+            continue
+        for field, allow_zero in (("shares", False), ("cost_basis_usd", True)):
+            value = position.get(field)
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                defects.append(f"position_{field}_invalid:{key}")
+                continue
+            if not math.isfinite(numeric) or numeric < 0 or (not allow_zero and numeric == 0):
+                defects.append(f"position_{field}_invalid:{key}")
+            if field == "cost_basis_usd" and math.isfinite(numeric):
+                total_cost_basis += numeric
+        entry = position.get("avg_entry_price")
+        if entry is not None:
+            try:
+                entry_numeric = float(entry)
+            except (TypeError, ValueError):
+                defects.append(f"position_avg_entry_price_invalid:{key}")
+            else:
+                if not math.isfinite(entry_numeric) or not 0 < entry_numeric <= 1:
+                    defects.append(f"position_avg_entry_price_invalid:{key}")
+
+    if not math.isfinite(total_cost_basis):
+        defects.append("total_cost_basis_not_finite")
+    if kill_switch is not None:
+        if not isinstance(kill_switch, dict):
+            defects.append("kill_switch_not_a_mapping")
+        elif not isinstance(kill_switch.get("reasons"), list) or not kill_switch.get("reasons"):
+            defects.append("kill_switch_reasons_malformed")
+    if equity_hwm is not None:
+        try:
+            hwm = float(equity_hwm)
+        except (TypeError, ValueError):
+            defects.append("equity_hwm_invalid")
+        else:
+            if not math.isfinite(hwm) or hwm < 0:
+                defects.append("equity_hwm_invalid")
+    return defects
 
 
 def total_exposure_usd(positions):
@@ -227,11 +287,15 @@ def check_buy(positions, market_to_event, event_slug, trade_usd, kill_switch, wa
     for every wallet, same as omitting it entirely — existing callers that
     don't have this data yet don't have to change either).
     """
-    if kill_switch:
+    # None is the only healthy representation. Any present value, including
+    # an empty/malformed dict, must fail closed instead of being treated as
+    # falsy and silently reopening BUYs.
+    if kill_switch is not None:
         reasons = kill_switch.get("reasons") if isinstance(kill_switch, dict) else None
+        triggered_at = kill_switch.get("triggered_at", "?") if isinstance(kill_switch, dict) else "?"
         return False, "skip_risk_kill_switch", (
-            f"kill switch latched since {kill_switch.get('triggered_at', '?')}: "
-            f"{'; '.join(reasons) if reasons else 'unknown trigger'} — run "
+            f"kill switch latched since {triggered_at}: "
+            f"{'; '.join(str(reason) for reason in reasons) if reasons else 'malformed/unknown trigger'} — run "
             f"reset_kill_switch.py after review to resume buying"
         )
 

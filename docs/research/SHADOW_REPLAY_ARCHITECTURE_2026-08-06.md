@@ -1,22 +1,29 @@
 # Lean Shadow Recorder and Replay Architecture — 2026-08-06
 
-Status: Phase A foundation implemented locally on 2026-08-06; not production-active. The compact
-schema, bounded JSONL writer, virtual-clock replay, and recoverable BUY interlock exist, but no
-public-market WebSocket recorder, health sampler, AWS resize, or C++ service is running.
+Status: Phase A polling vertical slice implemented locally on 2026-08-06; not production-active.
+The compact schema, bounded JSONL writer, virtual-clock replay, passive signal-time measurement,
+recoverable BUY interlock, and persistent malformed-risk panic path exist. No public-market
+WebSocket recorder, AWS feature activation/resize, or C++ service is running.
 
 Implemented files:
 
 - `shadow_replay.py`: v1 envelope, integer BBO/top-three/`$3/$5/$10` VWAP features, four named
   causal checkpoints, non-blocking bounded writer health, and deterministic replay.
 - `entry_interlock.py`: pure immediate-trip/hysteretic-recovery state machine.
+- `passive_integrity.py` and `shadow_capture.py`: signal-triggered queue/book-age measurement and a
+  real polling signal -> current REST book -> replayable shadow-event adapter, with no network or
+  order dependency of their own.
 - `risk_manager.py`, `bot.py`, and `db.py`: the persisted interlock value is recognized by the
-  existing sole BUY gate and decision journal; SELL/exit paths remain untouched.
+  existing sole BUY gate and decision journal; malformed core local state persistently hard-kills
+  entries, invalidates delayed BUY intents, preserves SELL exits, and alerts an operator.
 - `polymarket_simulator.py`: the current direct REST adapter now preserves the server book
   timestamp and book hash needed by shadow attribution.
 
-The interlock producer is intentionally not active yet: event-loop/queue/book-freshness samplers
-and the public WebSocket shadow process still need Phase B implementation and burst testing. A
-dormant consumer gate must not be described as complete operational protection.
+The polling-path producer is implemented but intentionally defaults off pending burst testing.
+It passively derives signal queue age and book freshness at decision time without a timer or
+duplicate REST request. Recorder CPU/RSS, AWS CPU credits, a public WebSocket shadow process, and
+full sequence-aware reconciliation still need Phase B implementation. A disabled gate must not be
+described as operational protection.
 
 ## Objective
 
@@ -101,6 +108,21 @@ The degradation ladder has two separate safety outcomes:
 This separation avoids both failure modes: blindly buying while the execution path is late, and
 needlessly hard-killing a healthy trading path because an optional research payload could not be
 written.
+
+Observer-effect constraint: the current Python bot must not run a 10 ms watchdog. Source events
+receive a monotonic enqueue timestamp in the existing fetch worker; queue/scheduling age is
+calculated once when that event reaches BUY decision. A REST book receives wall and monotonic
+timestamps when its existing sizing request returns; effective freshness is server age at receipt
+plus local monotonic residence. The isolated journal worker blocks on `queue.get()` when idle and
+the trading producer only calls `put_nowait()`. Low-cadence host telemetry may be added separately,
+but it must not be confused with an active per-book safety poller.
+
+Panic semantics: current live BUY execution is FAK/market-style and does not intentionally leave
+managed resting entry orders. Managed resting exchange orders are SELL exits. Therefore malformed
+core risk state latches the hard kill and invalidates delayed local entry intents, but does not
+issue a blind venue cancel-all that could remove protection and trap positions. Telegram explicitly
+requires manual venue position/open-order reconciliation. Automatic authenticated reconciliation
+can replace that manual step only after the OMS exposes trustworthy side/reduce-only ownership.
 
 ### JSON decoding is benchmark-gated, not a blind one-line substitution
 
@@ -203,11 +225,12 @@ estimation.
 ### Phase A — minimum vertical slice
 
 1. Define the compact event envelope and the minimum copy-alpha fields above.
-2. Implement one source-signal -> BBO/VWAP -> hypothetical decision journal path using the current
-   direct REST adapter.
+2. **Implemented, feature-disabled:** one real polling source-signal -> BBO/VWAP -> hypothetical
+   decision journal path using the current direct REST adapter and the same already-fetched book.
 3. Implement a minimal virtual-clock replay test for that one path before live collection.
-4. Add event-loop lag, queue age, recorder RSS/CPU, dropped-event, entry-interlock, and CPU-credit
-   observability.
+4. **Partial:** passive queue/scheduling age, book freshness, dropped-event, writer error, and
+   entry-interlock signals exist. Add low-cadence recorder RSS/CPU and CPU-credit observability,
+   plus a captured burst benchmark; do not add a high-frequency active watchdog loop.
 5. Benchmark `json`/`orjson`/typed decoding on captured payloads; do not change the production
    decoder until semantic-equivalence and burst-performance gates pass.
 

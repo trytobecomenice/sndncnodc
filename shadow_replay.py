@@ -132,7 +132,7 @@ def _buy_vwap(asks, usd):
 
 def build_book_checkpoint(checkpoint, book, received_timestamp_ms, monotonic_ns,
                           book_timestamp_ms=None, source_sequence=None, source_hash=None,
-                          resync_generation=0, quality_flags=()):
+                          resync_generation=0, quality_flags=(), vwap_tiers_usd=VWAP_TIERS_USD):
     """Build fixed-width BBO/top-three/VWAP features from a public book."""
     bids = _normalize_levels(book.get("bids") or (), reverse=True)
     asks = _normalize_levels(book.get("asks") or (), reverse=False)
@@ -151,13 +151,14 @@ def build_book_checkpoint(checkpoint, book, received_timestamp_ms, monotonic_ns,
         best_ask_price_micros=(asks[0].price_micros if asks else None),
         top_bids=bids[:3],
         top_asks=asks[:3],
-        buy_vwap=tuple(_buy_vwap(asks, usd) for usd in VWAP_TIERS_USD),
+        buy_vwap=tuple(_buy_vwap(asks, usd) for usd in sorted(set(vwap_tiers_usd))),
         quality_flags=tuple(sorted(flags)),
     )
 
 
 def build_rest_book_checkpoint(checkpoint, book, received_timestamp_ms, monotonic_ns,
-                               resync_generation=0, quality_flags=()):
+                               resync_generation=0, quality_flags=(),
+                               vwap_tiers_usd=VWAP_TIERS_USD):
     """Adapt polymarket_simulator.fetch_order_book() output without I/O."""
     flags = set(quality_flags)
     if book.get("book_timestamp_ms") is None:
@@ -173,6 +174,7 @@ def build_rest_book_checkpoint(checkpoint, book, received_timestamp_ms, monotoni
         source_hash=book.get("book_hash"),
         resync_generation=resync_generation,
         quality_flags=flags,
+        vwap_tiers_usd=vwap_tiers_usd,
     )
 
 
