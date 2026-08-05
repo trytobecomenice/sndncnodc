@@ -189,6 +189,10 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
      numeric equity HWM. No AWS process, DB row, environment setting, or deployment was changed.
    - Verification: focused suite **471 passed**; full workspace suite **727 passed**; compile and
      `git diff --check` passed. `.env`, keys, and unrelated dirty-worktree files remain excluded.
+   - Implementation commit `d5ae7a4` (`feat(shadow): wire passive capture and panic interlock`)
+     was pushed to the new GitHub `main`. Post-push verification resolved GitHub HEAD to
+     `d5ae7a40a31efce257e63b8c291d0bbce65a5cd8`; AWS intentionally remains on `328a22d` with
+     `data/autodeploy.lock` present and one paper bot PID `83881`.
 
 ### 2026-08-06 — Phase A shadow journal/replay and BUY interlock foundation
 
