@@ -61,6 +61,7 @@ dependency policy.
 
 import http.client
 import json
+import math
 import threading
 import time
 import urllib.parse
@@ -420,18 +421,22 @@ def fetch_order_book(token_id, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness
         ((float(level["price"]), float(level["size"])) for level in data.get("asks", [])),
         key=lambda level: level[0],
     )
-    # 2026-07-29: confirmed live against the real API — this field comes
-    # back as a JSON STRING (e.g. "0.999"), same as every bid/ask price
-    # above, NOT already a float despite this function's own docstring
-    # claiming "float or None". Uncoerced, this silently produced a str
-    # that crashed bot.py's get_market_prices() the moment a thin/empty
-    # book fell back to it (`indicative <= 0` -> "'<=' not supported
-    # between instances of 'str' and 'int'") — found live: 200 occurrences
-    # over 3+ days, each one aborting that entire TTP sweep cycle AND
-    # skipping that cycle's kill-switch evaluation (see bot.py's main loop,
-    # which explicitly skips the equity check when the sweep itself failed).
+    # 2026-08-05: the live API started returning an EMPTY string for this
+    # optional field on otherwise-valid books (valid timestamp and bid/ask
+    # levels).  Treat missing/blank/malformed/non-finite optional last-trade
+    # data as unavailable, not as a reason to discard the whole book.  TTP
+    # can still use the live best bid; if the book itself is empty,
+    # get_market_prices() already fails soft with "no usable price".
     last_trade_price_raw = data.get("last_trade_price")
-    last_trade_price = float(last_trade_price_raw) if last_trade_price_raw is not None else None
+    last_trade_price = None
+    if last_trade_price_raw is not None and str(last_trade_price_raw).strip():
+        try:
+            parsed_last_trade_price = float(last_trade_price_raw)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if math.isfinite(parsed_last_trade_price):
+                last_trade_price = parsed_last_trade_price
     return {"bids": bids, "asks": asks, "last_trade_price": last_trade_price}
 
 

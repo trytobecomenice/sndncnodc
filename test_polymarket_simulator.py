@@ -314,6 +314,36 @@ class TestFetchOrderBook(unittest.TestCase):
             book = fetch_order_book("some-token")
         self.assertIsNone(book["last_trade_price"])
 
+    def test_empty_last_trade_price_does_not_discard_valid_book(self):
+        # Live regression, 2026-08-05: Polymarket returned "" for this
+        # optional field on every one of 53 otherwise-valid open-position
+        # books. float("") made every five-minute TTP mark fail.
+        raw = _book_body(
+            bids=[{"price": "0.10", "size": "5"}],
+            asks=[{"price": "0.90", "size": "2"}],
+            last_trade_price="",
+        )
+        mock_conn = MagicMock()
+        mock_conn.getresponse.side_effect = [_mock_response(200, raw)]
+        with patch("http.client.HTTPSConnection", return_value=mock_conn):
+            book = fetch_order_book("some-token")
+        self.assertEqual(book["bids"], [(0.10, 5.0)])
+        self.assertEqual(book["asks"], [(0.90, 2.0)])
+        self.assertIsNone(book["last_trade_price"])
+
+    def test_invalid_optional_last_trade_prices_are_none(self):
+        values = ("   ", "not-a-price", "NaN", "Infinity", float("inf"))
+        mock_conn = MagicMock()
+        mock_conn.getresponse.side_effect = [
+            _mock_response(200, _book_body(bids=[], asks=[], last_trade_price=value))
+            for value in values
+        ]
+        with patch("http.client.HTTPSConnection", return_value=mock_conn):
+            for value in values:
+                with self.subTest(value=value):
+                    book = fetch_order_book("some-token")
+                    self.assertIsNone(book["last_trade_price"])
+
 
 class TestOrderBookStaleness(unittest.TestCase):
     """fetch_order_book()'s staleness check, added 2026-07-22 after finding
