@@ -180,6 +180,9 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
    - Verification: focused observer/shadow/risk suites **390 passed**; full workspace suite
      **734 passed**; compile and `git diff --check` passed. No AWS deployment, feature activation,
      `.env`, credential, dependency, or private-key change was made.
+   - Implementation commit `942824f` (`fix(shadow): measure pre-parse latency off hot path`) was
+     pushed to the new GitHub `main`. AWS deployment remains intentionally blocked pending the
+     real-corpus, external-injector, and process-isolation gates above.
 
 ### 2026-08-06 — Passive signal capture, observer-safe integrity checks, and panic protocol
 
