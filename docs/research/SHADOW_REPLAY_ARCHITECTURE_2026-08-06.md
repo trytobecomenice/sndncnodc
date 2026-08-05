@@ -59,8 +59,9 @@ Degradation ladder:
 
 1. `NORMAL`: BBO, top-three levels, fixed-size VWAP/depth features, and the signal-window buffer.
 2. `PRESSURE`: BBO and fixed-size VWAP/depth features only; drop non-signal level deltas.
-3. `CRITICAL`: signal, decision, latency, and data-loss/gap markers only; halt new BUYs if market
-   state cannot be proven fresh.
+3. `CRITICAL`: signal, decision, latency, and data-loss/gap markers only. If the cause threatens
+   decision/execution integrity — event-loop lag, stale market data, decision-queue age, sequence
+   uncertainty, or loss of the minimum audit trail — engage the entry interlock immediately.
 
 Every downgrade, queue overflow, dropped event, and recovery is journaled and exported as a
 metric. Silent loss is not allowed. Initial queue/memory/CPU limits must be chosen by a replayed
@@ -70,6 +71,34 @@ Python cyclic GC is a risk to measure, not an assumed root cause. Compact tuples
 queues may create little cyclic garbage; JSON allocation, callbacks, and logging may still cause
 event-loop lag. Instrument GC pauses and allocation pressure before deciding whether a C++ hot
 path is justified.
+
+The degradation ladder has two separate safety outcomes:
+
+- **Entry interlock (automatic, hysteretic):** rejects every new entry/BUY, cancels pending entry
+  orders in a future live mode, and leaves SELL/reduce-only/closeout paths available. It clears
+  only after lag, freshness, queue age, and audit continuity remain healthy for a configured
+  recovery window.
+- **Hard kill (persistent/manual review):** reserved for capital-loss limits, impossible position
+  or order invariants, custody/execution uncertainty, or repeated failed recovery. Recorder disk
+  backpressure alone must first drop optional capture; it does not deserve a permanent capital
+  kill if market data, execution, and the minimum decision audit remain provably healthy.
+
+This separation avoids both failure modes: blindly buying while the execution path is late, and
+needlessly hard-killing a healthy trading path because an optional research payload could not be
+written.
+
+### JSON decoding is benchmark-gated, not a blind one-line substitution
+
+The production payload corpus must benchmark Python `json`, `orjson`, and a typed decoder such as
+`msgspec` on the actual EC2 architecture. Record p50/p95/p99 decode time, peak RSS/allocation rate,
+event-loop impact, malformed-input behavior, and normalized-output equivalence.
+
+`orjson` is a strong candidate because its native implementation can materially reduce decode
+cost, but it is not assumed to be a drop-in replacement: bytes versus string output, Decimal/
+datetime/default-hook behavior, non-finite numbers, key handling, wheel availability, and error
+semantics must be contract-tested. Pin the chosen version and artifact. Filtering irrelevant
+markets before full normalization and avoiding unnecessary object creation may matter more than
+swapping decoders alone.
 
 ### 3. Self-inflicted latency is a first-class attribution term
 
@@ -83,6 +112,22 @@ For every signal, capture separate monotonic spans for:
 - execution-quote request start, connect/TLS, first byte, and complete;
 - hypothetical order-ready timestamp;
 - REST/RPC/relayer latency only when that operation actually depends on it.
+
+For `$3`, `$5`, and `$10`, attach book sequence/hash and data-quality flags to four executable
+VWAP checkpoints:
+
+1. `source_pre_trade_vwap`: last coherent book before the source fill, when causally available;
+2. `signal_visible_vwap`: first coherent book visible after the source signal has parsed;
+3. `decision_commit_vwap`: coherent book when risk/state checks finish and the order intent is
+   committed;
+4. `execution_vwap`: preview/acknowledgement/fill-time executable or realized VWAP.
+
+The time and price difference between checkpoints 2 and 3 is the direct measure of latency
+exposure inside our decision path; checkpoint 4 adds outbound network, exchange, and our own size
+impact. Call these checkpoints, not "one microsecond before": monotonic nanoseconds provide
+ordering precision, while the journal separately records the public feed's timing uncertainty.
+Risk checks are not automatically waste merely because prices move while they run — attribution
+must compare their protective benefit against their latency cost before optimizing them away.
 
 This separates source market impact and public-network movement from local CPU pressure, Python
 processing, logging, or a blocked event loop. Polygon base fee is relevant to on-chain
@@ -146,7 +191,10 @@ estimation.
 2. Implement one source-signal -> BBO/VWAP -> hypothetical decision journal path using the current
    direct REST adapter.
 3. Implement a minimal virtual-clock replay test for that one path before live collection.
-4. Add event-loop lag, queue age, recorder RSS/CPU, dropped-event, and CPU-credit observability.
+4. Add event-loop lag, queue age, recorder RSS/CPU, dropped-event, entry-interlock, and CPU-credit
+   observability.
+5. Benchmark `json`/`orjson`/typed decoding on captured payloads; do not change the production
+   decoder until semantic-equivalence and burst-performance gates pass.
 
 ### Phase B — immediate shadow collection
 
@@ -155,7 +203,8 @@ estimation.
 2. Capture BBO/top-three/fixed-size VWAP and signal windows under strict resource bounds.
 3. REST-quote each real source signal and record hypothetical slippage without submitting an
    order.
-4. Run for 3-7 days while measuring data loss and host performance.
+4. Record all four causal VWAP checkpoints for `$3`, `$5`, and `$10` when data quality permits.
+5. Run for 3-7 days while measuring data loss and host performance.
 
 ### Phase C — evidence gate
 

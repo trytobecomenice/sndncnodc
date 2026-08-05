@@ -168,6 +168,13 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
    - Preserved a future C++ hot-path boundary and AWS upgrade path without assuming that a
      language rewrite, bare metal, or kernel bypass creates edge before profiling proves the
      bottleneck.
+   - Refined `CRITICAL` into a recoverable, hysteretic entry interlock for execution-integrity
+     failures versus the existing persistent capital/invariant hard kill. Optional recorder
+     backpressure degrades capture first; stale/late/unauditable execution blocks every new BUY
+     while keeping exits available.
+   - Added benchmark gates for stdlib `json` versus `orjson`/typed decoding rather than assuming a
+     drop-in speed claim, and expanded executable VWAP capture to source-pre-trade, signal-visible,
+     decision-commit, and execution checkpoints for `$3/$5/$10`.
    - Documentation/research only: no recorder, AWS resize, C++ service, strategy change, key,
      `.env`, or production deployment was made.
 
