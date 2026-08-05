@@ -148,6 +148,29 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 
 ## Change log
 
+### 2026-08-06 — Lean shadow recorder / replay architecture decision
+
+1. **When:** 2026-08-06 HKT.
+2. **Files adjusted:**
+   - `docs/research/SHADOW_REPLAY_ARCHITECTURE_2026-08-06.md` — recorded the bounded recorder,
+     compact copy-alpha schema, self-inflicted latency instrumentation, shadow-first rollout, and
+     evidence-gated AWS/C++ path.
+   - `docs/TODO_2026-08-06.md` and this handoff — added the implementation/evidence checklist.
+3. **What changed:**
+   - Verified production is an AWS `t3.small` with 2 vCPU, 1.9 GiB RAM, no swap, 910 MiB
+     available at the sample, and a roughly 96 MiB RSS / 3.2% CPU Copy Bot process. Quiet-time
+     load was low, but CPU credits and burst-time event-loop lag remain unmeasured tail risks.
+   - Rejected continuous all-market full-depth Python capture on the current host. The first
+     design is signal-scoped and fixed-cost: BBO/top three, `$3/$5/$10` VWAP/depth, bounded
+     pre/post-signal windows, asynchronous bounded writing, and an explicit degradation ladder.
+   - Moved copy-alpha data requirements and one minimal replay/attribution walking skeleton into
+     the first phase, then placed 3-7 days of real shadow collection before broader replay work.
+   - Preserved a future C++ hot-path boundary and AWS upgrade path without assuming that a
+     language rewrite, bare metal, or kernel bypass creates edge before profiling proves the
+     bottleneck.
+   - Documentation/research only: no recorder, AWS resize, C++ service, strategy change, key,
+     `.env`, or production deployment was made.
+
 ### 2026-08-05 — Blank `last_trade_price` production hotfix
 
 1. **When:** 2026-08-05 15:16–15:38 HKT.
