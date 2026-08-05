@@ -299,6 +299,37 @@ class TestCheckBuy(ConfigPatchingTestCase):
         self.assertIn("equity below floor", reason)
         self.assertIn("reset_kill_switch", reason)
 
+    def test_entry_interlock_blocks_new_buy_but_is_not_a_persistent_kill(self):
+        interlock = {
+            "active": True,
+            "status": "interlocked",
+            "reasons": ["event_loop_lag_exceeded"],
+        }
+        ok, event_type, reason = risk_manager.check_buy(
+            {}, {}, "ev", 5.0, None, entry_interlock=interlock
+        )
+        self.assertFalse(ok)
+        self.assertEqual(event_type, "skip_risk_entry_interlock")
+        self.assertIn("event_loop_lag_exceeded", reason)
+        self.assertIn("exits continue", reason)
+
+    def test_healthy_entry_interlock_value_does_not_block(self):
+        ok, event_type, reason = risk_manager.check_buy(
+            {}, {}, "ev", 5.0, None,
+            entry_interlock={"active": False, "status": "healthy"},
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(event_type)
+        self.assertIsNone(reason)
+
+    def test_malformed_persisted_interlock_state_fails_closed(self):
+        ok, event_type, reason = risk_manager.check_buy(
+            {}, {}, "ev", 5.0, None, entry_interlock={"active": "unknown"}
+        )
+        self.assertFalse(ok)
+        self.assertEqual(event_type, "skip_risk_entry_interlock")
+        self.assertIn("health state is not safe", reason)
+
     def test_ceiling_blocks_the_first_dollar_past_the_limit(self):
         positions = {"a|m|Yes": pos(16.0)}  # 16 + 5 = 21 > 20
         ok, event_type, _ = risk_manager.check_buy(positions, {"m": "other-ev"}, "ev", 5.0, None)

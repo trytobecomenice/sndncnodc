@@ -202,16 +202,18 @@ def depth_capped_trade_size_usd(trade_size_usd, book_depth_usd, depth_fraction):
 
 
 def check_buy(positions, market_to_event, event_slug, trade_usd, kill_switch, wallet_address=None,
-               wallet_ev_stats=None, drawdown_warning=None):
+               wallet_ev_stats=None, drawdown_warning=None, entry_interlock=None):
     """The pre-BUY risk gate. Returns (ok, skip_event_type, reason):
     (True, None, None) if the BUY may proceed, otherwise ok=False with the
     bot_event_log event_type to log and a human-readable reason.
 
     Check order is deliberate — cheapest and most absolute first:
       1. kill switch (latched halt beats everything)
-      2. total exposure ceiling
-      3. per-event cap
-      4. per-wallet cap (added 2026-07-24, Rule 26 — see
+      2. recoverable execution-integrity entry interlock
+      3. drawdown warning
+      4. total exposure ceiling
+      5. per-event cap
+      6. per-wallet cap (added 2026-07-24, Rule 26 — see
          wallet_exposure_usd()'s docstring; 2026-07-31: this cap is now
          automatically EV-scaled per wallet via `wallet_ev_stats` — see
          wallet_exposure_cap_usd()/compute_wallet_ev_cap_usd())
@@ -231,6 +233,27 @@ def check_buy(positions, market_to_event, event_slug, trade_usd, kill_switch, wa
             f"kill switch latched since {kill_switch.get('triggered_at', '?')}: "
             f"{'; '.join(reasons) if reasons else 'unknown trigger'} — run "
             f"reset_kill_switch.py after review to resume buying"
+        )
+
+    interlock_active = False
+    if isinstance(entry_interlock, dict):
+        explicitly_healthy = (
+            entry_interlock.get("active") is False
+            and entry_interlock.get("status") == "healthy"
+        )
+        # A persisted safety value that is present but malformed is not
+        # evidence of health. Fail closed unless the producer wrote the one
+        # explicit healthy shape (healthy values are normally deleted).
+        interlock_active = not explicitly_healthy
+    elif entry_interlock is not None:
+        interlock_active = bool(entry_interlock)
+    if interlock_active:
+        reasons = entry_interlock.get("reasons") if isinstance(entry_interlock, dict) else None
+        reason_text = "; ".join(str(reason) for reason in reasons) if reasons else None
+        return False, "skip_risk_entry_interlock", (
+            f"execution-integrity entry interlock active: "
+            f"{reason_text or 'health state is not safe for a new entry'} — "
+            f"BUY blocked; exits continue through SELL/reduce-only paths"
         )
 
     if drawdown_warning and config.DRAWDOWN_WARNING_PAUSE_BUYS:

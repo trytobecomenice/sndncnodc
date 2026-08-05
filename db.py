@@ -624,8 +624,11 @@ def _decision_type_for_event(event_type, side):
     if event_type == "skip_wide_spread" and side == "BUY":
         return "skip"
     # Portfolio-risk gates (risk_manager.py) — all BUY-only by construction.
-    if event_type in ("skip_risk_kill_switch", "skip_risk_drawdown_warning", "skip_risk_exposure_ceiling",
-                      "skip_risk_event_cap", "skip_risk_event_unresolved"):
+    if event_type in (
+        "skip_risk_kill_switch", "skip_risk_entry_interlock",
+        "skip_risk_drawdown_warning", "skip_risk_exposure_ceiling",
+        "skip_risk_event_cap", "skip_risk_event_unresolved",
+    ):
         return "skip"
     # "Disciplined Taker" price ceiling (bot.py's check_slippage_ceiling) —
     # BUY-only by construction (see its docstring: never gates a SELL).

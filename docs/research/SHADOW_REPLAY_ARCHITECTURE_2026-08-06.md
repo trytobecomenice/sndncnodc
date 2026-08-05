@@ -1,7 +1,22 @@
 # Lean Shadow Recorder and Replay Architecture — 2026-08-06
 
-Status: architecture decision / research plan only. No recorder, WebSocket execution path, AWS
-resize, or C++ service is production-active from this document.
+Status: Phase A foundation implemented locally on 2026-08-06; not production-active. The compact
+schema, bounded JSONL writer, virtual-clock replay, and recoverable BUY interlock exist, but no
+public-market WebSocket recorder, health sampler, AWS resize, or C++ service is running.
+
+Implemented files:
+
+- `shadow_replay.py`: v1 envelope, integer BBO/top-three/`$3/$5/$10` VWAP features, four named
+  causal checkpoints, non-blocking bounded writer health, and deterministic replay.
+- `entry_interlock.py`: pure immediate-trip/hysteretic-recovery state machine.
+- `risk_manager.py`, `bot.py`, and `db.py`: the persisted interlock value is recognized by the
+  existing sole BUY gate and decision journal; SELL/exit paths remain untouched.
+- `polymarket_simulator.py`: the current direct REST adapter now preserves the server book
+  timestamp and book hash needed by shadow attribution.
+
+The interlock producer is intentionally not active yet: event-loop/queue/book-freshness samplers
+and the public WebSocket shadow process still need Phase B implementation and burst testing. A
+dormant consumer gate must not be described as complete operational protection.
 
 ## Objective
 

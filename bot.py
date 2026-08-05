@@ -92,6 +92,10 @@ logger.addHandler(logging.StreamHandler())
 # docs/copy-trading/SAFETY.md Sec.54.
 METRIC_EQUITY_USD = Gauge("copybot_equity_usd", "Current portfolio equity (bankroll + realized + unrealized PnL)")
 METRIC_KILL_SWITCH_ACTIVE = Gauge("copybot_kill_switch_active", "1 if the drawdown kill switch is latched, else 0")
+METRIC_ENTRY_INTERLOCK_ACTIVE = Gauge(
+    "copybot_entry_interlock_active",
+    "1 if the recoverable execution-integrity BUY interlock is active, else 0",
+)
 METRIC_OPEN_POSITIONS = Gauge("copybot_open_positions", "Count of currently open bot_filtered positions")
 
 
@@ -2787,6 +2791,7 @@ def _execute_buy(base_event, key, trader, market_slug, outcome, price, trade_usd
         trade_usd, risk_state["kill_switch"], wallet_address=trader,
         wallet_ev_stats=wallet_ev_stats,
         drawdown_warning=risk_state.get("drawdown_warning"),
+        entry_interlock=risk_state.get("entry_interlock"),
     )
     if not risk_ok:
         append_log({**base_event, "event_type": risk_event_type, "reason": risk_reason})
@@ -3746,6 +3751,7 @@ def main():
     # resolve-once-and-cache shape as market_to_event.
     risk_state = {
         "kill_switch": get_risk_value("kill_switch"),
+        "entry_interlock": get_risk_value("entry_interlock"),
         "drawdown_warning": get_risk_value("drawdown_warning"),
         "equity_hwm": get_risk_value("equity_hwm"),
         "market_to_event": load_market_events(),
@@ -3778,6 +3784,7 @@ def main():
     }
     evaluation_epoch = get_or_create_evaluation_epoch()
     METRIC_KILL_SWITCH_ACTIVE.set(1 if risk_state["kill_switch"] else 0)
+    METRIC_ENTRY_INTERLOCK_ACTIVE.set(1 if risk_state["entry_interlock"] else 0)
 
     logger.info(f"Copybot starting — mode={'LIVE' if config.LIVE_MODE else 'PAPER'}, "
                 f"source={config.TRACKED_TRADERS_SOURCE}, "
@@ -3790,6 +3797,14 @@ def main():
         logger.warning(f"WARNING: drawdown kill switch is LATCHED (since {ks.get('triggered_at')}: "
                        f"{'; '.join(ks.get('reasons', []))}) — all new BUYs are halted. "
                        f"Run reset_kill_switch.py after review to resume buying.")
+    if risk_state["entry_interlock"]:
+        interlock = risk_state["entry_interlock"]
+        reasons = interlock.get("reasons", []) if isinstance(interlock, dict) else []
+        logger.warning(
+            f"WARNING: execution-integrity entry interlock is active: "
+            f"{'; '.join(str(reason) for reason in reasons) or 'unknown reason'} — "
+            f"new BUYs halted; exits continue."
+        )
     if risk_state["drawdown_warning"]:
         warning = risk_state["drawdown_warning"]
         logger.warning(

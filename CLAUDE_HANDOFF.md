@@ -148,6 +148,40 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 
 ## Change log
 
+### 2026-08-06 — Phase A shadow journal/replay and BUY interlock foundation
+
+1. **When:** 2026-08-06 HKT, after the architecture decision below.
+2. **Files adjusted:**
+   - `entry_interlock.py` and `test_entry_interlock.py` — added a pure execution-integrity state
+     machine that trips on one bad sample and requires both consecutive healthy samples and a
+     recovery window before reopening entries.
+   - `shadow_replay.py` and `test_shadow_replay.py` — added the v1 language-neutral envelope,
+     exact raw signal text, integer BBO/top-three and `$3/$5/$10` VWAP, four named checkpoints,
+     bounded non-blocking JSONL writing, virtual time, and deterministic decision digests.
+   - `risk_manager.py`, `bot.py`, `db.py`, and `test_risk_manager.py` — connected a persisted
+     `entry_interlock` value to the sole BUY gate, Prometheus/startup visibility, and skip-decision
+     journal while keeping SELL/reduce-only paths open.
+   - `polymarket_simulator.py` and `test_polymarket_simulator.py` — retained CLOB book timestamp
+     and hash in the existing public REST adapter for later attribution.
+   - `docs/research/SHADOW_REPLAY_ARCHITECTURE_2026-08-06.md`, `docs/TODO_2026-08-06.md`, and this
+     handoff — recorded exact implementation status and remaining Phase B work.
+3. **What changed:**
+   - The recorder producer path is bounded: submission never waits for disk; queue drops and write
+     errors are counted and mark the minimum audit trail unavailable instead of failing silently.
+   - Replay consumes receive order with a monotonic virtual clock and rejects time regression; the
+     same journal produces the same decision digest.
+   - The shadow policy can only return `shadow_buy`/`skip`; it has no execution dependency or key
+     access and cannot submit an order.
+   - Verification: **704 Python tests passed** in the full workspace, including malformed metric,
+     stale/missing book, queue-overflow, writer-loss, JSON round-trip, time-regression, deterministic
+     digest, BUY-gate, decision-journal, and direct REST metadata regressions.
+   - This is a foundation, not a live watchdog. Event-loop/queue/book-freshness samplers, numeric
+     copy-alpha attribution, decoder benchmarks, public WS shadow capture, and 3-7 day evidence
+     collection remain pending.
+   - AWS production remains on `328a22d`; `data/autodeploy.lock` was verified present and watchdog
+     active before push. No `.env`, key, AWS resize, live recorder, or production deployment was
+     made.
+
 ### 2026-08-06 — Lean shadow recorder / replay architecture decision
 
 1. **When:** 2026-08-06 HKT.

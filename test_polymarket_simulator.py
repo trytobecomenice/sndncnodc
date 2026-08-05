@@ -314,6 +314,16 @@ class TestFetchOrderBook(unittest.TestCase):
             book = fetch_order_book("some-token")
         self.assertIsNone(book["last_trade_price"])
 
+    def test_preserves_book_timestamp_and_hash_for_shadow_attribution(self):
+        raw = _book_body(bids=[], asks=[])
+        raw["hash"] = "0xbookhash"
+        mock_conn = MagicMock()
+        mock_conn.getresponse.side_effect = [_mock_response(200, raw)]
+        with patch("http.client.HTTPSConnection", return_value=mock_conn):
+            book = fetch_order_book("some-token")
+        self.assertEqual(book["book_timestamp_ms"], int(raw["timestamp"]))
+        self.assertEqual(book["book_hash"], "0xbookhash")
+
     def test_empty_last_trade_price_does_not_discard_valid_book(self):
         # Live regression, 2026-08-05: Polymarket returned "" for this
         # optional field on every one of 53 otherwise-valid open-position

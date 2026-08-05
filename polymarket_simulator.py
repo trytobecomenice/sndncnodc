@@ -367,7 +367,8 @@ def resolve_market_category(event_slug, timeout=DEFAULT_TIMEOUT_SECONDS):
 def fetch_order_book(token_id, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness=False):
     """Fetches one token's live order book. Returns {"bids": [(price,
     size), ...], "asks": [(price, size), ...], "last_trade_price": float
-    or None}, EXPLICITLY sorted here (bids descending, asks ascending,
+    or None, "book_timestamp_ms": int or None, "book_hash": str or None},
+    EXPLICITLY sorted here (bids descending, asks ascending,
     best price always at index 0) — see module docstring on why the API's
     own ordering isn't trusted. last_trade_price comes from the same
     /book response (confirmed live: it's a real top-level field on this
@@ -437,7 +438,25 @@ def fetch_order_book(token_id, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness
         else:
             if math.isfinite(parsed_last_trade_price):
                 last_trade_price = parsed_last_trade_price
-    return {"bids": bids, "asks": asks, "last_trade_price": last_trade_price}
+    parsed_book_timestamp_ms = None
+    if book_timestamp_ms is not None:
+        try:
+            parsed_book_timestamp_ms = int(float(book_timestamp_ms))
+        except (TypeError, ValueError, OverflowError):
+            # The timestamp already participated in the safety check above
+            # when present. Preserve the existing lenient missing/invalid
+            # metadata posture for callers that only need BBO, while the
+            # shadow recorder can quality-flag None rather than inventing it.
+            parsed_book_timestamp_ms = None
+    raw_book_hash = data.get("hash")
+    book_hash = str(raw_book_hash) if raw_book_hash not in (None, "") else None
+    return {
+        "bids": bids,
+        "asks": asks,
+        "last_trade_price": last_trade_price,
+        "book_timestamp_ms": parsed_book_timestamp_ms,
+        "book_hash": book_hash,
+    }
 
 
 def fetch_order_book_for_outcome(market_slug, outcome, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness=False):

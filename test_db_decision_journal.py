@@ -149,6 +149,20 @@ class TestAppendLogDecisionJournal(_TempDbTestCase):
         conn.close()
         self.assertIsNone(row[0])
 
+    def test_entry_interlock_skip_is_recorded_as_a_decision(self):
+        returned_id = db.append_log(self._copy_event(
+            event_type="skip_risk_entry_interlock",
+            reason="event_loop_lag_exceeded",
+        ))
+        self.assertIsNotNone(returned_id)
+        conn = self._raw_conn()
+        row = conn.execute(
+            "SELECT decision_type, decision_reason FROM decision_journal WHERE id = ?",
+            (returned_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row, ("skip", "event_loop_lag_exceeded"))
+
     def test_persists_rule_set_version_when_given(self):
         db.append_log(self._copy_event(rule_set_version=3))
         conn = self._raw_conn()
