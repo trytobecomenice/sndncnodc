@@ -108,7 +108,7 @@ class TestNormalizeActivityRecord(unittest.TestCase):
 
 class TestFetchAllWalletsConcurrent(unittest.TestCase):
     def test_one_wallet_failing_does_not_abort_the_batch(self):
-        def fake_fetch(wallet_address, limit=100, timeout=10, start=None):
+        def fake_fetch(wallet_address, limit=100, timeout=10, start=None, **kwargs):
             if wallet_address == "0xBAD":
                 raise TimeoutError("simulated network failure")
             return [REAL_TRADE_RECORD]
@@ -122,11 +122,13 @@ class TestFetchAllWalletsConcurrent(unittest.TestCase):
 
     def test_all_wallets_succeeding_returns_no_errors(self):
         with patch("polymarket_data_api.fetch_wallet_trades", return_value=[REAL_TRADE_RECORD]):
-            result = fetch_all_wallets_concurrent(["0xA", "0xB"])
+            result = fetch_all_wallets_concurrent(["0xA", "0xB"], capture_timing=True)
         self.assertEqual(len(result["trades"]), 2)
         self.assertEqual(result["errors"], [])
         self.assertIn("_enqueued_monotonic_ns", result["trades"][0])
         self.assertEqual(result["trades"][0]["_raw_payload_format"], "canonicalized_api_record")
+        self.assertNotIn("_raw_payload", result["trades"][0])
+        self.assertEqual(result["trades"][0]["_raw_record"], REAL_TRADE_RECORD)
 
     def test_accepts_an_externally_provided_executor(self):
         # The whole point of make_persistent_executor(): bot.py must be able
@@ -175,6 +177,32 @@ class TestStartParam(unittest.TestCase):
             fetch_wallet_trades("0xABC")
         path_used = mock_conn.request.call_args[0][1]
         self.assertNotIn("start=", path_used)
+
+
+class TestPreParseTiming(unittest.TestCase):
+    def tearDown(self):
+        _thread_local.conn = None
+
+    def test_capture_stamps_raw_body_before_json_decode(self):
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = _mock_response(200, [{"id": 1}])
+        with patch("http.client.HTTPSConnection", return_value=mock_conn), \
+             patch("polymarket_data_api.time.time_ns", return_value=1_000_000_000), \
+             patch("polymarket_data_api.time.monotonic_ns", side_effect=[100, 200, 500]):
+            rows = fetch_wallet_trades("0xABC", capture_timing=True)
+
+        timing = rows[0][polymarket_data_api._TRANSPORT_META_KEY]
+        self.assertEqual(timing["received_monotonic_ns"], 100)
+        self.assertEqual(timing["parse_started_monotonic_ns"], 200)
+        self.assertEqual(timing["parse_completed_monotonic_ns"], 500)
+        self.assertGreater(timing["body_size_bytes"], 0)
+
+    def test_public_default_does_not_leak_internal_transport_metadata(self):
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = _mock_response(200, [{"id": 1}])
+        with patch("http.client.HTTPSConnection", return_value=mock_conn):
+            rows = fetch_wallet_trades("0xABC")
+        self.assertEqual(rows, [{"id": 1}])
 
 
 class TestConnectionReuse(unittest.TestCase):

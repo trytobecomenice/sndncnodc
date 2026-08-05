@@ -28,6 +28,8 @@ class PassiveIntegrityMeasurement:
     scheduler_lag_ms: float | None
     decision_queue_age_ms: float | None
     decision_path_age_ms: float | None
+    signal_parse_duration_ms: float | None
+    book_parse_duration_ms: float | None
     book_server_age_at_receive_ms: float | None
     book_local_residence_ms: float | None
     effective_book_age_ms: float | None
@@ -59,10 +61,21 @@ def measure_passive_integrity(signal, book, decision_monotonic_ns, decision_time
     """
     flags = set()
     enqueued_ns = signal.get("_enqueued_monotonic_ns")
-    signal_received_ns = enqueued_ns
+    signal_received_ns = signal.get("_ingress_monotonic_ns")
+    if signal_received_ns is None:
+        signal_received_ns = enqueued_ns
+        flags.add("missing_signal_ingress_timestamp")
     queue_age_ms = _elapsed_ms(decision_monotonic_ns, enqueued_ns)
     if queue_age_ms is None:
         flags.add("missing_signal_monotonic_timestamp")
+    ingress_to_decision_ms = _elapsed_ms(decision_monotonic_ns, signal_received_ns)
+
+    signal_parse_duration_ms = _elapsed_ms(
+        signal.get("_parse_completed_monotonic_ns"),
+        signal.get("_parse_started_monotonic_ns"),
+    )
+    if signal_parse_duration_ms is None:
+        flags.add("missing_signal_parse_timestamps")
 
     book_timestamp_ms = book.get("book_timestamp_ms")
     book_received_timestamp_ms = book.get("received_timestamp_ms")
@@ -99,11 +112,23 @@ def measure_passive_integrity(signal, book, decision_monotonic_ns, decision_time
                 abs(wall_residence_ms - local_residence_ms),
             )
 
+    book_parse_duration_ms = _elapsed_ms(
+        book.get("parse_completed_monotonic_ns"),
+        book.get("parse_started_monotonic_ns"),
+    )
+    if book_parse_duration_ms is None:
+        flags.add("missing_book_parse_timestamps")
+
     return PassiveIntegrityMeasurement(
         observed_monotonic_ms=int(decision_monotonic_ns // NANOSECONDS_PER_MILLISECOND),
-        scheduler_lag_ms=queue_age_ms,
+        # This broad ingress-to-decision span is the safe current proxy for
+        # scheduling health: it includes JSON/GIL stalls that a post-parse
+        # queue timestamp would otherwise hide.
+        scheduler_lag_ms=ingress_to_decision_ms,
         decision_queue_age_ms=queue_age_ms,
-        decision_path_age_ms=_elapsed_ms(decision_monotonic_ns, signal_received_ns),
+        decision_path_age_ms=ingress_to_decision_ms,
+        signal_parse_duration_ms=signal_parse_duration_ms,
+        book_parse_duration_ms=book_parse_duration_ms,
         book_server_age_at_receive_ms=server_age_ms,
         book_local_residence_ms=local_residence_ms,
         effective_book_age_ms=effective_book_age_ms,

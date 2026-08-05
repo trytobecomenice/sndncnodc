@@ -110,12 +110,22 @@ needlessly hard-killing a healthy trading path because an optional research payl
 written.
 
 Observer-effect constraint: the current Python bot must not run a 10 ms watchdog. Source events
-receive a monotonic enqueue timestamp in the existing fetch worker; queue/scheduling age is
-calculated once when that event reaches BUY decision. A REST book receives wall and monotonic
-timestamps when its existing sizing request returns; effective freshness is server age at receipt
-plus local monotonic residence. The isolated journal worker blocks on `queue.get()` when idle and
-the trading producer only calls `put_nowait()`. Low-cadence host telemetry may be added separately,
-but it must not be confused with an active per-book safety poller.
+receive wall/monotonic timestamps immediately after the raw HTTP body completes and before
+UTF-8/JSON decode; parse start/complete and post-normalization enqueue are separate checkpoints.
+The BUY safety age runs from raw-body ingress to decision, so a GIL-bound decoder stall cannot hide
+behind a young queue timestamp. A REST book uses the same opt-in boundary; effective freshness is
+server age at receipt plus local monotonic residence. The producer enqueues only a lightweight
+capsule; Decimal VWAP, canonical JSON, and envelope normalization happen in the writer. The writer
+blocks on `queue.get()` when idle and the producer only calls `put_nowait()`. Low-cadence host
+telemetry may be added separately, but it must not be confused with an active per-book safety
+poller.
+
+This boundary is application-space, not kernel packet-arrival time. It cannot reconstruct time
+spent in a socket buffer before `response.read()` returns. More importantly, the current writer is
+an isolated Python thread, not an isolated process, so deferred materialization can still contend
+for the same GIL. This is acceptable only as a feature-disabled polling vertical slice. A public
+WebSocket burst recorder must capture/replay real raw frames from an external injector and move
+per-message decode/materialization behind a separate process or host before activation.
 
 Panic semantics: current live BUY execution is FAK/market-style and does not intentionally leave
 managed resting entry orders. Managed resting exchange orders are SELL exits. Therefore malformed

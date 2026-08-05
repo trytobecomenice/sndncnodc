@@ -320,11 +320,26 @@ class TestFetchOrderBook(unittest.TestCase):
         mock_conn = MagicMock()
         mock_conn.getresponse.side_effect = [_mock_response(200, raw)]
         with patch("http.client.HTTPSConnection", return_value=mock_conn):
-            book = fetch_order_book("some-token")
+            book = fetch_order_book("some-token", capture_parse_timing=True)
         self.assertEqual(book["book_timestamp_ms"], int(raw["timestamp"]))
         self.assertEqual(book["book_hash"], "0xbookhash")
         self.assertIsInstance(book["received_timestamp_ms"], int)
         self.assertIsInstance(book["received_monotonic_ns"], int)
+        self.assertIsInstance(book["parse_started_monotonic_ns"], int)
+        self.assertIsInstance(book["parse_completed_monotonic_ns"], int)
+        self.assertGreater(book["transport_body_size_bytes"], 0)
+
+    def test_receive_timestamp_precedes_json_parse_timing(self):
+        raw = _book_body(bids=[], asks=[])
+        mock_conn = MagicMock()
+        mock_conn.getresponse.side_effect = [_mock_response(200, raw)]
+        with patch("http.client.HTTPSConnection", return_value=mock_conn), \
+             patch("polymarket_simulator.time.time_ns", return_value=1_000_000_000), \
+             patch("polymarket_simulator.time.monotonic_ns", side_effect=[100, 200, 500]):
+            book = fetch_order_book("some-token", capture_parse_timing=True)
+        self.assertEqual(book["received_monotonic_ns"], 100)
+        self.assertEqual(book["parse_started_monotonic_ns"], 200)
+        self.assertEqual(book["parse_completed_monotonic_ns"], 500)
 
     def test_empty_last_trade_price_does_not_discard_valid_book(self):
         # Live regression, 2026-08-05: Polymarket returned "" for this

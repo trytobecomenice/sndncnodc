@@ -98,6 +98,21 @@ class TestPassiveShadowDecision(unittest.TestCase):
         append_log.assert_not_called()
         self.assertIsNone(state["entry_interlock"])
 
+    def test_hot_path_enqueues_capsule_without_materializing_event(self):
+        writer = _FakeWriter()
+        state = _risk_state()
+        with patch.object(config, "ENABLE_PASSIVE_ENTRY_INTERLOCK", False), \
+             patch("shadow_capture.build_passive_shadow_event") as materialize:
+            accepted = bot.record_passive_shadow_decision(
+                _trade(), _book(), 5.0, writer, state,
+                decision_monotonic_ns=10_000_000_000,
+                decision_timestamp_ms=10_000,
+            )
+
+        self.assertTrue(accepted)
+        materialize.assert_not_called()
+        self.assertTrue(callable(writer.events[0].materialize_event))
+
     def test_enforced_stale_book_trips_before_buy_gate(self):
         writer = _FakeWriter()
         state = _risk_state()

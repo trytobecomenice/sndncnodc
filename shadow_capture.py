@@ -2,11 +2,12 @@
 """Build shadow records from data the trading path already fetched.
 
 This module performs no network, database, order, timer, or polling action.
-The caller hands it the source signal and the direct-REST book already read
-for depth sizing; it only creates the fixed-width v1 journal record.
+The trading producer creates only a lightweight capture capsule. The writer
+later materializes its fixed-width v1 record away from the synchronous BUY
+path.
 """
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import json
 
 from shadow_replay import VWAP_TIERS_USD, build_rest_book_checkpoint, build_source_signal_envelope
@@ -31,6 +32,17 @@ def build_passive_shadow_event(trade, book, copy_size_usd, measurement,
     quality_flags = set(measurement.quality_flags)
     raw_payload = trade.get("_raw_payload")
     raw_payload_format = trade.get("_raw_payload_format")
+    if raw_payload is None and trade.get("_raw_record") is not None:
+        try:
+            raw_payload = json.dumps(
+                trade["_raw_record"],
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            raw_payload_format = "canonicalized_api_record"
+        except (TypeError, ValueError):
+            quality_flags.add("raw_record_serialization_failed")
     if raw_payload is None:
         raw_payload = _fallback_raw_payload(trade)
         raw_payload_format = "reconstructed_normalized_signal"
@@ -45,7 +57,10 @@ def build_passive_shadow_event(trade, book, copy_size_usd, measurement,
         vwap_tiers_usd=tuple(VWAP_TIERS_USD) + (copy_size_usd,),
     )
     signal_received_timestamp_ms = trade.get("_received_timestamp_ms")
-    signal_received_monotonic_ns = trade.get("_enqueued_monotonic_ns")
+    signal_received_monotonic_ns = (
+        trade.get("_ingress_monotonic_ns")
+        or trade.get("_enqueued_monotonic_ns")
+    )
     if signal_received_timestamp_ms is None:
         signal_received_timestamp_ms = decision_timestamp_ms
         quality_flags.add("missing_signal_wall_timestamp")
@@ -78,4 +93,48 @@ def build_passive_shadow_event(trade, book, copy_size_usd, measurement,
         source_hash=book.get("book_hash"),
         correlation_id=str(trade.get("trade_id") or ""),
         quality_flags=tuple(sorted(quality_flags)),
+    )
+
+
+@dataclass(frozen=True)
+class PassiveShadowCapture:
+    """Lightweight producer capsule materialized only by the writer thread.
+
+    `trade` and `book` are fresh per-signal mappings which the caller must
+    not mutate after submission. Keeping references avoids copying a deep
+    order book or running Decimal/JSON work before the BUY gate.
+    """
+
+    trade: dict
+    book: dict
+    copy_size_usd: float
+    measurement: object
+    entry_interlock_active: bool
+    decision_timestamp_ms: int
+    decision_monotonic_ns: int
+
+    def materialize_event(self):
+        return build_passive_shadow_event(
+            self.trade,
+            self.book,
+            self.copy_size_usd,
+            self.measurement,
+            self.entry_interlock_active,
+            self.decision_timestamp_ms,
+            self.decision_monotonic_ns,
+        )
+
+
+def build_passive_shadow_capture(trade, book, copy_size_usd, measurement,
+                                 entry_interlock_active, decision_timestamp_ms,
+                                 decision_monotonic_ns):
+    """Create the O(1) queue item; do not normalize or serialize here."""
+    return PassiveShadowCapture(
+        trade=trade,
+        book=book,
+        copy_size_usd=copy_size_usd,
+        measurement=measurement,
+        entry_interlock_active=bool(entry_interlock_active),
+        decision_timestamp_ms=int(decision_timestamp_ms),
+        decision_monotonic_ns=int(decision_monotonic_ns),
     )

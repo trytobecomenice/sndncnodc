@@ -148,6 +148,39 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 
 ## Change log
 
+### 2026-08-06 — Pre-parse timing and deferred shadow materialization
+
+1. **When:** 2026-08-06 01:35–02:00 HKT.
+2. **Files adjusted:**
+   - `polymarket_data_api.py` and `test_polymarket_data_api.py` — timestamp the completed raw HTTP
+     body before UTF-8/`json.loads`, retain parse-start/parse-complete/body-size metadata, separate
+     ingress age from post-normalization queue age, and defer raw-record canonicalization.
+   - `polymarket_simulator.py` and `test_polymarket_simulator.py` — add the same opt-in pre-parse
+     timing boundary to the CLOB order-book response used by shadow decisions.
+   - `passive_integrity.py` and `test_passive_integrity.py` — include signal JSON parse duration,
+     book parse duration, and full ingress-to-decision age; a simulated 200 ms GIL parse stall is
+     now visible to the BUY interlock even when post-normalization queue age is only 15 ms.
+   - `shadow_capture.py`, `shadow_replay.py`, `bot.py`, `test_shadow_capture.py`,
+     `test_shadow_replay.py`, and `test_bot_passive_shadow.py` — enqueue a lightweight capture
+     capsule and defer Decimal VWAP, canonical JSON, `asdict`, and `EventEnvelope` construction to
+     the writer rather than doing them synchronously before the BUY gate.
+   - `docs/research/SHADOW_REPLAY_ARCHITECTURE_2026-08-06.md`, `docs/TODO_2026-08-06.md`, and this
+     handoff — record the corrected measurement boundary and remaining GIL limitation.
+3. **What changed:**
+   - Timing capture is opt-in and is passed by `bot.fetch_direct_feed()` only when the recorder or
+     entry interlock feature is enabled. With both default-off flags disabled, the normal wallet
+     normalization path does not copy raw records or collect parse checkpoints.
+   - The earliest application-space timestamp is immediately after `response.read()` and before
+     decode. It does not claim kernel packet-arrival accuracy, but it can no longer hide Python
+     deserialization time behind a post-parse enqueue timestamp.
+   - The writer still uses a Python thread. Heavy work is no longer synchronous in the BUY call
+     stack, but it still shares the GIL and therefore is **not** sufficient proof for a future
+     per-WebSocket-message burst recorder. Public WS capture must use a separate process/host and
+     real captured frames before activation.
+   - Verification: focused observer/shadow/risk suites **390 passed**; full workspace suite
+     **734 passed**; compile and `git diff --check` passed. No AWS deployment, feature activation,
+     `.env`, credential, dependency, or private-key change was made.
+
 ### 2026-08-06 — Passive signal capture, observer-safe integrity checks, and panic protocol
 
 1. **When:** 2026-08-06 00:45–01:27 HKT.

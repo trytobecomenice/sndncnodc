@@ -124,6 +124,7 @@ REQUEST_HEADERS = {
 # to share across threads simultaneously, so this must stay thread-local,
 # never a single module-level connection.
 _thread_local = threading.local()
+_TRANSPORT_META_KEY = "__copybot_transport_meta"
 
 
 def _get_connection(timeout):
@@ -144,10 +145,11 @@ def _reset_connection():
     _thread_local.conn = None
 
 
-def _make_request(wallet_address, limit, timeout, start, offset):
+def _make_request(wallet_address, limit, timeout, start, offset, capture_timing=False):
     """Makes ONE HTTP request, handling a stale/dead keep-alive connection
     with exactly one reset-and-retry (no backoff delay — a dead connection
-    isn't a rate-limit issue). Returns (status, body_bytes) — does NOT
+    isn't a rate-limit issue). Returns (status, body_bytes, receive_wall_ms,
+    receive_monotonic_ns) — does NOT
     interpret the HTTP status code itself; that's _fetch_one_page's job,
     since 429/5xx need backoff+retry at a different layer than a broken
     TCP connection does. Unchanged behavior from before this rewrite, just
@@ -166,14 +168,20 @@ def _make_request(wallet_address, limit, timeout, start, offset):
             conn.request("GET", path, headers=REQUEST_HEADERS)
             response = conn.getresponse()
             body = response.read()
-            return response.status, body
+            # Earliest reliable application boundary: bytes are complete,
+            # but UTF-8 decoding and json.loads have not acquired the GIL.
+            received_timestamp_ms = (
+                time.time_ns() // 1_000_000 if capture_timing else None
+            )
+            received_monotonic_ns = time.monotonic_ns() if capture_timing else None
+            return response.status, body, received_timestamp_ms, received_monotonic_ns
         except (http.client.HTTPException, OSError) as e:
             _reset_connection()
             if attempt == 2:
                 raise RuntimeError(f"fetch failed after reconnect attempt: {e}")
 
 
-def _fetch_one_page(wallet_address, limit, timeout, start, offset):
+def _fetch_one_page(wallet_address, limit, timeout, start, offset, capture_timing=False):
     """One logical page fetch, retrying HTTP-level 429/5xx with exponential
     backoff (RETRYABLE_STATUS_CODES, up to RATE_LIMIT_MAX_RETRIES) — a
     DIFFERENT failure class from _make_request's connection-level retry, and
@@ -185,9 +193,29 @@ def _fetch_one_page(wallet_address, limit, timeout, start, offset):
     """
     rate_limit_attempt = 0
     while True:
-        status, body = _make_request(wallet_address, limit, timeout, start, offset)
+        status, body, received_timestamp_ms, received_monotonic_ns = _make_request(
+            wallet_address, limit, timeout, start, offset,
+            capture_timing=capture_timing,
+        )
         if status == 200:
-            return json.loads(body.decode("utf-8"))
+            parse_started_monotonic_ns = time.monotonic_ns() if capture_timing else None
+            page = json.loads(body.decode("utf-8"))
+            parse_completed_monotonic_ns = time.monotonic_ns() if capture_timing else None
+            if capture_timing:
+                timing = {
+                    "received_timestamp_ms": received_timestamp_ms,
+                    "received_monotonic_ns": received_monotonic_ns,
+                    "parse_started_monotonic_ns": parse_started_monotonic_ns,
+                    "parse_completed_monotonic_ns": parse_completed_monotonic_ns,
+                    "body_size_bytes": len(body),
+                    "page_offset": offset,
+                }
+                page = [
+                    {**record, _TRANSPORT_META_KEY: timing}
+                    if isinstance(record, dict) else record
+                    for record in page
+                ]
+            return page
 
         if status in RETRYABLE_STATUS_CODES and rate_limit_attempt < RATE_LIMIT_MAX_RETRIES:
             delay = RATE_LIMIT_BACKOFF_BASE_SECONDS * (2 ** rate_limit_attempt)
@@ -214,7 +242,7 @@ def _activity_trade_id(record):
 
 def fetch_wallet_trades(wallet_address, limit=DEFAULT_FETCH_LIMIT,
                         timeout=DEFAULT_TIMEOUT_SECONDS, start=None,
-                        known_trade_ids=None):
+                        known_trade_ids=None, capture_timing=False):
     """Fetches one wallet's recent TRADE-type activity directly from
     Polymarket's own public Data API, over this thread's persistent
     connection (see module docstring). Returns the raw JSON list
@@ -243,7 +271,10 @@ def fetch_wallet_trades(wallet_address, limit=DEFAULT_FETCH_LIMIT,
     all_records = []
     offset = 0
     for _ in range(MAX_PAGES_PER_FETCH):
-        page = _fetch_one_page(wallet_address, limit, timeout, start, offset)
+        page = _fetch_one_page(
+            wallet_address, limit, timeout, start, offset,
+            capture_timing=capture_timing,
+        )
         all_records.extend(page)
         if known_trade_ids and any(_activity_trade_id(record) in known_trade_ids for record in page):
             break  # reached the live poll's already-processed boundary
@@ -254,7 +285,11 @@ def fetch_wallet_trades(wallet_address, limit=DEFAULT_FETCH_LIMIT,
 
 
 def normalize_activity_record(record, wallet_address, received_timestamp_ms=None,
-                              enqueued_monotonic_ns=None, raw_payload=None):
+                              enqueued_monotonic_ns=None, raw_payload=None,
+                              ingress_monotonic_ns=None,
+                              parse_started_monotonic_ns=None,
+                              parse_completed_monotonic_ns=None,
+                              raw_record=None, body_size_bytes=None):
     """Converts one Polymarket /activity TRADE record into the exact dict
     shape bot.py's process_trade() already expects from bullpen's tracker
     feed (see bot.py's process_trade() for the authoritative field list) —
@@ -313,10 +348,22 @@ def normalize_activity_record(record, wallet_address, received_timestamp_ms=None
     # becomes available, so queue age later needs no polling thread.
     if received_timestamp_ms is not None:
         normalized["_received_timestamp_ms"] = int(received_timestamp_ms)
+    if ingress_monotonic_ns is not None:
+        normalized["_ingress_monotonic_ns"] = int(ingress_monotonic_ns)
     if enqueued_monotonic_ns is not None:
         normalized["_enqueued_monotonic_ns"] = int(enqueued_monotonic_ns)
+    if parse_started_monotonic_ns is not None:
+        normalized["_parse_started_monotonic_ns"] = int(parse_started_monotonic_ns)
+    if parse_completed_monotonic_ns is not None:
+        normalized["_parse_completed_monotonic_ns"] = int(parse_completed_monotonic_ns)
+    if body_size_bytes is not None:
+        normalized["_transport_body_size_bytes"] = int(body_size_bytes)
     if raw_payload is not None:
         normalized["_raw_payload"] = raw_payload
+        normalized["_raw_payload_format"] = "canonicalized_api_record"
+    if raw_record is not None:
+        # Serialization is deliberately deferred to the journal worker.
+        normalized["_raw_record"] = raw_record
         normalized["_raw_payload_format"] = "canonicalized_api_record"
     if timestamp is not None:
         normalized["_source_timestamp_ms"] = int(float(timestamp) * 1000)
@@ -325,7 +372,8 @@ def normalize_activity_record(record, wallet_address, received_timestamp_ms=None
 
 def fetch_all_wallets_concurrent(wallet_addresses, limit=DEFAULT_FETCH_LIMIT,
                                   max_workers=DEFAULT_MAX_WORKERS, timeout=DEFAULT_TIMEOUT_SECONDS,
-                                  executor=None, start=None, known_trade_ids=None):
+                                  executor=None, start=None, known_trade_ids=None,
+                                  capture_timing=False):
     """Fetches every wallet's recent trade activity CONCURRENTLY via a
     thread pool. Pass a long-lived `executor` (created ONCE by the caller,
     reused across every poll cycle) to get the real connection-reuse speedup
@@ -352,26 +400,35 @@ def fetch_all_wallets_concurrent(wallet_addresses, limit=DEFAULT_FETCH_LIMIT,
         fetch_kwargs = {"limit": limit, "timeout": timeout, "start": start}
         if known_trade_ids is not None:
             fetch_kwargs["known_trade_ids"] = known_trade_ids
+        fetch_kwargs["capture_timing"] = capture_timing
         raw = fetch_wallet_trades(wallet_address, **fetch_kwargs)
+        if not capture_timing:
+            return [normalize_activity_record(record, wallet_address) for record in raw]
         normalized = []
         for record in raw:
-            received_timestamp_ms = time.time_ns() // 1_000_000
-            enqueued_monotonic_ns = time.monotonic_ns()
-            try:
-                raw_payload = json.dumps(
-                    record, sort_keys=True, separators=(",", ":"), allow_nan=False
-                )
-            except (TypeError, ValueError):
-                # Do not break the tracking feed because an optional
-                # research copy of a malformed row could not serialize.
-                raw_payload = None
-            normalized.append(normalize_activity_record(
+            transport = record.get(_TRANSPORT_META_KEY, {}) if isinstance(record, dict) else {}
+            raw_record = (
+                {key: value for key, value in record.items() if key != _TRANSPORT_META_KEY}
+                if isinstance(record, dict) else None
+            )
+            received_timestamp_ms = transport.get(
+                "received_timestamp_ms", time.time_ns() // 1_000_000
+            )
+            ingress_monotonic_ns = transport.get(
+                "received_monotonic_ns", time.monotonic_ns()
+            )
+            item = normalize_activity_record(
                 record,
                 wallet_address,
                 received_timestamp_ms=received_timestamp_ms,
-                enqueued_monotonic_ns=enqueued_monotonic_ns,
-                raw_payload=raw_payload,
-            ))
+                ingress_monotonic_ns=ingress_monotonic_ns,
+                parse_started_monotonic_ns=transport.get("parse_started_monotonic_ns"),
+                parse_completed_monotonic_ns=transport.get("parse_completed_monotonic_ns"),
+                raw_record=raw_record,
+                body_size_bytes=transport.get("body_size_bytes"),
+            )
+            item["_enqueued_monotonic_ns"] = time.monotonic_ns()
+            normalized.append(item)
         return normalized
 
     def _run(exec_):

@@ -308,6 +308,12 @@ class BoundedJournalWriter:
     submit() never waits for disk. A full queue returns False and increments
     an observable loss counter; callers must feed that failed minimum-audit
     state into the entry interlock rather than silently losing records.
+
+    Deferred materialization removes Decimal/VWAP/canonical-JSON work from
+    the synchronous BUY call stack, but this remains a Python thread and
+    therefore still shares the process GIL. It is not evidence that a future
+    per-WebSocket-message recorder is burst-safe; that path needs a separate
+    process/host and captured-traffic benchmark before activation.
     """
 
     _STOP = object()
@@ -349,7 +355,9 @@ class BoundedJournalWriter:
                 if item is self._STOP:
                     return
                 try:
-                    self.journal.append(item)
+                    materialize = getattr(item, "materialize_event", None)
+                    envelope = materialize() if callable(materialize) else item
+                    self.journal.append(envelope)
                 except Exception:
                     # The health counter is the safety signal. The writer
                     # stays alive so a transient I/O error does not discard

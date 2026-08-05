@@ -65,7 +65,7 @@ from entry_interlock import (
     evaluate_entry_interlock,
 )
 from passive_integrity import measure_passive_integrity
-from shadow_capture import build_passive_shadow_event
+from shadow_capture import build_passive_shadow_capture
 from shadow_replay import BoundedJournalWriter, JsonlEventJournal
 
 
@@ -653,14 +653,18 @@ def get_market_bid_ask(market_slug, outcome):
     return best_bid, best_ask, None
 
 
-def fetch_book_depth_snapshot(market_slug, outcome):
+def fetch_book_depth_snapshot(market_slug, outcome, capture_parse_timing=False):
     """Return (visible ask USD depth, the already-fetched public book).
 
     The second value lets passive shadow capture reuse this exact read. It
     must never issue a duplicate request merely for watchdog measurement.
     """
     try:
-        _, book = polymarket_simulator.fetch_order_book_for_outcome(market_slug, outcome)
+        _, book = polymarket_simulator.fetch_order_book_for_outcome(
+            market_slug,
+            outcome,
+            capture_parse_timing=capture_parse_timing,
+        )
     except Exception:
         return None, None
 
@@ -735,7 +739,7 @@ def record_passive_shadow_decision(trade, book, copy_size_usd, writer, risk_stat
     )
     proposed = evaluate_entry_interlock(state, sample, _entry_integrity_thresholds()).state
 
-    event = build_passive_shadow_event(
+    capture = build_passive_shadow_capture(
         trade,
         book,
         copy_size_usd,
@@ -744,7 +748,7 @@ def record_passive_shadow_decision(trade, book, copy_size_usd, writer, risk_stat
         decision_timestamp_ms,
         decision_monotonic_ns,
     )
-    accepted = writer.submit(event)
+    accepted = writer.submit(capture)
     final_state = proposed
     if not accepted:
         failed_sample = measurement.to_interlock_sample(
@@ -3442,7 +3446,7 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
                 book_depth_usd = fetch_book_depth_usd(market_slug, outcome)
             else:
                 book_depth_usd, decision_book = fetch_book_depth_snapshot(
-                    market_slug, outcome
+                    market_slug, outcome, capture_parse_timing=True
                 )
             depth_capped_usd = risk_manager.depth_capped_trade_size_usd(
                 trade_usd, book_depth_usd, config.TRADE_SIZE_DEPTH_FRACTION
@@ -3724,6 +3728,10 @@ def fetch_direct_feed(executor, wallet_addresses, known_trade_ids=None):
         limit=config.DIRECT_API_PER_WALLET_LIMIT,
         executor=executor,
         known_trade_ids=known_trade_ids,
+        capture_timing=(
+            config.ENABLE_PASSIVE_SHADOW_RECORDER
+            or config.ENABLE_PASSIVE_ENTRY_INTERLOCK
+        ),
     )
     for err in result["errors"]:
         append_log({"timestamp": now_iso(), "event_type": "error",

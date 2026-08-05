@@ -206,6 +206,23 @@ class TestJournalReplay(unittest.TestCase):
         self.assertEqual(health.dropped_events, 0)
         self.assertFalse(health.running)
 
+    def test_bounded_writer_materializes_deferred_capture_off_producer_thread(self):
+        journal = JsonlEventJournal(self.path)
+        producer_thread = threading.get_ident()
+        materialized_thread = []
+
+        class DeferredCapture:
+            def materialize_event(self):
+                materialized_thread.append(threading.get_ident())
+                return envelope()
+
+        writer = BoundedJournalWriter(journal, queue_capacity=2)
+        self.assertTrue(writer.submit(DeferredCapture()))
+        writer.close(timeout=2)
+        self.assertEqual(len(journal.read_all()), 1)
+        self.assertNotEqual(materialized_thread, [])
+        self.assertNotEqual(materialized_thread[0], producer_thread)
+
     def test_queue_overflow_is_observable_and_marks_audit_unavailable(self):
         release = threading.Event()
         entered = threading.Event()

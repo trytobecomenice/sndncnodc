@@ -132,33 +132,51 @@ def _reset_connection(host):
         conns[host] = None
 
 
-def _make_request(host, path, timeout):
+def _make_request(host, path, timeout, capture_timing=False):
     """One HTTP GET, handling a stale/dead keep-alive connection with
     exactly one reset-and-retry (no backoff delay — a dead connection isn't
     a rate-limit issue). Returns (status, body_bytes); does not interpret
-    the status code itself."""
+    the status code itself. Receive timestamps are captured after the raw
+    body completes but before UTF-8/JSON decoding."""
     for attempt in (1, 2):
         try:
             conn = _get_connection(host, timeout)
             conn.request("GET", path, headers=REQUEST_HEADERS)
             response = conn.getresponse()
             body = response.read()
-            return response.status, body
+            received_timestamp_ms = (
+                time.time_ns() // 1_000_000 if capture_timing else None
+            )
+            received_monotonic_ns = time.monotonic_ns() if capture_timing else None
+            return response.status, body, received_timestamp_ms, received_monotonic_ns
         except (http.client.HTTPException, OSError) as e:
             _reset_connection(host)
             if attempt == 2:
                 raise RuntimeError(f"fetch failed after reconnect attempt: {e}")
 
 
-def _fetch_json(host, path, timeout):
+def _fetch_json(host, path, timeout, include_timing=False):
     """One logical GET, retrying HTTP-level 429/5xx with exponential
     backoff (same policy as polymarket_data_api.py); any other non-200
     status raises immediately."""
     rate_limit_attempt = 0
     while True:
-        status, body = _make_request(host, path, timeout)
+        status, body, received_timestamp_ms, received_monotonic_ns = _make_request(
+            host, path, timeout, capture_timing=include_timing
+        )
         if status == 200:
-            return json.loads(body.decode("utf-8"))
+            parse_started_monotonic_ns = time.monotonic_ns() if include_timing else None
+            data = json.loads(body.decode("utf-8"))
+            parse_completed_monotonic_ns = time.monotonic_ns() if include_timing else None
+            if include_timing:
+                return data, {
+                    "received_timestamp_ms": received_timestamp_ms,
+                    "received_monotonic_ns": received_monotonic_ns,
+                    "parse_started_monotonic_ns": parse_started_monotonic_ns,
+                    "parse_completed_monotonic_ns": parse_completed_monotonic_ns,
+                    "body_size_bytes": len(body),
+                }
+            return data
 
         if status in RETRYABLE_STATUS_CODES and rate_limit_attempt < RATE_LIMIT_MAX_RETRIES:
             delay = RATE_LIMIT_BACKOFF_BASE_SECONDS * (2 ** rate_limit_attempt)
@@ -364,7 +382,8 @@ def resolve_market_category(event_slug, timeout=DEFAULT_TIMEOUT_SECONDS):
     return "other"
 
 
-def fetch_order_book(token_id, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness=False):
+def fetch_order_book(token_id, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness=False,
+                     capture_parse_timing=False):
     """Fetches one token's live order book. Returns {"bids": [(price,
     size), ...], "asks": [(price, size), ...], "last_trade_price": float
     or None, "book_timestamp_ms": int or None, "book_hash": str or None},
@@ -401,9 +420,19 @@ def fetch_order_book(token_id, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness
     best-effort exit at a still-real (if not maximally fresh) price.
     """
     path = f"/book?token_id={token_id}"
-    data = _fetch_json(CLOB_API_HOST, path, timeout)
-    received_timestamp_ms = time.time_ns() // 1_000_000
-    received_monotonic_ns = time.monotonic_ns()
+    if capture_parse_timing:
+        data, transport_timing = _fetch_json(
+            CLOB_API_HOST, path, timeout, include_timing=True
+        )
+        received_timestamp_ms = transport_timing["received_timestamp_ms"]
+        received_monotonic_ns = transport_timing["received_monotonic_ns"]
+    else:
+        data = _fetch_json(CLOB_API_HOST, path, timeout)
+        transport_timing = None
+        # Preserve the pre-existing attribution fields without paying the
+        # extra parse checkpoints while passive capture is disabled.
+        received_timestamp_ms = time.time_ns() // 1_000_000
+        received_monotonic_ns = time.monotonic_ns()
 
     book_timestamp_ms = data.get("timestamp")
     if book_timestamp_ms is not None and not ignore_staleness:
@@ -460,10 +489,20 @@ def fetch_order_book(token_id, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness
         "book_hash": book_hash,
         "received_timestamp_ms": received_timestamp_ms,
         "received_monotonic_ns": received_monotonic_ns,
+        "parse_started_monotonic_ns": (
+            transport_timing["parse_started_monotonic_ns"] if transport_timing else None
+        ),
+        "parse_completed_monotonic_ns": (
+            transport_timing["parse_completed_monotonic_ns"] if transport_timing else None
+        ),
+        "transport_body_size_bytes": (
+            transport_timing["body_size_bytes"] if transport_timing else None
+        ),
     }
 
 
-def fetch_order_book_for_outcome(market_slug, outcome, timeout=DEFAULT_TIMEOUT_SECONDS, ignore_staleness=False):
+def fetch_order_book_for_outcome(market_slug, outcome, timeout=DEFAULT_TIMEOUT_SECONDS,
+                                 ignore_staleness=False, capture_parse_timing=False):
     """Resolves market_slug+outcome -> token_id (via fetch_market_info) then
     fetches that token's order book — the composed lookup both
     simulate_fill() and bot.py's get_market_prices() (TTP monitoring) need,
@@ -477,7 +516,12 @@ def fetch_order_book_for_outcome(market_slug, outcome, timeout=DEFAULT_TIMEOUT_S
     """
     market_info = fetch_market_info(market_slug, timeout=timeout)
     token_id = token_id_for_outcome(market_info, outcome)
-    book = fetch_order_book(token_id, timeout=timeout, ignore_staleness=ignore_staleness)
+    book = fetch_order_book(
+        token_id,
+        timeout=timeout,
+        ignore_staleness=ignore_staleness,
+        capture_parse_timing=capture_parse_timing,
+    )
     return market_info, book
 
 

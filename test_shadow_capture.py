@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
 import unittest
+from unittest.mock import patch
 
 from passive_integrity import measure_passive_integrity
-from shadow_capture import build_passive_shadow_event
+from shadow_capture import build_passive_shadow_capture, build_passive_shadow_event
 from shadow_replay import decide_shadow_buy
 
 
@@ -87,6 +88,21 @@ class TestPassiveShadowCapture(unittest.TestCase):
         checkpoint = event.normalized_payload["checkpoints"]["decision_commit"]
         self.assertEqual(len(checkpoint["buy_vwap"]), 4)
         self.assertEqual(decide_shadow_buy(event).action, "shadow_buy")
+
+    def test_producer_capsule_defers_event_construction_until_materialized(self):
+        trade = self._trade()
+        book = self._book()
+        measurement = measure_passive_integrity(
+            trade, book, decision_monotonic_ns=1_020_000_000,
+            decision_timestamp_ms=10_020,
+        )
+        with patch("shadow_capture.build_passive_shadow_event") as build_event:
+            capsule = build_passive_shadow_capture(
+                trade, book, 5, measurement, False, 10_020, 1_020_000_000
+            )
+            build_event.assert_not_called()
+            capsule.materialize_event()
+            build_event.assert_called_once()
 
 
 if __name__ == "__main__":
