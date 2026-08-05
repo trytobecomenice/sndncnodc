@@ -4,7 +4,7 @@
 the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEMENT.md` and
 `docs/copy-trading/SAFETY.md` for the full rationale and implementation history.
 
-**Last live verification:** 2026-08-05 04:54 HKT / 2026-08-04 20:54 UTC.
+**Last live verification:** 2026-08-05 15:38 HKT / 2026-08-05 07:38 UTC.
 
 ## Non-negotiable operating rules
 
@@ -25,8 +25,8 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 ### Deployment and control plane
 
 - EC2 host alias: `polymarket-copybot` (`/home/ubuntu/polymarket-copybot`).
-- Git commit live: `736d3e0` (`refactor(copybot): separate weather bot workspace`); paper bot PID
-  remained `75742` during the 04:54 HKT read-only audit.
+- Git commit live: `328a22d` (`fix(copybot): tolerate blank last trade prices`); single paper bot
+  PID `83881` after the controlled 15:30 HKT restart.
 - `LIVE_MODE=False`.
 - EC2 `config.py` has two intentional-but-uncommitted overrides:
   - `TRACKED_TRADERS_SOURCE="db"`
@@ -34,6 +34,9 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
 - Do not run `git reset --hard` on EC2: it would erase those production overrides.
 - `watchdog.py` cron is installed every 2 minutes.
 - `autodeploy.py` cron is installed every 5 minutes.
+- Watchdog is active. `data/autodeploy.lock` remains intentionally present because `origin/main`
+  also contains the not-yet-production-active quant-controls checkpoint; do not remove the lock
+  until that larger deployment passes `docs/TODO_2026-08-06.md`.
 - Daily wallet scan/score/category-discovery/send-approval cron is installed at 20:00 UTC.
 - `telegram-approval-listener.service` is installed, enabled, and active.
 - `omsd.service` is installed, enabled, active on `127.0.0.1:8090`, and the shadow mirror is on.
@@ -76,7 +79,14 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
   07:00 HKT on 2026-08-04. The next row is not due until the 23:00 UTC trigger
   (07:00 HKT next morning).
 - The laptop DB's apparent snapshot stoppage was not a production outage.
-- AWS showed zero `str`/`int` TTP type errors in the 24 hours before the P0 restart.
+- At 12:31 HKT Polymarket began returning `last_trade_price=""` on otherwise-valid order books.
+  The old parser called `float("")`; all 53 open-position marks failed every sweep, producing
+  1,018 repeated errors by 15:17 HKT. This was an upstream optional-field shape change, not a
+  trader signal.
+- Production hotfix `328a22d` treats blank, malformed, and non-finite optional last-trade prices
+  as unavailable while preserving valid live bid/ask data. Its first two post-restart sweeps
+  marked all **53/53** open positions at 15:30:39 and 15:36:03 HKT (5m24s apart), with zero
+  post-start errors.
 - AWS open-position numeric columns were all stored as numeric SQLite types.
 - Stale order books remain a real market-quality condition, but there were zero generic error
   events in the one-hour production sample immediately before P0.
@@ -137,6 +147,29 @@ the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEM
    when the roster count looks diversified.
 
 ## Change log
+
+### 2026-08-05 — Blank `last_trade_price` production hotfix
+
+1. **When:** 2026-08-05 15:16–15:38 HKT.
+2. **Files adjusted:**
+   - `polymarket_simulator.py` — normalized an optional blank/malformed/non-finite
+     `last_trade_price` to `None` without discarding a valid bid/ask book.
+   - `test_polymarket_simulator.py` — added the exact live empty-string regression plus
+     whitespace, malformed, NaN, and infinity coverage.
+   - `CLAUDE_HANDOFF.md`, `docs/TODO_2026-08-06.md`, and
+     `docs/copy-trading/RISK_MANAGEMENT.md` — recorded cause, isolated deployment, and follow-up.
+3. **What changed:**
+   - Confirmed against a raw affected CLOB response that `timestamp`, bids, and asks were valid;
+     only optional `last_trade_price` was `""`.
+   - Built production-only commit `328a22d` from the prior live commit `736d3e0`, so the urgent
+     deploy did not activate the larger quant-controls checkpoint.
+   - Focused simulator tests: **42 passed** locally and on AWS. Normal-workspace full Python suite:
+     **676 passed**.
+   - AWS fast-forwarded `736d3e0 -> 328a22d`; paper bot restarted cleanly from PID `75742` to
+     single PID `83881`. Two sweeps refreshed 53/53 marks at 15:30:39 and 15:36:03 HKT, with
+     zero new errors and zero recurrence of the empty-price exception.
+   - `.env`, credentials, EC2's intentional dirty `config.py` overrides, and unrelated local
+     worktree changes were not committed or overwritten.
 
 ### 2026-08-05 — Quant controls 1–4 implementation checkpoint
 

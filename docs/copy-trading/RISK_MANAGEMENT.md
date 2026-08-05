@@ -4454,6 +4454,26 @@ but stays polled for exits until no real position remains, then becomes `watch`.
 deferred to the controlled checklist in `docs/TODO_2026-08-06.md` because EC2 has intentional
 uncommitted `config.py` overrides and the new startup audit changes roster state.
 
+## 52. Optional blank `last_trade_price` must not invalidate a live order book (2026-08-05)
+
+At 12:31 HKT Polymarket began returning `last_trade_price=""` on otherwise-valid `/book`
+responses. The timestamp and both bid/ask sides remained valid. `fetch_order_book()` treated every
+non-`None` value as numeric and called `float("")`, causing every one of the 53 normal open
+positions to fail its five-minute TTP mark. By 15:17 HKT this had generated 1,018 duplicate errors
+and frozen TTP/equity observability across the whole book.
+
+The optional field is now normalized at the API boundary: missing, blank, malformed, NaN, and
+infinite values become `None`; valid numeric strings remain floats. A valid live bid/ask book is
+preserved and remains eligible for mark-to-market and bid-side TTP. If no usable book price exists,
+the existing fail-soft `no usable price` path still applies; the fix never invents a price or fires
+an exit from last-trade data alone.
+
+The production-only hotfix was cut from the prior live commit so it could be deployed without the
+larger pending quant-control rollout. Commit `328a22d` passed 42 focused tests locally and on AWS;
+the normal-workspace full suite passed 676 tests. The first live post-restart sweep refreshed all
+53/53 open marks; the second did the same 5m24s later. There were zero post-start errors across
+both sweeps.
+
 ## What is intentionally still simple
 
 The current setup is conservative by design — it focuses on avoiding obvious bad fills, bad
