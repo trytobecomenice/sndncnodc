@@ -4,6 +4,38 @@
 the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEMENT.md` and
 `docs/copy-trading/SAFETY.md` for the full rationale and implementation history.
 
+## Project maturity — honest benchmark
+
+Using **10/10** to mean a world-leading Wall Street/prop-shop platform, the project is currently
+approximately **4/10 overall**:
+
+- Architecture thinking: **6/10**
+- Risk-control thinking: **6.5/10**
+- Operational/system maturity: **4/10**
+- Demonstrated net alpha: **2/10**
+
+This is advanced for a personal project but not institution-grade. Its strongest evidence is the
+risk/deployment discipline, deterministic replay foundation, paper/shadow isolation, passive
+latency measurement, and explicit failure handling. Its largest unresolved question is still the
+only one that economically matters: after source market impact, detection delay, spread, fees,
+slippage, and execution uncertainty, does any followed trader retain positive **copyable net
+alpha**?
+
+Do not raise the score because more features were added. Raise it only at evidence gates:
+
+```text
+4/10  current engineering foundation
+5/10  credible shadow attribution from real captured data
+6/10  sequence-safe WS/REST resync and real-burst resource safety
+7/10  small live executions agree with the shadow model
+8/10  sustained positive net alpha after all observable friction
+9/10  institutional redundancy, independent risk, reconciliation, and compliance
+10/10 world-leading prop infrastructure and research operation
+```
+
+If real evidence disproves high-frequency copy alpha and the system pivots early to a slower,
+high-conviction strategy, that is good quant research rather than failure.
+
 **Last live verification:** 2026-08-05 15:38 HKT / 2026-08-05 07:38 UTC.
 
 ## Non-negotiable operating rules
