@@ -6,9 +6,27 @@ import tempfile
 
 from audit_resolution_timing import classify_resolution_timing, parse_timestamp
 from analyze_clean_cohort import bootstrap, estimators, load_resolution_audit
+from apply_resolution_audit import load_candidates
 
 
 class TestResolutionTiming(unittest.TestCase):
+    def test_apply_manifest_contains_only_factual_phantom(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audit.json"
+            path.write_text(json.dumps({
+                "audit_version": "resolution-timing-v1",
+                "rows": [
+                    {"id": "p", "verdict": "phantom", "resolution_timestamp": 2,
+                     "verdict_reason": "resolution_precedes_paper_entry"},
+                    {"id": "u", "verdict": "unknown"},
+                    {"id": "l", "verdict": "legit"},
+                ],
+            }))
+            _, candidates, first_digest = load_candidates(path)
+            _, _, second_digest = load_candidates(path)
+        self.assertEqual([row["id"] for row in candidates], ["p"])
+        self.assertEqual(first_digest, second_digest)
+
     def test_factual_phantom_requires_resolution_before_entry(self):
         metadata = {"closed": True, "closedTime": "2026-08-01T00:00:00Z"}
         verdict, timestamp, reason = classify_resolution_timing(1_800_000_000, metadata)
