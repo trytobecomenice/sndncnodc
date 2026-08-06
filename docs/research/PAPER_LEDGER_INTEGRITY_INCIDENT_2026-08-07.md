@@ -1,7 +1,7 @@
 # Paper Ledger Integrity Incident Review — 2026-08-07
 
-Status: **P0 independently reproduced; local isolation patch tested; AWS mutation/deployment
-pending.** This document records the complete structured review received on 2026-08-07 and
+Status: **P0 independently reproduced and isolated on AWS Paper; strategy remains rejected for
+Live.** This document records the complete structured review received on 2026-08-07 and
 the immediate operating decisions that follow from it. It does not silently rewrite historical
 rows, authorize a production database mutation, or assert that an external calculation is already
 verified production truth.

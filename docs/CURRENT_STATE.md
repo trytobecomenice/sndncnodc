@@ -7,7 +7,7 @@
 > cap, mute, promotion, HWM, or drawdown figure. The external review's exact local figures are not
 > AWS truth; use the verified causal-classifier figures below.
 >
-> **Last live verification:** 2026-08-05 03:50 HKT. Read `CLAUDE_HANDOFF.md` for the exact AWS
+> **Last live verification:** 2026-08-07 01:44 HKT. Read `CLAUDE_HANDOFF.md` for the exact AWS
 > evidence, P0 replay fix, restart gate, and open operational risks.
 
 ## Repository scope
@@ -42,13 +42,14 @@ authority for fresh/current databases.
   claim of 14 / `-$40.74` was a different snapshot and is not current AWS truth.
 - **AWS equity HWM:** `$2,173.60` at the read-only check, not the reviewer's older/local
   `$1,853.36`; it remains quarantined because historical phantom PnL fed the ratchet.
-- **Open book at the earlier live check:** 56 positions with `$356.26` recorded cost basis. The
-  markability statement below describes that point-in-time operational check, not clean strategy
-  profitability.
-- **HKT 2026-08-05 realized PnL at 03:50:** `$0.00`.
-- **Risk state:** kill switch inactive; all 56 open positions had a successful recent mark and no
-  open position was more than 24 hours stale.
-- **Runtime:** the P0-fixed paper process was PID `75742`; verify live before relying on this PID.
+- **P0 integrity isolation deployed:** AWS has 455 rows marked by classifier
+  `paper-ledger-integrity-v1`; manifest SHA-256 starts `75755957`. No rows or PnL were deleted or
+  rebased, and zero open positions matched the classifier.
+- **Open book at verification:** 52 clean/unclassified positions; all 52 received a fresh mark at
+  2026-08-07 01:44 HKT. This is markability evidence, not strategy profitability.
+- **Risk state:** contaminated HWM `$2,173.60` was removed after backup and classification; the
+  restarted bot cleanly reseeded HWM to `$1,112.60`.
+- **Runtime:** paper process PID `105229` on commit `a7f7a00`; verify live before relying on this PID.
 - **Services:** watchdog, autodeploy, Telegram approval listener, daily wallet scan/score workflow,
   and OMS shadow mirror were deployed at the last check.
 
@@ -62,10 +63,13 @@ authority for fresh/current databases.
    Copy Bot exposure and PnL.
 4. Historical PnL can remain concentrated in a small number of wallets even when the roster count
    appears diversified.
-5. Historical Paper PnL, wallet EV/ranking, circuit-breaker outcomes, and equity HWM are
-   contaminated by replayed/post-event phantom positions. A local isolation patch is tested but
-   not yet applied to AWS; treat downstream economic decisions as quarantined until controlled
-   migration, classification, HWM reseed, and restart verification complete.
+5. Historical Paper PnL remains auditable but quarantined. Confirmed phantom rows are now excluded
+   from wallet EV/ranking, rolling evidence, dashboards, open-state loading, and clean PnL readers.
+   Existing mute/status decisions were deliberately not auto-reversed; review them manually from
+   clean evidence.
+6. `pnl_snapshot` still had zero rows after the first migrated TTP/HWM cycle. Snapshot activation
+   remains an operational gap even though all 52 open positions marked and post-restart errors were
+   zero.
 
 ## 2026-08-05 repository separation
 

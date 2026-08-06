@@ -393,6 +393,36 @@ priorities until the forensic and feedback-isolation gates pass.
 
 ## Change log
 
+### 2026-08-07 — P0 Paper-ledger isolation deployed to AWS
+
+1. **When:** 2026-08-07 01:17–01:44 HKT.
+2. **Files/data adjusted:**
+   - GitHub/AWS checkout advanced to `a7f7a00`.
+   - AWS `paper_trade` received the four migration-0023 integrity columns; 455 closed rows were
+     marked with classifier v1 metadata. No row or PnL value was deleted/rebased.
+   - AWS `bot_risk_state.equity_hwm` was cleared only after backup and manifest match, then
+     naturally reseeded by the restarted Paper bot.
+   - Recovery evidence written under AWS `data/backups/`: 4.9 GB SQLite backup, dry-run manifest,
+     and applied manifest. These runtime files are untracked.
+3. **What changed / verification:**
+   - Source/backup page count, page size, full `sqlite_master` SHA-256, schema-object count, wallet
+     count, and closed-row count matched. A full integrity scan was stopped after excessive EBS
+     rereads; no source write was involved, and the completed SQLite backup remained intact.
+   - Dry-run and apply both produced manifest SHA `7575595736b2fad08ecfee9043c3b39397f265d43076e8b5f9d3e2e65f640c33`:
+     455 candidates / `+$668.998241`, 186 clean remainder / `-$48.599008`, zero open candidates.
+   - Existing roster status remained exactly 12 unmuted track + 5 muted track; no automatic
+     unmute/promotion/demotion occurred.
+   - Paper PID `105229` started with `LIVE_MODE=False`, DB roster source, and OMS shadow enabled.
+     HWM reseeded from `$2,173.60` contaminated to `$1,112.60`; 52/52 open rows marked fresh at
+     01:44 HKT; post-restart error count was zero.
+   - Phase-0 recorder stayed active throughout. Watchdog pause was removed after verification;
+     autodeploy lock remains. `pnl_snapshot` still had zero rows and needs follow-up.
+   - Migration 0022 would drop nine legacy Weather tables, so it was intentionally skipped. 0023
+     was directly applied and journaled as the new baseline; all nine Weather tables remain.
+   - Local full suite 795 passed / 2 skipped; AWS exact new P0 regressions 11/11 passed. The AWS
+     full suite was stopped because an integration path scanned the 4.9 GB runtime DB and created
+     unacceptable observer effect; tests need complete temp-DB isolation.
+
 ### 2026-08-07 — Independent P0 reproduction and local feedback isolation
 
 1. **When:** 2026-08-07 HKT.
