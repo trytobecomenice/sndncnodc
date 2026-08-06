@@ -7,7 +7,7 @@ from reconcile_paper_trade_events import allocate_events
 class TestEventAllocation(unittest.TestCase):
     def test_unique_interval_allocates_partial_events_to_one_lot(self):
         trades = [{"id": "a", "wallet_address": "w", "market_slug": "m", "outcome": "Yes",
-                   "opened_at": 10, "closed_at": 20}]
+                   "opened_at": 10, "closed_at": 20, "allocation_end_at": 20}]
         events = [
             {"id": "e1", "trader_address": "w", "market_slug": "m", "outcome": "Yes",
              "timestamp": 15, "pnl_usd": 1},
@@ -22,9 +22,9 @@ class TestEventAllocation(unittest.TestCase):
     def test_no_match_and_overlapping_lots_are_never_forced(self):
         trades = [
             {"id": "a", "wallet_address": "w", "market_slug": "m", "outcome": "Yes",
-             "opened_at": 10, "closed_at": 20},
+             "opened_at": 10, "closed_at": 20, "allocation_end_at": 20},
             {"id": "b", "wallet_address": "w", "market_slug": "m", "outcome": "Yes",
-             "opened_at": 15, "closed_at": 25},
+             "opened_at": 15, "closed_at": 25, "allocation_end_at": 25},
         ]
         events = [
             {"id": "amb", "trader_address": "w", "market_slug": "m", "outcome": "Yes",

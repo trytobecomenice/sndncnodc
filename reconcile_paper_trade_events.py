@@ -34,7 +34,7 @@ def allocate_events(trades, events):
     for event in events:
         key = (event["trader_address"], event["market_slug"], event["outcome"])
         candidates = [trade for trade in by_key.get(key, [])
-                      if trade["opened_at"] <= event["timestamp"] <= trade["closed_at"]]
+                      if trade["opened_at"] <= event["timestamp"] <= trade["allocation_end_at"]]
         if len(candidates) == 1:
             allocations[candidates[0]["id"]].append(event)
         elif not candidates:
@@ -53,13 +53,15 @@ def reconcile(db_path):
     try:
         trades = [dict(row) for row in conn.execute(
             "SELECT id,lower(wallet_address) wallet_address,market_slug,outcome,"
-            "opened_at,closed_at,close_reason,cost_basis_usd,realized_pnl_usd,"
+            "status,opened_at,closed_at,close_reason,cost_basis_usd,realized_pnl_usd,"
             "COALESCE(is_phantom,0) is_phantom,phantom_classifier_version "
-            "FROM paper_trade WHERE strategy='bot_filtered' AND status='closed' "
+            "FROM paper_trade WHERE strategy='bot_filtered' "
             "AND is_demo_data=0 ORDER BY opened_at,id"
         )]
         lower = min(row["opened_at"] for row in trades)
-        upper = max(row["closed_at"] for row in trades)
+        upper = conn.execute("SELECT COALESCE(MAX(timestamp),?) FROM bot_event_log", (lower,)).fetchone()[0]
+        for trade in trades:
+            trade["allocation_end_at"] = trade["closed_at"] or upper
         placeholders = ",".join("?" for _ in _REALIZED_PNL_EVENT_TYPES)
         events = [dict(row) for row in conn.execute(
             f"SELECT id,timestamp,event_type,lower(trader_address) trader_address,"
@@ -91,6 +93,8 @@ def reconcile(db_path):
         "report_version": REPORT_VERSION,
         "generated_at": int(time.time()),
         "trade_count": len(trades),
+        "closed_trade_count": sum(row["status"] == "closed" for row in trades),
+        "open_trade_count": sum(row["status"] == "open" for row in trades),
         "event_count_in_trade_time_range": len(events),
         "matched_trade_count": len(matched),
         "no_event_match_trade_count": len(rows) - len(matched),
@@ -99,9 +103,16 @@ def reconcile(db_path):
         "row_ledger_realized_pnl_usd": sum(float(row["realized_pnl_usd"] or 0) for row in trades),
         "allocated_event_realized_pnl_usd": sum(row["allocated_event_pnl_usd"] for row in matched),
         "fact_clean_allocated_event_pnl_usd": sum(row["allocated_event_pnl_usd"] for row in clean),
+        "fact_clean_closed_event_pnl_usd": sum(
+            row["allocated_event_pnl_usd"] for row in clean if row["status"] == "closed"
+        ),
+        "fact_clean_open_partial_event_pnl_usd": sum(
+            row["allocated_event_pnl_usd"] for row in clean if row["status"] == "open"
+        ),
         "phantom_allocated_event_pnl_usd": sum(row["allocated_event_pnl_usd"] for row in phantom),
         "fact_clean_cost_basis_usd": sum(float(row["cost_basis_usd"] or 0) for row in clean),
         "fact_clean_trade_count": len(clean),
+        "fact_clean_closed_trade_count": sum(row["status"] == "closed" for row in clean),
         "rows": rows,
         "unmatched_event_ids": [row["id"] for row in unmatched],
         "ambiguous_events": ambiguous,
