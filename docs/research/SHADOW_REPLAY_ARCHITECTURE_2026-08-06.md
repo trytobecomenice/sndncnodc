@@ -1,8 +1,8 @@
 # Lean Shadow Recorder and Replay Architecture — 2026-08-06
 
 Status: Phase A polling vertical slice, minimal Phase 0 attribution, and a standalone public-WS
-soak recorder were implemented locally on 2026-08-06. The recorder is paper/read-only and awaits
-the controlled AWS service deployment recorded below. The compact schema, bounded JSONL writer,
+soak recorder were implemented on 2026-08-06. The recorder is paper/read-only and began its
+controlled AWS soak at 2026-08-06 19:00 HKT. The compact schema, bounded JSONL writer,
 virtual-clock replay, passive signal-time measurement, exact gate trace, size-aware entry/exit
 observation, conservative tax-lot shadow ledger, recoverable BUY interlock, and persistent
 malformed-risk panic path exist. No C++ service or live order path is running.
@@ -747,9 +747,9 @@ Current official lifecycle references used for this decision:
 
 ## Phase 0 soak implementation — 2026-08-06
 
-Status at this checkpoint: implemented and locally network-sanity-tested; paper/read-only. The AWS
-service is deployed only when the later handoff entry explicitly records its commit and service
-state. This section distinguishes implemented evidence from future inference.
+Status at this checkpoint: implemented, locally network-sanity-tested, and running as a separate
+paper/read-only AWS service. The first 24-hour evidence gate is not yet complete. This section
+distinguishes implemented evidence from future inference.
 
 ### Distinct fills and incremental conviction
 

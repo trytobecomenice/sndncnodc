@@ -324,6 +324,37 @@ high-conviction strategy, that is good quant research rather than failure.
    - Commit, GitHub, and AWS service state are recorded in the next deployment entry only; do not
      infer deployment from this implementation entry.
 
+### 2026-08-06 — Phase 0 AWS soak deployment
+
+1. **When:** 2026-08-06 18:55–19:01 HKT.
+2. **Files adjusted:**
+   - `deploy/phase0-soak-recorder.service` — tightened final AWS limits after host preflight.
+   - `CLAUDE_HANDOFF.md` and
+     `docs/research/SHADOW_REPLAY_ARCHITECTURE_2026-08-06.md` — recorded exact deployment truth.
+3. **What changed:**
+   - Implementation commit `649c9d8` and resource-limit commit `0f97c4e` were pushed to GitHub
+     `main`. AWS was safely fast-forwarded from `328a22d` to `0f97c4e` with the existing
+     `config.py` overrides preserved (`TRACKED_TRADERS_SOURCE="db"`, OMS mirror enabled).
+   - `data/autodeploy.lock` remained present. The existing paper bot was not restarted and stayed
+     PID `83881`; its DB journal continued producing events after deployment.
+   - AWS preflight found 1,905 MB RAM, about 906 MB available, no swap, Python 3.14.4, and aiohttp
+     3.14.3. The research service was therefore capped at 384 MB address space, 512 MB cgroup,
+     35% CPU, 64 active assets, `Nice=10`, and idle I/O priority rather than risking a 1 GB cap.
+   - AWS focused suite **122 passed**, Python compile passed, and `systemd-analyze verify` passed
+     before service activation.
+   - `phase0-soak-recorder.service` started at 2026-08-06 11:00:36 UTC (19:00:36 HKT), PID `96800`.
+     After two polls it was active with zero restart, about 39.7 MB RAM, one healthy WS connection,
+     0 poll errors, 0 malformed lines, p50 poll 909 ms, and no historical fake signal. Empty
+     T+100/T+500 counts are expected until the first genuinely new followed-wallet fill.
+   - The journal is `/home/ubuntu/polymarket-copybot/data/phase0_soak_v1.jsonl`; it is runtime data,
+     untracked by Git, and contains no key/order capability. `.env` and credentials were not
+     staged, pushed, copied, or printed.
+   - **24-hour gate remains pending.** Inspect after 2026-08-07 19:00 HKT with
+     `python3 inspect_phase0_soak.py data/phase0_soak_v1.jsonl`, then review coverage, poll gaps,
+     WS reconnects, T+100/T+500 lateness/availability, RSS/CPU, malformed lines, BUY/SELL mix,
+     tax-lot lifecycle, and ten manual source-fill/VWAP samples before making any alpha or AWS-
+     sizing claim.
+
 ## Change log
 
 ### 2026-08-06 — Process-isolation blueprint and repository-scope cleanup
