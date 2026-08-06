@@ -35,6 +35,9 @@ import telegram_alerts
 
 WATCHDOG_PAUSE_PATH = os.path.join(config.BASE_DIR, "data", "watchdog_paused")
 WATCHDOG_LOG_PATH = os.path.join(config.BASE_DIR, "watchdog.out.log")
+WATCHDOG_DUPLICATE_STATE_PATH = os.path.join(
+    config.BASE_DIR, "data", "watchdog_duplicate_bot.state"
+)
 
 # Seconds to wait after start_bot() before checking whether the restart
 # actually took — bot.py's own startup (loading tracked traders, wallet
@@ -53,7 +56,31 @@ def main():
     if os.path.exists(WATCHDOG_PAUSE_PATH):
         return  # deliberately paused -- no-op, no log spam, no Telegram noise
 
-    if dashboard.bot_pid() is not None:
+    pids = dashboard.bot_pids()
+    if len(pids) > 1:
+        signature = ",".join(map(str, pids))
+        previous = None
+        try:
+            with open(WATCHDOG_DUPLICATE_STATE_PATH) as f:
+                previous = f.read().strip()
+        except OSError:
+            pass
+        if previous != signature:
+            _log(f"CRITICAL duplicate bot.py processes detected: {signature}; not starting another")
+            telegram_alerts.send_telegram_alert(
+                f"🚨 copybot watchdog: duplicate bot.py processes detected ({signature}). "
+                "No automatic kill was attempted; manual reconciliation required."
+            )
+            with open(WATCHDOG_DUPLICATE_STATE_PATH, "w") as f:
+                f.write(signature)
+        return
+    try:
+        os.remove(WATCHDOG_DUPLICATE_STATE_PATH)
+    except FileNotFoundError:
+        pass
+
+    if pids:
+        dashboard.bot_pid()  # repair a missing/stale PID file
         return  # alive, nothing to do
 
     _log("bot.py not running -- restarting")

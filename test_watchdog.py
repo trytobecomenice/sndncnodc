@@ -41,6 +41,7 @@ class TestWatchdog(unittest.TestCase):
 
     def test_noop_when_bot_is_already_alive(self):
         with patch("watchdog.dashboard.bot_pid", return_value=12345), \
+             patch("watchdog.dashboard.bot_pids", return_value=[12345]), \
              patch("watchdog.dashboard.start_bot") as mock_start, \
              patch("watchdog.telegram_alerts.send_telegram_alert") as mock_alert:
             watchdog.main()
@@ -48,7 +49,8 @@ class TestWatchdog(unittest.TestCase):
         mock_alert.assert_not_called()
 
     def test_restarts_and_alerts_twice_when_dead_and_restart_succeeds(self):
-        with patch("watchdog.dashboard.bot_pid", side_effect=[None, 99999]), \
+        with patch("watchdog.dashboard.bot_pid", return_value=99999), \
+             patch("watchdog.dashboard.bot_pids", return_value=[]), \
              patch("watchdog.dashboard.start_bot") as mock_start, \
              patch("watchdog.telegram_alerts.send_telegram_alert") as mock_alert, \
              patch("watchdog.time.sleep"):
@@ -60,7 +62,8 @@ class TestWatchdog(unittest.TestCase):
         self.assertIn("99999", mock_alert.call_args_list[1].args[0])
 
     def test_alerts_failure_when_restart_does_not_come_back_up(self):
-        with patch("watchdog.dashboard.bot_pid", side_effect=[None, None]), \
+        with patch("watchdog.dashboard.bot_pid", return_value=None), \
+             patch("watchdog.dashboard.bot_pids", return_value=[]), \
              patch("watchdog.dashboard.start_bot") as mock_start, \
              patch("watchdog.telegram_alerts.send_telegram_alert") as mock_alert, \
              patch("watchdog.time.sleep"):
@@ -74,9 +77,26 @@ class TestWatchdog(unittest.TestCase):
         """Sanity check on the setUp fixture itself: with the pause path
         pointed at something that doesn't exist, the paused branch must
         not fire."""
-        with patch("watchdog.dashboard.bot_pid", return_value=1) as mock_bot_pid:
+        with patch("watchdog.dashboard.bot_pids", return_value=[1]), \
+             patch("watchdog.dashboard.bot_pid", return_value=1) as mock_bot_pid:
             watchdog.main()
         mock_bot_pid.assert_called_once()
+
+    def test_duplicate_processes_alert_once_and_never_start(self):
+        duplicate_state = os.path.join(tempfile.gettempdir(), "watchdog-duplicate-test-state")
+        try:
+            os.remove(duplicate_state)
+        except FileNotFoundError:
+            pass
+        with patch.object(watchdog, "WATCHDOG_DUPLICATE_STATE_PATH", duplicate_state), \
+             patch("watchdog.dashboard.bot_pids", return_value=[10, 20]), \
+             patch("watchdog.dashboard.start_bot") as mock_start, \
+             patch("watchdog.telegram_alerts.send_telegram_alert") as mock_alert:
+            watchdog.main()
+            watchdog.main()
+        mock_start.assert_not_called()
+        mock_alert.assert_called_once()
+        os.remove(duplicate_state)
 
 
 if __name__ == "__main__":

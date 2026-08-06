@@ -14,6 +14,7 @@ unchanged from the JSON-file version.
 """
 
 import json
+import fcntl
 import logging
 import os
 import signal
@@ -29,6 +30,7 @@ from db import get_closed_trade_stats_since, get_tracked_traders, realized_pnl_t
 
 PORT = 8787
 PID_PATH = os.path.join(config.BASE_DIR, "bot.pid")
+START_LOCK_PATH = os.path.join(config.BASE_DIR, "data", "bot-start.lock")
 BOT_LOG_PATH = config.BOT_LOG_PATH
 
 # Own rotating log (2026-07-22, disk-exhaustion hardening) — same reasoning
@@ -45,70 +47,102 @@ logger.addHandler(logging.StreamHandler())
 INDEX_PATH = os.path.join(config.BASE_DIR, "static", "index.html")
 
 
-def bot_pid():
-    if not os.path.exists(PID_PATH):
-        return None
-    try:
-        with open(PID_PATH) as f:
-            pid = int(f.read().strip())
-    except (ValueError, OSError):
-        return None
-
-    # Reap the bot if it's an exited child of THIS process. start_bot()
-    # discards its Popen object, so nothing ever wait()s on the child —
-    # when bot.py exits, it lingers as a zombie, and zombies pass the
-    # os.kill(pid, 0) existence check below, making a dead bot report as
-    # "running" forever (observed 2026-07-18: a cleanly-SIGTERM'd bot.py
-    # showed ZN/<defunct> in ps while this function kept returning its pid).
-    try:
-        os.waitpid(pid, os.WNOHANG)
-    except OSError:
-        pass  # not our child (bot started manually or by a prior dashboard run)
-
+def _is_live_bot_process(pid):
     try:
         os.kill(pid, 0)
     except OSError:
-        os.remove(PID_PATH)
-        return None
+        return False
 
-    # os.kill(pid, 0) also succeeds on zombies parented to OTHER processes
-    # (which we cannot reap) — check the real process state and treat
-    # Z/defunct as dead. `ps -o stat=` is Darwin/Linux-portable.
     try:
         result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "stat="],
+            ["ps", "-p", str(pid), "-o", "stat=", "-o", "args="],
             capture_output=True, text=True, timeout=5,
         )
-        if result.stdout.strip().startswith("Z"):
-            os.remove(PID_PATH)
-            return None
+        output = result.stdout.strip()
+        if not output or output.startswith("Z") or "bot.py" not in output:
+            return False
     except Exception:
-        pass  # ps unavailable/slow — fall back on the existence check above
+        return False
 
-    return pid
+    proc_dir = f"/proc/{pid}"
+    if os.path.isdir(proc_dir):
+        try:
+            cwd = os.path.realpath(os.readlink(os.path.join(proc_dir, "cwd")))
+            cmdline = open(os.path.join(proc_dir, "cmdline"), "rb").read().split(b"\0")
+            if cwd != os.path.realpath(config.BASE_DIR):
+                return False
+            if not any(os.path.basename(part.decode(errors="ignore")) == "bot.py"
+                       for part in cmdline if part):
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def bot_pids():
+    """Return every live bot.py PID for this repository, not just bot.pid."""
+    candidates = set()
+    try:
+        with open(PID_PATH) as f:
+            candidates.add(int(f.read().strip()))
+    except (ValueError, OSError):
+        pass
+
+    proc_root = "/proc"
+    if os.path.isdir(proc_root):
+        for name in os.listdir(proc_root):
+            if name.isdigit():
+                candidates.add(int(name))
+    return sorted(pid for pid in candidates if _is_live_bot_process(pid))
+
+
+def _write_pid(pid):
+    temporary = f"{PID_PATH}.{os.getpid()}.tmp"
+    with open(temporary, "w") as f:
+        f.write(str(pid))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, PID_PATH)
+
+
+def bot_pid():
+    pids = bot_pids()
+    if not pids:
+        try:
+            os.remove(PID_PATH)
+        except FileNotFoundError:
+            pass
+        return None
+
+    # Repair a missing/stale PID file. Returning any live PID prevents an
+    # unsafe second start; watchdog separately alerts if len(bot_pids()) > 1.
+    current = None
+    try:
+        with open(PID_PATH) as f:
+            current = int(f.read().strip())
+    except (ValueError, OSError):
+        pass
+    if current != pids[0]:
+        _write_pid(pids[0])
+    return pids[0]
 
 
 def start_bot():
-    if bot_pid():
-        return
-    # 2026-07-22: no longer redirects the child's stdout to BOT_LOG_PATH via
-    # a file handle opened HERE. bot.py now owns that file itself through
-    # its own RotatingFileHandler (see bot.py's module-level logger setup) —
-    # keeping this Popen-level redirect too would (a) double-write every
-    # line bot.py's StreamHandler also mirrors to stdout, and worse, (b) go
-    # rotation-blind: this file handle would keep writing to bot.out.log's
-    # OLD inode after bot.py's handler rotates it away, so nothing from this
-    # side would ever appear in the current bot.out.log again after the
-    # first rotation. bot.py's own logger is the sole writer of that file
-    # now; this subprocess's stdout/stderr are simply discarded.
-    proc = subprocess.Popen(
-        [sys.executable, "-u", "bot.py"],
-        cwd=config.BASE_DIR,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    with open(PID_PATH, "w") as f:
-        f.write(str(proc.pid))
+    os.makedirs(os.path.dirname(START_LOCK_PATH), exist_ok=True)
+    with open(START_LOCK_PATH, "a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        if bot_pid():
+            return
+        # 2026-07-22: no longer redirects the child's stdout to BOT_LOG_PATH via
+        # a file handle opened HERE. bot.py now owns that file itself through
+        # its own RotatingFileHandler (see bot.py's module-level logger setup).
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "bot.py"],
+            cwd=config.BASE_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _write_pid(proc.pid)
 
 
 def stop_bot():
