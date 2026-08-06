@@ -2805,10 +2805,12 @@ def maybe_snapshot_daily_portfolio(positions, prices_by_key, tracked_traders, mu
     )
 
 
-def record_periodic_pnl_snapshots(positions, prices_by_key, evaluation_epoch, now=None):
+def record_periodic_pnl_snapshots(
+        positions, prices_by_key, evaluation_epoch, now=None, total_realized=None):
     """Persist overall and clean-epoch mark-to-market rows every TTP sweep."""
     now = now or datetime.now(timezone.utc)
-    total_realized = realized_pnl_total()
+    if total_realized is None:
+        total_realized = realized_pnl_total()
     total_breakdown = risk_manager.compute_equity_breakdown(
         positions, prices_by_key, total_realized,
     )
@@ -4423,9 +4425,11 @@ def main():
                 # the sweep itself failed — a broken price fetch must not
                 # manufacture a phantom drawdown.
                 if prices_by_key is not None and not SHUTDOWN_REQUESTED:
+                    total_realized = None
                     try:
+                        total_realized = realized_pnl_total()
                         equity = risk_manager.compute_equity(
-                            positions, prices_by_key, realized_pnl_total())
+                            positions, prices_by_key, total_realized)
                         new_hwm, triggers = risk_manager.evaluate_equity(
                             equity, risk_state["equity_hwm"])
                         # Phase 1 observability (2026-07-31) — set on every
@@ -4462,6 +4466,7 @@ def main():
                     try:
                         record_periodic_pnl_snapshots(
                             positions, prices_by_key, evaluation_epoch,
+                            total_realized=total_realized,
                         )
                         maybe_snapshot_daily_portfolio(positions, prices_by_key, tracked_traders, muted_traders)
                     except Exception as e:

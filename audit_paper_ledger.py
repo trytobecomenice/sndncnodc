@@ -94,6 +94,12 @@ def build_report(conn):
     bad_open_rows = [
         row for row in rows if row["status"] == "open" and row["id"] in classified
     ]
+    residual_fast_resolved = [
+        row for row in clean_rows
+        if row["close_reason"] == "resolved"
+        and row["closed_at"] is not None
+        and int(row["closed_at"]) - int(row["opened_at"]) < 600
+    ]
 
     def aggregate(items):
         cost = sum(float(row["cost_basis_usd"] or 0) for row in items)
@@ -127,6 +133,13 @@ def build_report(conn):
             ), 6),
         },
         "candidate_clean_remainder": aggregate(clean_rows),
+        # Screening evidence only. Holding duration measures sweep latency,
+        # not whether the market had resolved before entry. Every row stays
+        # clean until a factual closedTime/umaEndDate audit decides it.
+        "suspect_fast_resolved_residual": {
+            **aggregate(residual_fast_resolved),
+            "row_ids": sorted(row["id"] for row in residual_fast_resolved),
+        },
         "reason_counts": dict(sorted(
             (reason, sum(reason in reasons for reasons in classified.values()))
             for reason in {reason for reasons in classified.values() for reason in reasons}

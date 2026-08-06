@@ -107,6 +107,16 @@ class TestPaperLedgerApply(unittest.TestCase):
             "SELECT is_phantom FROM paper_trade WHERE id='c'"
         ).fetchone()[0], 1)
 
+    def test_fast_resolved_clean_rows_are_reported_but_not_auto_classified(self):
+        self.conn.execute(
+            "INSERT INTO paper_trade VALUES "
+            "('fast','bot_filtered','other','closed',300,350,'resolved',10,-2,0,0,NULL,NULL,NULL)"
+        )
+        report = build_report(self.conn)
+        residual = report["suspect_fast_resolved_residual"]
+        self.assertIn("fast", residual["row_ids"])
+        self.assertNotIn("fast", [row["id"] for row in report["candidate_ids"]])
+
 
 if __name__ == "__main__":
     unittest.main()

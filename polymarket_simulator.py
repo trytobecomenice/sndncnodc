@@ -251,6 +251,8 @@ def fetch_market_metadata(market_slug, timeout=DEFAULT_TIMEOUT_SECONDS):
     (list of dicts with a `slug` key), `holdingRewardsEnabled` (bool),
     `endDateIso` (YYYY-MM-DD — Gamma's own field is `endDate`, a full
     ISO-8601 datetime, truncated to the date here), `closed` (bool),
+    `closedTime`/`umaEndDate` (full timestamps used only for factual
+    historical resolution-timing audits),
     `umaResolutionStatus` (str, absent/empty on an unresolved market),
     `outcomes`/`outcomePrices` (JSON-string-encoded arrays, passed through
     as-is — the callers already tolerate that encoding, verified above in
@@ -278,6 +280,8 @@ def fetch_market_metadata(market_slug, timeout=DEFAULT_TIMEOUT_SECONDS):
         "holdingRewardsEnabled": market.get("holdingRewardsEnabled"),
         "endDateIso": end_date_iso,
         "closed": market.get("closed"),
+        "closedTime": market.get("closedTime"),
+        "umaEndDate": market.get("umaEndDate"),
         "umaResolutionStatus": market.get("umaResolutionStatus"),
         "outcomes": market.get("outcomes"),
         "outcomePrices": market.get("outcomePrices"),
