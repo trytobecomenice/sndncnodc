@@ -38,6 +38,32 @@ high-conviction strategy, that is good quant research rather than failure.
 
 **Last live verification:** 2026-08-05 15:38 HKT / 2026-08-05 07:38 UTC.
 
+## Urgent P0 — 2026-08-07 Paper-ledger integrity quarantine
+
+An external quant review has produced strong evidence that historical replayed/post-event Paper
+entries were closed as near-immediate `resolved` winners, materially inflating reported PnL and
+potentially contaminating wallet EV caps, circuit breakers, category ranking, promotions, and the
+equity HWM. Read
+`docs/research/PAPER_LEDGER_INTEGRITY_INCIDENT_2026-08-07.md` before taking any economic action.
+
+Do not quote `+$639.74` as demonstrated alpha. It remains a raw AWS ledger figure from an earlier
+check. The reviewer separately reports a local candidate clean result of 127 closes, `-$59.86`,
+and `-9.38%` ROI, but Codex has not yet independently reproduced that result against the
+authoritative AWS DB. Both errors are prohibited: do not trust the raw total, and do not silently
+promote the external clean estimate to production truth.
+
+Immediate operator rules:
+
+- remain Paper-only;
+- do not add wallets/strategies, raise size, alter roster status, or reseed HWM by hand;
+- independently reproduce row-level contamination and chronology read-only;
+- preserve historical rows and use a versioned/auditable classification;
+- cut contaminated rows out of decision inputs only after tests and review; and
+- repair TTP observability and exit coverage before strategy expansion.
+
+The 2026-08-07 P0 incident queue at the top of `docs/TODO_2026-08-06.md` supersedes older feature
+priorities until the forensic and feedback-isolation gates pass.
+
 ## Non-negotiable operating rules
 
 - This repository is Copy Bot only. Other bots live in separate workspaces; do not add their code,
@@ -94,7 +120,9 @@ high-conviction strategy, that is good quant research rather than failure.
 
 ### Copy Bot book and PnL
 
-- `bot_filtered` closed: **634**, cumulative realized PnL **+$639.74**.
+- `bot_filtered` closed at the earlier AWS check: **634**, raw ledger realized PnL **+$639.74**.
+  This figure is quarantined and must not be described as economic PnL or alpha; see the urgent
+  2026-08-07 incident section and its canonical incident document.
 - `bot_filtered` open: **56**, cost basis **$356.26** at 03:50 HKT.
 - HKT 2026-08-05 realized PnL at 03:50: **$0.00** (zero fully closed rows today).
 - All 56 normal open positions had a successful recent mark at the live check.
@@ -363,6 +391,26 @@ high-conviction strategy, that is good quant research rather than failure.
      sizing claim.
 
 ## Change log
+
+### 2026-08-07 — Paper-ledger integrity incident record and metric quarantine
+
+1. **When:** 2026-08-07 HKT.
+2. **Files adjusted:**
+   - `docs/research/PAPER_LEDGER_INTEGRITY_INCIDENT_2026-08-07.md` — created.
+   - `docs/CURRENT_STATE.md` — changed unqualified historical PnL into a quarantined raw-ledger
+     figure and recorded the external candidate-clean estimate separately.
+   - `docs/TODO_2026-08-06.md` — added a superseding P0 incident queue.
+   - `CLAUDE_HANDOFF.md` — added this zero-context urgent handoff.
+3. **What changed:**
+   - Recorded all seven external-review findings: phantom PnL, feedback contamination, candidate
+     negative strategy expectancy, ineffective Kelly mapping, TTP/error saturation, Shadow Rehab
+     lifecycle failure, and unpriceable/capital-saturation risk gaps.
+   - Recorded the positive controls that limited harm: Paper-only mode, stale guard, tests,
+     comments, and auditability.
+   - Separated allegations/candidate clean totals from independently verified AWS truth and made
+     forensic reproduction the next P0 gate.
+   - Documentation only: no trading code, DB, AWS process/config, wallet status, HWM, `.env`, key,
+     credential, push, or deployment changed.
 
 ### 2026-08-06 — Process-isolation blueprint and repository-scope cleanup
 

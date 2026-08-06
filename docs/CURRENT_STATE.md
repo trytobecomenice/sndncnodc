@@ -1,5 +1,11 @@
 # Current State — Copy Bot Only
 
+> **Economic-integrity alert — 2026-08-07:** historical Paper PnL is quarantined after an external
+> review identified likely post-event/replayed-trade phantom profits. Read
+> `docs/research/PAPER_LEDGER_INTEGRITY_INCIDENT_2026-08-07.md` before using any PnL, wallet rank,
+> cap, mute, promotion, HWM, or drawdown figure. The exact clean totals remain pending independent
+> AWS reproduction.
+>
 > **Last live verification:** 2026-08-05 03:50 HKT. Read `CLAUDE_HANDOFF.md` for the exact AWS
 > evidence, P0 replay fix, restart gate, and open operational risks.
 
@@ -21,8 +27,14 @@ authority for fresh/current databases.
   `/home/ubuntu/polymarket-copybot`.
 - **Roster:** 17 tracked wallets, 5 circuit-breaker muted, 12 eligible for normal copying at the
   last live check.
-- **Normal Copy Bot book:** 634 closed positions with cumulative realized PnL `+$639.74`; 56 open
-  positions with `$356.26` cost basis at the last live check.
+- **Normal Copy Bot raw ledger:** 634 closed positions with reported realized PnL `+$639.74`; this
+  is a historical database total, **not trusted economic PnL or demonstrated alpha** pending the
+  2026-08-07 phantom-trade reproduction. An external review separately reported a local raw sample
+  of 457 closes / `+$519.16` and a candidate clean result of 127 closes / `-$59.86`; neither local
+  scope nor candidate clean total may replace an authoritative AWS recomputation.
+- **Open book at the earlier live check:** 56 positions with `$356.26` recorded cost basis. The
+  markability statement below describes that point-in-time operational check, not clean strategy
+  profitability.
 - **HKT 2026-08-05 realized PnL at 03:50:** `$0.00`.
 - **Risk state:** kill switch inactive; all 56 open positions had a successful recent mark and no
   open position was more than 24 hours stale.
@@ -40,6 +52,9 @@ authority for fresh/current databases.
    Copy Bot exposure and PnL.
 4. Historical PnL can remain concentrated in a small number of wallets even when the roster count
    appears diversified.
+5. Historical Paper PnL, wallet EV/ranking, circuit-breaker outcomes, and equity HWM may be
+   contaminated by replayed/post-event phantom positions. Treat all downstream economic decisions
+   as quarantined until the 2026-08-07 incident protocol is completed.
 
 ## 2026-08-05 repository separation
 
