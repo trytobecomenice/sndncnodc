@@ -426,3 +426,41 @@ implementation cannot submit an order and has not been activated or deployed.
 - Merge: <https://docs.polymarket.com/trading/ctf/merge>
 - Negative risk: <https://docs.polymarket.com/advanced/neg-risk>
 - Gasless Relayer operations: <https://docs.polymarket.com/trading/gasless>
+
+## 12. Phase-0 virtual matching decisions — 2026-08-06
+
+The offline virtual CLOB now evaluates the documented nonlinear taker-fee formula independently at
+every consumed book level. It does not use one average price or deduct one fee after walking the
+whole book. Fixed-point cash, price, and share calculations use 1e-6 units; simulated fill amounts
+are floored at that unit and fee is floored to the declared 0.00001-USDC precision. These rounding
+rules remain a versioned research assumption until compared with venue/SDK golden vectors.
+
+Two BUY cash interpretations remain explicit and must not be conflated:
+
+- `ORDER_NOTIONAL` sizes the displayed order notional and attributes fee at match, consistent with
+  the current documentation boundary that fees are not part of the submitted order amount.
+- `ALL_IN_CAPITAL` embeds every marginal fee inside a conservative capital budget. It is useful for
+  treasury/risk planning but is not evidence that the venue itself would reject the corresponding
+  FOK for insufficient fee cash.
+
+Missing fee rates stay unknown, not zero. Exact live acceptance also depends on deployed SDK/order
+precision, tick size, signing fields, matching, and fee application; the research engine therefore
+remains a displayed-depth upper bound.
+
+Aggregate one-second public trade tape is rejected as fill ground truth because it combines other
+participants, queue position, cancels, and replenishment. A `<5%` readiness gate requires
+attributable micro-live fills or official/venue-version golden vectors. No qualifying corpus exists
+in the local workspace yet, so validation is `FAIL_CLOSED`, not passed.
+
+Signal clustering retains both adjacent-gap and maximum-diameter caps. The proposed message-rate or
+volume-time cascade boundary is not estimated from signal-triggered T0/T+ checkpoints because they
+are not a continuous market-message series. It requires monotonic-time message buckets, a declared
+rolling baseline, and a hard maximum diameter even after adaptive termination is introduced.
+
+Open lots that cross an observed event-membership change receive `TOPOLOGY_RISK`; open event
+topologies remain on `MUTABLE_TOPOLOGY_WATCH`. No arbitrary numerical uncertainty haircut is
+applied while executable MtM and a calibrated haircut policy are both unavailable. The correct
+current action is to freeze the valuation claim and surface the evidence gap prominently.
+
+Weather research/model code remains a separate project and is not reintroduced into this Copy Bot
+repository or deployment.

@@ -1,0 +1,7 @@
+# Offline research UI/graph environment only. Never install into the bot service.
+polars>=1.0,<2
+pyarrow>=16,<25
+plotly>=5,<7
+pandas>=2,<4
+streamlit>=1.40,<2
+networkx>=3.2,<4

@@ -1,0 +1,48 @@
+[
+  {
+    "id": "standard-event",
+    "slug": "standard-event",
+    "title": "Standard independent markets",
+    "negRisk": false,
+    "markets": [
+      {
+        "id": "standard-a",
+        "conditionId": "condition-standard-a",
+        "slug": "standard-a",
+        "question": "Will A happen?",
+        "outcomes": "[\"Yes\",\"No\"]"
+      },
+      {
+        "id": "standard-b",
+        "conditionId": "condition-standard-b",
+        "slug": "standard-b",
+        "question": "Will B happen?",
+        "outcomes": "[\"Yes\",\"No\"]"
+      }
+    ]
+  },
+  {
+    "id": "negative-risk-event",
+    "slug": "negative-risk-event",
+    "title": "Negative-risk outcomes",
+    "negRisk": true,
+    "negRiskMarketID": "neg-risk-group",
+    "markets": [
+      {
+        "id": "candidate-a",
+        "conditionId": "condition-candidate-a",
+        "slug": "candidate-a",
+        "question": "Will candidate A win?",
+        "outcomes": ["Yes", "No"]
+      },
+      {
+        "id": "candidate-other",
+        "conditionId": "condition-candidate-other",
+        "slug": "candidate-other",
+        "question": "Will another candidate win?",
+        "outcomes": ["Yes", "No"],
+        "negRiskOther": true
+      }
+    ]
+  }
+]
