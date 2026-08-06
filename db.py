@@ -120,6 +120,55 @@ def _paper_trade_has_column(conn, column_name):
     }
 
 
+def _table_exists(conn, table_name):
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+    ).fetchone() is not None
+
+
+_REALIZED_ALLOCATION_TABLE = "paper_trade_realized_allocation"
+_REALIZED_ALLOCATOR_VERSION = "paper-realized-allocation-v1"
+_REALIZED_LEDGER_READY_KEY = "paper_realized_allocation_ledger_ready_v1"
+_TERMINATION_CLASSIFIER_VERSION = "termination-cause-v1"
+_EARLY_REJECTION_CAPTURE_VERSION = "early-rejection-raw-v1"
+
+
+def _termination_cause_for_event(event):
+    explicit = event.get("termination_cause")
+    if explicit:
+        return explicit
+    event_type = event.get("event_type")
+    if event_type in ("paper_sell", "live_sell", "shadow_rehab_sell", "shadow_challenger_sell"):
+        return "SOURCE_EXIT"
+    if event_type in ("paper_sell_trailing_tp", "live_sell_trailing_tp",
+                      "paper_sell_time_decay_loss_cut", "live_sell_time_decay_loss_cut"):
+        return "TTP_EXIT"
+    if event_type in ("paper_sell_zombie_dump", "live_sell_zombie_dump"):
+        return "SYSTEM_CENSORED"
+    return "UNKNOWN"
+
+
+def _realized_allocation_ledger_ready(conn):
+    """True only after the audited historical backfill has promoted v1.
+
+    Merely applying the migration must not switch portfolio equity to an empty
+    ledger.  The backfill tool sets this key in the same transaction that
+    verifies complete event coverage and rebuilds cumulative lot PnL.
+    """
+    if not _table_exists(conn, _REALIZED_ALLOCATION_TABLE):
+        return False
+    row = conn.execute(
+        "SELECT value_json FROM bot_risk_state WHERE key=?", (_REALIZED_LEDGER_READY_KEY,)
+    ).fetchone()
+    if not row:
+        return False
+    try:
+        value = json.loads(row["value_json"])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(value.get("ready")) and value.get("allocator_version") == _REALIZED_ALLOCATOR_VERSION
+
+
 def _clean_paper_trade_predicate(conn, alias=None):
     """SQL predicate excluding confirmed phantom Paper rows when available."""
     if not _paper_trade_has_column(conn, "is_phantom"):
@@ -211,9 +260,17 @@ def load_state():
                           for row in cur.fetchall()]
 
         positions = {}
+        termination_state_by_trade_id = {}
+        if _table_exists(conn, "paper_trade_termination_state"):
+            termination_state_by_trade_id = {
+                row["paper_trade_id"]: row for row in conn.execute(
+                    "SELECT paper_trade_id,ttp_eligible_pricing_failure_count,"
+                    "exit_signal_unexecutable_count FROM paper_trade_termination_state"
+                ).fetchall()
+            }
         clean_open_predicate = _clean_paper_trade_predicate(conn)
         cur = conn.execute(
-            "SELECT wallet_address, market_slug, outcome, our_shares, cost_basis_usd, "
+            "SELECT id,wallet_address, market_slug, outcome, our_shares, cost_basis_usd, "
             "avg_entry_price, buy_count, peak_profit_pct, opened_at, last_priced_at FROM paper_trade "
             "WHERE status = 'open' AND strategy = 'bot_filtered' AND is_demo_data = 0 "
             f"AND {clean_open_predicate}"
@@ -226,6 +283,7 @@ def load_state():
             # must start its zombie clock from when the position was
             # actually opened -- NOT from None/0, which would make it look
             # infinitely stale and eligible for a forced exit immediately.
+            termination_state = termination_state_by_trade_id.get(row["id"])
             positions[key] = {
                 "shares": row["our_shares"],
                 "cost_basis_usd": row["cost_basis_usd"],
@@ -233,6 +291,14 @@ def load_state():
                 "buy_count": row["buy_count"],
                 "peak_profit_pct": row["peak_profit_pct"],
                 "last_priced_at": row["last_priced_at"] or row["opened_at"],
+                "ttp_eligible_pricing_failure_count": (
+                    termination_state["ttp_eligible_pricing_failure_count"]
+                    if termination_state else 0
+                ),
+                "exit_signal_unexecutable_count": (
+                    termination_state["exit_signal_unexecutable_count"]
+                    if termination_state else 0
+                ),
                 # 2026-08-01, Time-Decay Loss Cut: the FIRST buy's real
                 # timestamp, never touched by averaging up (paper_trade.
                 # opened_at is only ever set on INSERT, never UPDATE — see
@@ -444,6 +510,19 @@ def save_state(state):
                 conn.execute(
                     "UPDATE decision_journal SET linked_paper_trade_id = ? WHERE id = ?",
                     (row_id, last_decision_journal_id),
+                )
+
+            if _table_exists(conn, "paper_trade_termination_state"):
+                conn.execute(
+                    "INSERT INTO paper_trade_termination_state "
+                    "(paper_trade_id,ttp_eligible_pricing_failure_count,"
+                    "exit_signal_unexecutable_count,updated_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(paper_trade_id) DO UPDATE SET "
+                    "ttp_eligible_pricing_failure_count=excluded.ttp_eligible_pricing_failure_count,"
+                    "exit_signal_unexecutable_count=excluded.exit_signal_unexecutable_count,"
+                    "updated_at=excluded.updated_at",
+                    (row_id, int(pos.get("ttp_eligible_pricing_failure_count", 0)),
+                     int(pos.get("exit_signal_unexecutable_count", 0)), _now_ts()),
                 )
 
         # Fail-safe only: append_log's close-event handling (see
@@ -743,6 +822,8 @@ _CLOSE_REASON_BY_EVENT = {
     # analysis that motivated building this.
     "paper_sell_time_decay_loss_cut": ("time_decay_loss_cut", True, "bot_filtered"),
     "live_sell_time_decay_loss_cut": ("time_decay_loss_cut", True, "bot_filtered"),
+    "paper_sell_zombie_dump": ("zombie_dump", True, "bot_filtered"),
+    "live_sell_zombie_dump": ("zombie_dump", True, "bot_filtered"),
     "position_resolved": ("resolved", True, "bot_filtered"),
     "paper_sell": ("source_sell", False, "bot_filtered"),
     "live_sell": ("source_sell", False, "bot_filtered"),
@@ -753,7 +834,61 @@ _CLOSE_REASON_BY_EVENT = {
 }
 
 
-def _maybe_close_paper_trade(conn, event):
+def _event_realized_values(event):
+    """Strict numeric extraction for a realized allocation event."""
+    pnl = event.get("pnl_usd")
+    if isinstance(pnl, bool) or not isinstance(pnl, (int, float)):
+        raise ValueError(f"realized event has invalid pnl_usd: {pnl!r}")
+    cost = event.get("cost_basis_usd")
+    if cost is not None and (isinstance(cost, bool) or not isinstance(cost, (int, float))):
+        raise ValueError(f"realized event has invalid cost_basis_usd: {cost!r}")
+    return float(pnl), (float(cost) if cost is not None else None)
+
+
+def _allocate_realized_event(conn, event_id, event, strategy, event_timestamp):
+    """Persist one live event-to-lot allocation without guessing.
+
+    Returns the unique paper_trade id, or None for an explicit unmatched /
+    ambiguous allocation.  A UNIQUE event_id makes retries idempotent.
+    """
+    if not _table_exists(conn, _REALIZED_ALLOCATION_TABLE):
+        return None
+    pnl_usd, cost_basis_usd = _event_realized_values(event)
+    trader = event.get("trader_address")
+    market_slug = event.get("market_slug")
+    outcome = event.get("outcome")
+    candidates = []
+    if trader and market_slug and outcome:
+        candidates = conn.execute(
+            "SELECT id FROM paper_trade WHERE lower(wallet_address)=lower(?) "
+            "AND market_slug=? AND outcome=? AND status='open' AND strategy=? "
+            "AND COALESCE(is_demo_data,0)=0 ORDER BY opened_at,id",
+            (trader, market_slug, outcome, strategy),
+        ).fetchall()
+    status = "matched" if len(candidates) == 1 else ("unmatched" if not candidates else "ambiguous")
+    paper_trade_id = candidates[0]["id"] if len(candidates) == 1 else None
+    inserted = conn.execute(
+        f"INSERT OR IGNORE INTO {_REALIZED_ALLOCATION_TABLE} "
+        "(event_id,paper_trade_id,event_timestamp,event_type,strategy,pnl_usd,cost_basis_usd,"
+        "allocation_status,candidate_count,allocator_version,allocation_source,termination_cause,"
+        "source_shares_at_termination,termination_classifier_version,allocated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (event_id, paper_trade_id, event_timestamp, event.get("event_type"), strategy,
+         pnl_usd, cost_basis_usd, status, len(candidates), _REALIZED_ALLOCATOR_VERSION,
+         "live", _termination_cause_for_event(event), event.get("source_shares_at_termination"),
+         _TERMINATION_CLASSIFIER_VERSION, _now_ts()),
+    )
+    if paper_trade_id and inserted.rowcount == 1:
+        conn.execute(
+            "UPDATE paper_trade SET cumulative_realized_pnl_usd="
+            "COALESCE(cumulative_realized_pnl_usd,0)+?, realized_event_count="
+            "COALESCE(realized_event_count,0)+1 WHERE id=?",
+            (pnl_usd, paper_trade_id),
+        )
+    return paper_trade_id
+
+
+def _maybe_close_paper_trade(conn, event, event_id=None, event_timestamp=None):
     event_type = event.get("event_type")
     mapping = _CLOSE_REASON_BY_EVENT.get(event_type)
     if not mapping:
@@ -764,10 +899,26 @@ def _maybe_close_paper_trade(conn, event):
     outcome = event.get("outcome")
     if not trader or not market_slug or not outcome:
         return
+    allocated_trade_id = None
+    if event_id is not None:
+        allocated_trade_id = _allocate_realized_event(
+            conn, event_id, event, strategy, event_timestamp or _now_ts()
+        )
     if not always_full:
         remaining = event.get("our_shares_remaining", 0.0) or 0.0
         if remaining > 1e-9:
             return  # partial sell — row stays open, save_state() updates its size
+    if event_id is not None and _table_exists(conn, _REALIZED_ALLOCATION_TABLE):
+        # New schema: only the exact uniquely allocated lot may close.  An
+        # unresolved allocation remains visible and cannot cross-close rows.
+        if allocated_trade_id:
+            conn.execute(
+                "UPDATE paper_trade SET status='closed', closed_at=?, close_reason=?, "
+                "realized_pnl_usd=? WHERE id=? AND status='open'",
+                (event_timestamp or _now_ts(), close_reason, event.get("pnl_usd"), allocated_trade_id),
+            )
+        return
+    # Compatibility path for focused tests using a pre-v24 minimal schema.
     conn.execute(
         "UPDATE paper_trade SET status='closed', closed_at=?, close_reason=?, realized_pnl_usd=? "
         "WHERE wallet_address=? AND market_slug=? AND outcome=? "
@@ -799,11 +950,13 @@ def append_log(event):
     conn = _connect()
     decision_journal_id = None
     try:
+        event_id = _new_id()
+        event_timestamp = _now_ts()
         conn.execute(
             "INSERT INTO bot_event_log (id, timestamp, event_type, trader_address, "
             "market_slug, outcome, side, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                _new_id(), _now_ts(), event.get("event_type"), event.get("trader_address"),
+                event_id, event_timestamp, event.get("event_type"), event.get("trader_address"),
                 event.get("market_slug"), event.get("outcome"), event.get("side"),
                 json.dumps(event),
             ),
@@ -827,7 +980,19 @@ def append_log(event):
                 ),
             )
 
-        _maybe_close_paper_trade(conn, event)
+        if decision_type == "skip" and _table_exists(conn, "early_rejection_capture"):
+            conn.execute(
+                "INSERT INTO early_rejection_capture "
+                "(id,bot_event_id,captured_at,rejection_code,wallet_address,market_slug,outcome,"
+                "source_trade_id,source_price,source_size_usd,raw_evidence_table,analysis_state,"
+                "capture_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (_new_id(), event_id, event_timestamp, event.get("event_type"),
+                 event.get("trader_address"), event.get("market_slug"), event.get("outcome"),
+                 event.get("source_trade_id"), event.get("source_price"), event.get("source_size_usd"),
+                 "bot_event_log", "BLOCKED_UNTIL_LEDGER_V2", _EARLY_REJECTION_CAPTURE_VERSION),
+            )
+
+        _maybe_close_paper_trade(conn, event, event_id=event_id, event_timestamp=event_timestamp)
         conn.commit()
     finally:
         conn.close()
@@ -1503,8 +1668,23 @@ def save_market_end_date(market_slug, end_date_iso):
 # that flag gets turned on.
 _REALIZED_PNL_EVENT_TYPES = (
     "paper_sell", "live_sell", "paper_sell_trailing_tp", "live_sell_trailing_tp",
+    "paper_sell_time_decay_loss_cut", "live_sell_time_decay_loss_cut",
     "paper_sell_zombie_dump", "live_sell_zombie_dump", "position_resolved",
 )
+
+
+def _allocated_realized_pnl(conn, start_timestamp=None):
+    query = (
+        f"SELECT COALESCE(SUM(a.pnl_usd),0) total FROM {_REALIZED_ALLOCATION_TABLE} a "
+        "JOIN paper_trade p ON p.id=a.paper_trade_id "
+        "WHERE a.strategy='bot_filtered' AND a.allocation_status='matched' "
+        "AND COALESCE(p.is_demo_data,0)=0 AND COALESCE(p.is_phantom,0)=0"
+    )
+    params = []
+    if start_timestamp is not None:
+        query += " AND a.event_timestamp>=?"
+        params.append(int(start_timestamp))
+    return float(conn.execute(query, params).fetchone()["total"] or 0.0)
 
 
 def realized_pnl_total():
@@ -1517,6 +1697,8 @@ def realized_pnl_total():
     """
     conn = _connect()
     try:
+        if _realized_allocation_ledger_ready(conn):
+            return _allocated_realized_pnl(conn)
         placeholders = ", ".join("?" for _ in _REALIZED_PNL_EVENT_TYPES)
         cur = conn.execute(
             f"SELECT COALESCE(SUM(json_extract(payload_json, '$.pnl_usd')), 0) AS total "
@@ -1542,6 +1724,8 @@ def realized_pnl_today(now=None):
     start_of_day = int(datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp())
     conn = _connect()
     try:
+        if _realized_allocation_ledger_ready(conn):
+            return _allocated_realized_pnl(conn, start_of_day)
         placeholders = ", ".join("?" for _ in _REALIZED_PNL_EVENT_TYPES)
         cur = conn.execute(
             f"SELECT COALESCE(SUM(json_extract(payload_json, '$.pnl_usd')), 0) AS total "
@@ -1558,6 +1742,8 @@ def realized_pnl_since(start_timestamp):
     """Realized Copy Bot PnL whose ledger event was recorded at/after an epoch."""
     conn = _connect()
     try:
+        if _realized_allocation_ledger_ready(conn):
+            return _allocated_realized_pnl(conn, start_timestamp)
         placeholders = ", ".join("?" for _ in _REALIZED_PNL_EVENT_TYPES)
         row = conn.execute(
             f"SELECT COALESCE(SUM(json_extract(payload_json, '$.pnl_usd')), 0) AS total "

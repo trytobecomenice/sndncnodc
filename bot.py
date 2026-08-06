@@ -1273,7 +1273,9 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
     # call per eligible position.
     def _fetch_price(item):
         _, _, market_slug, outcome, _ = item
-        return get_market_prices(market_slug, outcome)
+        started_ns = time.monotonic_ns()
+        result = get_market_prices(market_slug, outcome)
+        return (*result, (time.monotonic_ns() - started_ns) / 1_000_000)
 
     price_results = {}
     if executor is not None:
@@ -1283,10 +1285,34 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
             try:
                 price_results[key] = future.result()
             except Exception as e:
-                price_results[key] = (None, None, str(e))
+                price_results[key] = (None, None, str(e), None)
     else:
         for item in eligible:
             price_results[item[0]] = _fetch_price(item)
+
+    # One append-only qualification record per sweep, not one DB write per
+    # position.  This is the authoritative numerator/denominator for the
+    # pre-epoch TTP pricing SLO; errors remain per-position below for root
+    # cause, while this summary prevents noisy logs from distorting the SLO.
+    latencies_ms = sorted(
+        result[3] for result in price_results.values() if result[3] is not None
+    )
+    successful_prices = sum(result[1] is not None for result in price_results.values())
+    executable_bids = sum(result[0] is not None for result in price_results.values())
+    append_log({
+        "timestamp": now_iso(),
+        "event_type": "ttp_sweep_observation",
+        "attempted_positions": len(eligible),
+        "successful_price_reads": successful_prices,
+        "executable_bid_reads": executable_bids,
+        "failed_price_reads": len(eligible) - successful_prices,
+        "price_read_success_rate": successful_prices / len(eligible),
+        "executable_bid_rate": executable_bids / len(eligible),
+        "latency_p50_ms": latencies_ms[len(latencies_ms) // 2] if latencies_ms else None,
+        "latency_max_ms": latencies_ms[-1] if latencies_ms else None,
+        "qualification_schema_version": "ttp-sweep-observation-v1",
+        "termination_classifier_version": "termination-cause-v1",
+    })
 
     # Phase 2b: end-date resolution, deduplicated by market_slug (several
     # positions can share one market) -- same optional-parallel shape as
@@ -1330,8 +1356,18 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
             continue  # closed by an earlier iteration this same sweep
         nickname = nickname_for(trader, tracked_by_lower)
 
-        best_bid, indicative_price, err = price_results.get(key, (None, None, "no price result"))
+        best_bid, indicative_price, err, _latency_ms = price_results.get(
+            key, (None, None, "no price result", None)
+        )
         if indicative_price is None:
+            # Competing-risk evidence: once the trail is armed, a failed
+            # price read can be the reason this lot later drifts to
+            # resolution. Persist via save_state(); never reconstruct it
+            # after the fact from a generic error count.
+            if pos.get("peak_profit_pct", 0.0) >= config.TRAILING_TP_ACTIVATION_PCT:
+                pos["ttp_eligible_pricing_failure_count"] = (
+                    int(pos.get("ttp_eligible_pricing_failure_count", 0)) + 1
+                )
             append_log({"timestamp": now_iso(), "event_type": "error",
                         "trader_address": trader, "market_slug": market_slug,
                         "outcome": outcome, "error": f"trailing_tp price check: {err}"})
@@ -1474,7 +1510,8 @@ def _market_already_resolved(market_slug, risk_state):
 _closeout_fetch_failures = {}
 
 
-def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_lower):
+def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_lower,
+                       source_positions=None):
     """Resolved-market sweep (hourly, see CLOSEOUT_INTERVAL_SECONDS).
 
     Source traders redeem resolved positions rather than selling them, and
@@ -1537,6 +1574,19 @@ def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_
         nickname = nickname_for(trader, tracked_by_lower)
         proceeds_usd = pos["shares"] * final_price
         pnl_usd = proceeds_usd - pos["cost_basis_usd"]
+        source_shares_at_termination = (
+            source_positions.get(key) if source_positions is not None else None
+        )
+        if int(pos.get("exit_signal_unexecutable_count", 0)) > 0:
+            termination_cause = "EXIT_SIGNAL_BUT_UNEXECUTABLE"
+        elif int(pos.get("ttp_eligible_pricing_failure_count", 0)) > 0:
+            termination_cause = "TTP_ELIGIBLE_BUT_PRICING_FAILED"
+        elif source_shares_at_termination is not None and source_shares_at_termination > 1e-9:
+            termination_cause = "INTENDED_SOURCE_RESOLUTION"
+        elif source_shares_at_termination is not None:
+            termination_cause = "EXIT_SIGNAL_BUT_UNEXECUTABLE"
+        else:
+            termination_cause = "UNKNOWN"
         del positions[key]
 
         append_log({"timestamp": now_iso(), "event_type": "position_resolved",
@@ -1547,6 +1597,8 @@ def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_
                     "proceeds_usd": proceeds_usd,
                     "cost_basis_usd": pos["cost_basis_usd"],
                     "pnl_usd": pnl_usd,
+                    "termination_cause": termination_cause,
+                    "source_shares_at_termination": source_shares_at_termination,
                     "mode": "paper" if not config.LIVE_MODE else "live"})
         check_circuit_breaker(trader, nickname, pnl_usd, pos["cost_basis_usd"], trader_performance, muted_traders)
 
@@ -3672,6 +3724,9 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
                 market_slug, outcome, shares_closed, "SELL"
             )
             if not spread_ok:
+                pos["exit_signal_unexecutable_count"] = (
+                    int(pos.get("exit_signal_unexecutable_count", 0)) + 1
+                )
                 append_log({**base_event, "event_type": "skip_wide_spread", "reason": spread_reason})
                 return
 
@@ -3682,9 +3737,15 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
                     "--min-price", str(min_price), "--yes",
                 ]), "live sell")
             except BullpenTimeoutError as e:
+                pos["exit_signal_unexecutable_count"] = (
+                    int(pos.get("exit_signal_unexecutable_count", 0)) + 1
+                )
                 append_log({**base_event, "event_type": "unknown_fill_state", "reason": str(e)})
                 return
             except Exception as e:
+                pos["exit_signal_unexecutable_count"] = (
+                    int(pos.get("exit_signal_unexecutable_count", 0)) + 1
+                )
                 append_log({**base_event, "event_type": "failed_trade", "reason": str(e)})
                 return
 
@@ -4476,7 +4537,10 @@ def main():
             if not SHUTDOWN_REQUESTED and now - last_closeout_sweep >= config.CLOSEOUT_INTERVAL_SECONDS:
                 last_closeout_sweep = now
                 try:
-                    run_closeout_sweep(positions, trader_performance, muted_traders, all_by_lower)
+                    run_closeout_sweep(
+                        positions, trader_performance, muted_traders, all_by_lower,
+                        source_positions=source_positions,
+                    )
                     run_shadow_closeout_sweep(shadow_positions, "rehab")
                     run_shadow_closeout_sweep(challenger_positions, "challenger")
                 except Exception as e:

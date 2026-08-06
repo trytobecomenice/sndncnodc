@@ -910,5 +910,22 @@ priorities until the forensic and feedback-isolation gates pass.
    - Verified TTP at 03:45:13 and 03:50:38 HKT, equity `$1,801.36`, 56 positions, kill switch off,
      and zero post-start errors.
    - Replay churn stopped after one bounded catch-up. Its 2 dust sells had `$0.0133` cost basis;
-     all 18 replay sells across both restarts had `$0.0882` combined cost basis and `$0.00`
-     rounded PnL. They were left auditable, not manually hidden.
+   all 18 replay sells across both restarts had `$0.0882` combined cost basis and `$0.00`
+   rounded PnL. They were left auditable, not manually hidden.
+
+### 2026-08-07 — Durable ledger v2 and protocol-v2 preflight (local, not deployed)
+
+1. Added immutable realized-event allocations, cumulative per-lot PnL, an exact-SHA atomic
+   backfill/promote tool, event-time termination causes, one aggregate TTP qualification record per
+   sweep, and a raw early-rejection index whose analysis remains locked.
+2. Fixed two adjacent accounting gaps: time-decay exits now belong to the realized-event universe,
+   and zombie exits now have a tax-lot close mapping. Unmatched/ambiguous events are persisted and
+   cannot cross-close lots.
+3. Added a semantic protocol draft plus machine preflight. It encodes the 0.35–0.85 primary domain,
+   full mixture variance including the between-regime term/interior `w` scan, entity and signal
+   clustering, selected-vs-control design, frozen latency ECDF with p99 stress only, seven-day exit
+   qualification, bounded UNKNOWN, and max-duration `INSTRUMENT_INSUFFICIENT`.
+4. Protocol state is `DRAFT_NOT_FROZEN`; evaluator refuses to open an epoch and never authorizes
+   Live. Migration alone cannot switch the equity reader; only a complete atomic backfill can.
+5. Verification: 825 tests passed, 2 skipped; compile and diff checks passed. No AWS migration,
+   backfill, restart, epoch, roster/size change, `.env`, key, or credential action was performed.

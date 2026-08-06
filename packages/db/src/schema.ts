@@ -263,6 +263,13 @@ export const paperTrade = sqliteTable(
     // source_sell | trailing_tp | resolved | circuit_breaker
     closeReason: text("close_reason"),
     realizedPnlUsd: real("realized_pnl_usd"),
+    // Durable event-allocated economic PnL. realizedPnlUsd is retained as a
+    // legacy final-close field; it cannot represent partial exits because a
+    // later close overwrites the earlier event.  This cumulative value is
+    // rebuilt from paper_trade_realized_allocation and incremented
+    // transactionally for every new matched realized event.
+    cumulativeRealizedPnlUsd: real("cumulative_realized_pnl_usd").notNull().default(0),
+    realizedEventCount: integer("realized_event_count").notNull().default(0),
     peakProfitPct: real("peak_profit_pct").notNull().default(0),
     // Unix seconds of this position's last SUCCESSFUL price read (bot.py's
     // check_trailing_take_profit, on every sweep it manages to price this
@@ -286,6 +293,75 @@ export const paperTrade = sqliteTable(
     isDemoData: integer("is_demo_data", { mode: "boolean" }).notNull().default(false),
   },
   (t) => [index("paper_trade_lookup_idx").on(t.walletAddress, t.marketSlug, t.outcome, t.status)]
+);
+
+// One immutable allocation decision per realized bot_event_log event.
+// Unmatched/ambiguous events are deliberately persisted too: they are an
+// accounting-integrity failure to resolve, never silently omitted or forced
+// onto a convenient tax lot.  Historical backfill promotes the ledger to
+// authoritative only after every in-scope event has exactly one match.
+export const paperTradeRealizedAllocation = sqliteTable(
+  "paper_trade_realized_allocation",
+  {
+    eventId: text("event_id").primaryKey(),
+    paperTradeId: text("paper_trade_id"),
+    eventTimestamp: integer("event_timestamp", { mode: "timestamp" }).notNull(),
+    eventType: text("event_type").notNull(),
+    strategy: text("strategy").notNull(),
+    pnlUsd: real("pnl_usd").notNull(),
+    costBasisUsd: real("cost_basis_usd"),
+    allocationStatus: text("allocation_status").notNull(), // matched | unmatched | ambiguous
+    candidateCount: integer("candidate_count").notNull(),
+    allocatorVersion: text("allocator_version").notNull(),
+    allocationSource: text("allocation_source").notNull(), // live | historical_backfill
+    terminationCause: text("termination_cause").notNull(),
+    sourceSharesAtTermination: real("source_shares_at_termination"),
+    terminationClassifierVersion: text("termination_classifier_version").notNull(),
+    allocatedAt: integer("allocated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+  },
+  (t) => [
+    index("paper_trade_realized_allocation_trade_idx").on(t.paperTradeId),
+    index("paper_trade_realized_allocation_status_idx").on(t.allocationStatus),
+    index("paper_trade_realized_allocation_timestamp_idx").on(t.eventTimestamp),
+  ]
+);
+
+// Event-time competing-risk state for an open tax lot. It survives restarts
+// so a later resolution can distinguish intended holding from a TTP/source
+// exit that the system failed to execute. Rows are retained after close as
+// audit evidence.
+export const paperTradeTerminationState = sqliteTable("paper_trade_termination_state", {
+  paperTradeId: text("paper_trade_id").primaryKey(),
+  ttpEligiblePricingFailureCount: integer("ttp_eligible_pricing_failure_count").notNull().default(0),
+  exitSignalUnexecutableCount: integer("exit_signal_unexecutable_count").notNull().default(0),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+});
+
+// Observer-safe evidence for signals rejected before expensive EV/Kelly
+// work.  The immutable bot_event_log row is the raw evidence; this narrow
+// index preserves the rejection cohort even while analysis is explicitly
+// blocked until the durable v2 ledger/protocol are ready.
+export const earlyRejectionCapture = sqliteTable(
+  "early_rejection_capture",
+  {
+    id: id(),
+    botEventId: text("bot_event_id").notNull().unique(),
+    capturedAt: integer("captured_at", { mode: "timestamp" }).notNull(),
+    rejectionCode: text("rejection_code").notNull(),
+    walletAddress: text("wallet_address"),
+    marketSlug: text("market_slug"),
+    outcome: text("outcome"),
+    sourceTradeId: text("source_trade_id"),
+    sourcePrice: real("source_price"),
+    sourceSizeUsd: real("source_size_usd"),
+    rawEvidenceTable: text("raw_evidence_table").notNull().default("bot_event_log"),
+    analysisState: text("analysis_state").notNull().default("BLOCKED_UNTIL_LEDGER_V2"),
+    captureVersion: text("capture_version").notNull(),
+  },
+  (t) => [
+    index("early_rejection_capture_time_idx").on(t.capturedAt),
+    index("early_rejection_capture_code_idx").on(t.rejectionCode),
+  ]
 );
 
 // One row per UTC calendar day (2026-07-28) — the Grafana personal

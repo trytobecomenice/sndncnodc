@@ -37,6 +37,17 @@ class TestEventAllocation(unittest.TestCase):
         self.assertEqual([row["id"] for row in unmatched], ["none"])
         self.assertEqual(ambiguous[0]["candidate_trade_ids"], ["a", "b"])
 
+    def test_partial_event_payload_fields_survive_report_allocation(self):
+        trades = [{"id": "a", "wallet_address": "w", "market_slug": "m", "outcome": "Yes",
+                   "opened_at": 10, "closed_at": 20, "allocation_end_at": 20}]
+        events = [{"id": "e", "trader_address": "w", "market_slug": "m", "outcome": "Yes",
+                   "timestamp": 15, "event_type": "paper_sell", "pnl_usd": 1.5,
+                   "cost_basis_usd": 2.0}]
+        allocated, unmatched, ambiguous = allocate_events(trades, events)
+        self.assertEqual(allocated["a"][0]["cost_basis_usd"], 2.0)
+        self.assertFalse(unmatched)
+        self.assertFalse(ambiguous)
+
 
 if __name__ == "__main__":
     unittest.main()

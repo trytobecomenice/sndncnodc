@@ -2146,6 +2146,41 @@ class TestMarketAlreadyResolved(unittest.TestCase):
             self.assertFalse(bot._market_already_resolved("m1", risk_state))
 
 
+class TestResolutionCompetingRiskCause(unittest.TestCase):
+    def _resolve(self, position_overrides=None, source_shares=10.0):
+        key = "0xtrader|market|Yes"
+        position = {"shares": 2.0, "cost_basis_usd": 1.0,
+                    "ttp_eligible_pricing_failure_count": 0,
+                    "exit_signal_unexecutable_count": 0}
+        position.update(position_overrides or {})
+        positions = {key: position}
+        with patch("bot.polymarket_simulator.fetch_market_metadata", return_value={
+                "closed": True, "umaResolutionStatus": "resolved",
+                "outcomes": ["Yes", "No"], "outcomePrices": ["1", "0"]}), \
+             patch("bot.append_log") as logged, \
+             patch("bot.check_circuit_breaker"):
+            bot.run_closeout_sweep(
+                positions, {}, {}, {"0xtrader": ("0xtrader", "nick")},
+                source_positions={key: source_shares},
+            )
+        return next(call.args[0] for call in logged.call_args_list
+                    if call.args[0].get("event_type") == "position_resolved")
+
+    def test_source_still_holding_is_intended_resolution(self):
+        event = self._resolve()
+        self.assertEqual(event["termination_cause"], "INTENDED_SOURCE_RESOLUTION")
+        self.assertEqual(event["source_shares_at_termination"], 10.0)
+
+    def test_armed_pricing_failure_takes_precedence(self):
+        event = self._resolve({"ttp_eligible_pricing_failure_count": 2})
+        self.assertEqual(event["termination_cause"], "TTP_ELIGIBLE_BUT_PRICING_FAILED")
+
+    def test_unexecutable_source_exit_takes_highest_precedence(self):
+        event = self._resolve({"ttp_eligible_pricing_failure_count": 2,
+                               "exit_signal_unexecutable_count": 1}, source_shares=0.0)
+        self.assertEqual(event["termination_cause"], "EXIT_SIGNAL_BUT_UNEXECUTABLE")
+
+
 class TestProcessTradeResolvedMarketGuard(unittest.TestCase):
     """Belt-and-suspenders guard (2026-07-31) alongside the _mark_trade_seen()
     idempotency fix: a BUY signal old enough to be suspicious

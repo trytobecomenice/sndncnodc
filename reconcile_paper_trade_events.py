@@ -16,10 +16,10 @@ import sqlite3
 import time
 
 import config
-from db import _REALIZED_PNL_EVENT_TYPES
+from db import _REALIZED_PNL_EVENT_TYPES, _termination_cause_for_event
 
 
-REPORT_VERSION = "paper-event-reconciliation-v1"
+REPORT_VERSION = "paper-event-reconciliation-v2"
 
 
 def allocate_events(trades, events):
@@ -52,7 +52,7 @@ def reconcile(db_path):
     conn.row_factory = sqlite3.Row
     try:
         trades = [dict(row) for row in conn.execute(
-            "SELECT id,lower(wallet_address) wallet_address,market_slug,outcome,"
+            "SELECT id,strategy,lower(wallet_address) wallet_address,market_slug,outcome,"
             "status,opened_at,closed_at,close_reason,cost_basis_usd,realized_pnl_usd,"
             "COALESCE(is_phantom,0) is_phantom,phantom_classifier_version "
             "FROM paper_trade WHERE strategy='bot_filtered' "
@@ -65,7 +65,10 @@ def reconcile(db_path):
         placeholders = ",".join("?" for _ in _REALIZED_PNL_EVENT_TYPES)
         events = [dict(row) for row in conn.execute(
             f"SELECT id,timestamp,event_type,lower(trader_address) trader_address,"
-            f"market_slug,outcome,json_extract(payload_json,'$.pnl_usd') pnl_usd "
+            f"market_slug,outcome,json_extract(payload_json,'$.pnl_usd') pnl_usd,"
+            f"json_extract(payload_json,'$.cost_basis_usd') cost_basis_usd,"
+            f"json_extract(payload_json,'$.termination_cause') termination_cause,"
+            f"json_extract(payload_json,'$.source_shares_at_termination') source_shares_at_termination "
             f"FROM bot_event_log WHERE timestamp BETWEEN ? AND ? "
             f"AND event_type IN ({placeholders}) ORDER BY timestamp,id",
             (lower, upper, *_REALIZED_PNL_EVENT_TYPES),
@@ -74,10 +77,23 @@ def reconcile(db_path):
         conn.close()
 
     allocations, unmatched, ambiguous = allocate_events(trades, events)
+    event_allocations = []
     rows = []
     for trade in trades:
         assigned = allocations.get(trade["id"], [])
         event_pnl = sum(float(event["pnl_usd"] or 0) for event in assigned)
+        event_allocations.extend({
+            "event_id": event["id"],
+            "paper_trade_id": trade["id"],
+            "event_timestamp": event["timestamp"],
+            "event_type": event["event_type"],
+            "strategy": trade.get("strategy", "bot_filtered"),
+            "pnl_usd": float(event["pnl_usd"] or 0),
+            "cost_basis_usd": (float(event["cost_basis_usd"])
+                               if event.get("cost_basis_usd") is not None else None),
+            "termination_cause": _termination_cause_for_event(event),
+            "source_shares_at_termination": event.get("source_shares_at_termination"),
+        } for event in assigned)
         rows.append({
             **trade,
             "allocated_event_count": len(assigned),
@@ -114,6 +130,7 @@ def reconcile(db_path):
         "fact_clean_trade_count": len(clean),
         "fact_clean_closed_trade_count": sum(row["status"] == "closed" for row in clean),
         "rows": rows,
+        "event_allocations": sorted(event_allocations, key=lambda row: (row["event_timestamp"], row["event_id"])),
         "unmatched_event_ids": [row["id"] for row in unmatched],
         "ambiguous_events": ambiguous,
     }

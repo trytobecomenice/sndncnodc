@@ -1,0 +1,62 @@
+{
+  "protocol_version": "copy-alpha-v2-draft-1",
+  "freeze_state": "DRAFT_NOT_FROZEN",
+  "paper_only": true,
+  "pass_authority": "CALIBRATION_ONLY_NOT_LIVE",
+  "primary_entry_price_domain": [0.35, 0.85],
+  "qualification": {
+    "window_days": 7,
+    "coverage_grace_seconds": 600,
+    "ttp_price_read_success_rate_min": 0.99,
+    "ttp_executable_bid_rate_min": 0.99,
+    "termination_unknown_rate_max": 0.01
+  },
+  "evidence": {
+    "minimum_independent_entities": 30,
+    "minimum_independent_signal_clusters": 50,
+    "raw_address_recruitment_target": 100,
+    "maximum_epoch_days": 30,
+    "target_net_edge_per_lot": 0.05,
+    "alpha": 0.05,
+    "power": 0.8
+  },
+  "drift": {
+    "w_rolling_days": 7,
+    "w_control_interval": 0.99,
+    "w_consecutive_breaches": 2,
+    "latency_ks_alpha": 0.01,
+    "latency_consecutive_breaches": 2
+  },
+  "termination_causes": [
+    "INTENDED_SOURCE_RESOLUTION",
+    "SOURCE_EXIT",
+    "TTP_EXIT",
+    "TTP_ELIGIBLE_BUT_PRICING_FAILED",
+    "EXIT_SIGNAL_BUT_UNEXECUTABLE",
+    "SYSTEM_CENSORED",
+    "UNKNOWN"
+  ],
+  "variance_specification": {
+    "formula": "w*var_resolution+(1-w)*var_exit+w*(1-w)*(mu_resolution-mu_exit)^2",
+    "w_rule": "normal_strategy_terminations_only; system failures separate",
+    "w_uncertainty_rule": "scan the full preregistered confidence interval including interior extrema; never endpoints only",
+    "latency_primary": "frozen empirical ECDF",
+    "latency_stress": "p99 only; may veto PASS; excluded from primary sampling estimator"
+  },
+  "cluster_specification": {
+    "unit": "entity",
+    "primary_link": "common owner EOA/proxy ownership",
+    "secondary_link": "versioned PnL-blind feature algorithm",
+    "design_effect_layers": ["entity", "signal_cluster"],
+    "ci_rule": "wild cluster bootstrap with Rademacher weights",
+    "small_cluster_rule": "fewer than 30 entities cannot trigger PASS from CI alone"
+  },
+  "decision_policy": {
+    "primary_strategy_criterion": "wallet-clustered net return lower confidence bound > 0",
+    "strategy_kills_are_or_combined": true,
+    "type_i_policy": "deliberately conservative: false rejection costs less than promoting negative EV to live",
+    "rejected_action": "stop copy-direction promotion; write post-mortem within 7 days",
+    "budget_scope": "epoch",
+    "budget_loss_limit_usd": 100.0
+  }
+}

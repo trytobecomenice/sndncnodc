@@ -103,6 +103,16 @@ authority for fresh/current databases.
    same-repository bot processes through `/proc`, repairs a missing PID file, serializes starts with
    an OS file lock, and alerts/fails closed if duplicates exist. A live missing-PID simulation and
    the next cron tick both left exactly one process.
+8. **P0 ledger v2 is implemented locally, not yet deployed/promoted:** migrations 0024–0027 add
+   immutable realized-event allocations, per-lot cumulative PnL, event-time termination causes,
+   and raw early-rejection pointers. Migration alone cannot change equity: the new ledger becomes
+   authoritative only after an exact-SHA backfill proves zero unmatched/ambiguous/missing events
+   and atomically writes its readiness key. Protocol v2 remains `DRAFT_NOT_FROZEN`; no epoch clock
+   or Live authority exists.
+9. **Qualification instrumentation is implemented locally:** one aggregate `ttp_sweep_observation`
+   per sweep records the attempted/successful/executable-bid denominator plus latency. New
+   resolution closes snapshot source inventory at event time. Historical resolution closes without
+   that evidence remain `UNKNOWN`; no retrospective intent is invented.
 
 ## 2026-08-05 repository separation
 
