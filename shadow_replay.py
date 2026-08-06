@@ -18,7 +18,7 @@ import time
 
 
 SCHEMA_VERSION = 1
-POLICY_VERSION = "shadow-buy-v1"
+POLICY_VERSION = "shadow-buy-v2"
 PRICE_SCALE = 1_000_000
 SHARE_SCALE = 1_000_000
 USD_SCALE = 1_000_000
@@ -406,6 +406,14 @@ class VirtualClock:
 
 
 @dataclass(frozen=True)
+class GateEvaluation:
+    gate: str
+    mode: str
+    status: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class ShadowDecision:
     source_event_id: str
     policy_version: str
@@ -414,6 +422,7 @@ class ShadowDecision:
     copy_size_usd_micros: int
     executable_price_micros: int | None
     decision_monotonic_ns: int
+    gate_trace: tuple = ()
 
     def digest(self):
         return hashlib.sha256(_canonical_json(asdict(self)).encode("utf-8")).hexdigest()
@@ -431,20 +440,39 @@ def _checkpoint_from_record(record):
 def decide_shadow_buy(envelope, entry_interlock_active=None):
     """Deterministic first policy: quote a supported-size BUY, never execute."""
     payload = envelope.normalized_payload
+    trace = []
+
+    def gate(name, mode, status, reason):
+        trace.append(GateEvaluation(name, mode, status, reason))
+
+    def decision(action, reason, size, price, monotonic_ns):
+        attribution = payload.get("phase0_attribution") or {}
+        residual = attribution.get("residual_alpha") or {}
+        residual_status = residual.get("status", "phase0_attribution_unavailable")
+        gate("residual_alpha_lcb", "observe", "unknown", residual_status)
+        return ShadowDecision(
+            envelope.event_id, POLICY_VERSION, action, reason, size, price,
+            monotonic_ns, tuple(trace)
+        )
+
     copy_size_usd = payload.get("copy_size_usd")
     if payload.get("side") != "BUY":
-        return ShadowDecision(envelope.event_id, POLICY_VERSION, "skip", "not_a_buy", 0, None,
-                              envelope.monotonic_ns)
+        gate("signal_side", "blocking", "fail", "not_a_buy")
+        return decision("skip", "not_a_buy", 0, None, envelope.monotonic_ns)
+    gate("signal_side", "blocking", "pass", "buy_signal")
     try:
         copy_size_micros = _scaled_int(copy_size_usd, USD_SCALE, "copy_size_usd")
     except ValueError:
-        return ShadowDecision(envelope.event_id, POLICY_VERSION, "skip", "invalid_copy_size", 0,
-                              None, envelope.monotonic_ns)
+        gate("copy_size", "blocking", "fail", "invalid_copy_size")
+        return decision("skip", "invalid_copy_size", 0, None, envelope.monotonic_ns)
+    gate("copy_size", "blocking", "pass", "valid_copy_size")
     if entry_interlock_active is None:
         entry_interlock_active = payload.get("entry_interlock_active") is True
     if entry_interlock_active:
-        return ShadowDecision(envelope.event_id, POLICY_VERSION, "skip", "entry_interlock_active",
-                              copy_size_micros, None, envelope.monotonic_ns)
+        gate("entry_interlock", "blocking", "fail", "entry_interlock_active")
+        return decision("skip", "entry_interlock_active", copy_size_micros, None,
+                        envelope.monotonic_ns)
+    gate("entry_interlock", "blocking", "pass", "entry_interlock_clear")
 
     checkpoint_record = (payload.get("checkpoints") or {}).get("decision_commit")
     if checkpoint_record is None:
@@ -452,29 +480,36 @@ def decide_shadow_buy(envelope, entry_interlock_active=None):
         # always use the named checkpoints map above.
         checkpoint_record = payload.get("decision_commit_checkpoint")
     if not isinstance(checkpoint_record, dict):
-        return ShadowDecision(envelope.event_id, POLICY_VERSION, "skip", "missing_decision_book",
-                              copy_size_micros, None, envelope.monotonic_ns)
+        gate("decision_book", "blocking", "fail", "missing_decision_book")
+        return decision("skip", "missing_decision_book", copy_size_micros, None,
+                        envelope.monotonic_ns)
     try:
         checkpoint = _checkpoint_from_record(checkpoint_record)
     except (TypeError, ValueError):
-        return ShadowDecision(envelope.event_id, POLICY_VERSION, "skip", "invalid_decision_book",
-                              copy_size_micros, None, envelope.monotonic_ns)
+        gate("decision_book", "blocking", "fail", "invalid_decision_book")
+        return decision("skip", "invalid_decision_book", copy_size_micros, None,
+                        envelope.monotonic_ns)
     if UNSAFE_BOOK_FLAGS.intersection(checkpoint.quality_flags):
-        return ShadowDecision(envelope.event_id, POLICY_VERSION, "skip", "untrusted_decision_book",
-                              copy_size_micros, None, checkpoint.monotonic_ns)
+        gate("decision_book", "blocking", "fail", "untrusted_decision_book")
+        return decision("skip", "untrusted_decision_book", copy_size_micros, None,
+                        checkpoint.monotonic_ns)
+    gate("decision_book", "blocking", "pass", "trusted_decision_book")
 
     feature = next(
         (item for item in checkpoint.buy_vwap if item.requested_usd_micros == copy_size_micros),
         None,
     )
     if feature is None:
-        return ShadowDecision(envelope.event_id, POLICY_VERSION, "skip", "unsupported_size_tier",
-                              copy_size_micros, None, checkpoint.monotonic_ns)
+        gate("executable_liquidity", "blocking", "fail", "unsupported_size_tier")
+        return decision("skip", "unsupported_size_tier", copy_size_micros, None,
+                        checkpoint.monotonic_ns)
     if feature.insufficient_liquidity or feature.price_micros is None:
-        return ShadowDecision(envelope.event_id, POLICY_VERSION, "skip", "insufficient_liquidity",
-                              copy_size_micros, feature.price_micros, checkpoint.monotonic_ns)
-    return ShadowDecision(envelope.event_id, POLICY_VERSION, "shadow_buy", "quoted_not_submitted",
-                          copy_size_micros, feature.price_micros, checkpoint.monotonic_ns)
+        gate("executable_liquidity", "blocking", "fail", "insufficient_liquidity")
+        return decision("skip", "insufficient_liquidity", copy_size_micros,
+                        feature.price_micros, checkpoint.monotonic_ns)
+    gate("executable_liquidity", "blocking", "pass", "actual_size_quoted")
+    return decision("shadow_buy", "quoted_not_submitted", copy_size_micros,
+                    feature.price_micros, checkpoint.monotonic_ns)
 
 
 def replay_shadow_journal(events, entry_interlock_active=None):

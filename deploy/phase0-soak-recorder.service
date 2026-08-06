@@ -1,0 +1,24 @@
+[Unit]
+Description=Polymarket Copy Bot Phase-0 read-only soak recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-copybot
+ExecStart=/usr/bin/python3 -u /home/ubuntu/polymarket-copybot/phase0_soak_recorder.py --journal /home/ubuntu/polymarket-copybot/data/phase0_soak_v1.jsonl --poll-seconds 30 --memory-limit-mb 768 --max-workers 3 --max-assets 128
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+MemoryMax=1G
+CPUQuota=50%
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/ubuntu/polymarket-copybot/data
+
+[Install]
+WantedBy=multi-user.target

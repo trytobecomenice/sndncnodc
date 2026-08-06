@@ -42,7 +42,7 @@ high-conviction strategy, that is good quant research rather than failure.
 
 - This repository is Copy Bot only. Other bots live in separate workspaces; do not add their code,
   schema, dependencies, documentation, capital, PnL, or deployment controls here.
-- Both systems remain paper-only. Do not flip `LIVE_MODE` or introduce private-key custody.
+- Copy Bot remains paper-only. Do not flip `LIVE_MODE` or introduce private-key custody.
 - TypeScript/Drizzle owns schema and migrations; Python performs CRUD only.
 - Preserve unrelated dirty-worktree changes. Do not bundle them into a task commit.
 - Never commit or push `.env`, API tokens, SSH/private keys, or credentials. Stage explicit file
@@ -178,7 +178,205 @@ high-conviction strategy, that is good quant research rather than failure.
 5. Review concentration: historical PnL can still be dominated by a small number of wallets even
    when the roster count looks diversified.
 
+### 2026-08-06 — Execution uncertainty and honest Paper PnL decision record
+
+1. **When:** 2026-08-06 HKT.
+2. **Files adjusted:**
+   - `docs/research/SHADOW_REPLAY_ARCHITECTURE_2026-08-06.md` — added the jointly accepted
+     off-chain priority/toxicity, provisional settlement, depth-survival, Paper PnL, and scale-gate
+     decisions.
+   - `CLAUDE_HANDOFF.md` — added this exact handoff entry.
+3. **What changed:**
+   - Recorded FOK reject/adverse-markout monitoring without claiming unproved operator
+     front-running, VIP priority, MEV, or spoofing. Toxicity is a versioned research output with
+     controls, minimum samples, uncertainty, TTL, hysteresis, and temporary quarantine—not an
+     automatic permanent blacklist.
+   - Split economic exposure from settlement finality: `MATCHED` freezes capital and counts full
+     risk; only `CONFIRMED` settles the final ledger. User WS + authenticated REST are primary
+     lifecycle sources and Polygon RPC is independent corroboration. `RETRYING` stays frozen;
+     `FAILED` is reversed through append-only reconciliation.
+   - Kept raw bounded L2 objective and moved depth survival/fill probability to strategy/research.
+     FOK requires enough surviving eligible depth for the full size; FAK uses a fill-size
+     distribution; maker simulation conservatively accounts for queue ahead.
+   - Rejected a single deterministic Paper PnL. Reports must separate optimistic,
+     latency-adjusted, persistence-qualified, and stress results, with the conservative result as
+     headline. Journal gaps and missing volatile periods remain visible and can invalidate a
+     positive claim.
+   - Paper evidence can reject a strategy but cannot prove operator priority or live execution
+     alpha. Any later micro-live canary requires separate approval, tiny caps, and agreement of
+     actual fills/rejects/markouts/settlement with predicted intervals before AWS or capital scale.
+   - Documentation only: no code, strategy, order, AWS, DB, `.env`, key, commit, push, or deploy
+     was performed for this entry.
+
+### 2026-08-06 — Agreed strategy and expansion decision record
+
+1. **When:** 2026-08-06 HKT.
+2. **Files adjusted:**
+   - `docs/research/STRATEGY_AND_EXPANSION_DECISIONS_2026-08-06.md` — created as the canonical
+     record of agreed Copy strategy identity, residual-alpha gate, execution policy, market quality,
+     portfolio/capital decisions, and evidence-gated expansion roadmap.
+   - `docs/research/SHADOW_REPLAY_ARCHITECTURE_2026-08-06.md` — linked the new strategy record and
+     clarified which document owns architecture versus strategy conclusions.
+   - `docs/TODO_2026-08-06.md` — added P4 shadow evidence and expansion gates.
+   - `CLAUDE_HANDOFF.md` — added this exact change entry.
+3. **What changed:**
+   - Reframed the target as a wallet-conditioned signal engine: wallet actions update a posterior
+     but never command a trade. Every entry must retain a positive conservative residual edge after
+     actual-size VWAP, current fees, chase/decay, settlement, capital, and portfolio risk.
+   - Accepted proposed first-live Copy entries as price-bounded FOK/FAK only; a negative-Taker-EV
+     signal is dropped rather than converted to a resting Maker entry. Exits remain asymmetric and
+     urgency-based. No live execution was enabled.
+   - Recorded size-aware entry/exit liquidity and executable liquidation equity as risk truth;
+     fixed universal spread/depth/volume cutoffs and mid/last-price realizable PnL were rejected.
+   - Added logical dependency, sparse factor/scenario, shrinkage covariance, fractional-Kelly,
+     CTF/settlement, and Merge cash-band decisions without claiming those controls are implemented.
+   - Ordered future expansion: prove current Copy economics; deepen wallet intelligence; shadow an
+     event/payoff graph; test one niche primary-source vertical; then consider leg-risk execution,
+     a strategy allocator, LP, and external hedging. Each future strategy requires isolated code,
+     ledger, capital, risk, kill switch, and attribution.
+   - Recorded unsupported assumptions explicitly, including precise wallet target inference,
+     universal maker-toxicity percentages, batch atomicity, per-order CLOB V2 nonce, full-signature
+     caching, TWAP-created capacity, tiny-Canary size extrapolation, and Paper-only proof of alpha.
+   - Documentation only: no Python/TypeScript runtime, order, strategy parameter, AWS, DB, external
+     bot, `.env`, key, commit, push, or deploy was changed.
+
+### 2026-08-06 — Phase 0 attribution walking skeleton
+
+1. **When:** 2026-08-06 14:40–15:05 HKT.
+2. **Files adjusted:**
+   - `phase0_attribution.py` and `test_phase0_attribution.py` — added pure fixed-point Phase 0
+     attribution and focused evidence tests.
+   - `shadow_capture.py`, `shadow_replay.py`, `bot.py`, and
+     `polymarket_simulator.py` — carried same-request market/fee and existing wallet-model context
+     into the replayable event and added an exact blocking/observation gate trace.
+   - `test_shadow_capture.py`, `test_shadow_replay.py`, `test_bot_passive_shadow.py`, and
+     `test_polymarket_simulator.py` — covered the new journal fields, thin exit liquidity, unknown
+     model handling, metadata reuse, and deterministic gate trace.
+   - `docs/research/STRATEGY_AND_EXPANSION_DECISIONS_2026-08-06.md`,
+     `docs/research/SHADOW_REPLAY_ARCHITECTURE_2026-08-06.md`,
+     `docs/TODO_2026-08-06.md`, and this handoff — recorded exact implementation truth and gaps.
+3. **What changed:**
+   - Added actual-copy-size BUY book walking, current fee observation, projected immediate SELL-side
+     liquidation, visible two-sided depth, chase, and immediate round-trip executable value using
+     integer fixed-point fields.
+   - Recorded observed source position action without claiming economic intent; stored the existing
+     wallet sizing/model snapshot and event/category factor IDs without a second API/model call.
+   - Kept reported source-to-receive time separate from unavailable poll/clock bounds. Wallet point
+     probability is labeled as a point observation; residual-alpha LCB and scenario model remain
+     explicitly unknown until calibrated.
+   - Shadow decisions now state each blocking/observation gate, status, and reason. The module can
+     only return `shadow_buy`/`skip`; it has no key, network, DB, or order capability.
+   - Scope limitation: capture covers BUYs that reach the existing passive-shadow seam; earlier
+     skips are not yet complete counterfactual coverage.
+   - Verification: focused Phase 0/shadow/integrity/simulator suite **82 passed**; full workspace
+     suite **740 passed**; Python compile and `git diff --check` passed.
+   - Local only and feature-disabled: no commit, GitHub push, AWS change, DB change, `.env`, key,
+     external bot, live order, or deployment was performed.
+
+### 2026-08-06 — Standalone Phase 0 wallet/WS soak and SELL tax-lot ledger
+
+1. **When:** 2026-08-06 15:05–18:55 HKT.
+2. **Files adjusted:**
+   - `phase0_soak.py` and `test_phase0_soak.py` — added pure incremental conviction and per-tier
+     BUY/SELL shadow tax-lot state.
+   - `phase0_soak_recorder.py` and `test_phase0_soak_recorder.py` — added the standalone public
+     wallet/market-WS recorder, causal ingress/deadline contract, restart/dedup handling, bounded
+     asset cache, Linux memory limit, and sanity-only warm-up option.
+   - `inspect_phase0_soak.py` and `test_inspect_phase0_soak.py` — added a streaming JSONL coverage,
+     timing, reconnect, quality, visibility-proxy, and PnL report.
+   - `polymarket_data_api.py` and `test_polymarket_data_api.py` — added a caller-bounded first-page
+     bootstrap without changing normal production pagination defaults.
+   - `deploy/phase0-soak-recorder.service` — added a separate paper/read-only systemd unit with
+     memory/CPU/I/O/path limits; production bootstrap sample count remains zero.
+   - `requirements-phase0-soak.txt` — isolated the recorder's pinned `aiohttp` dependency from the
+     trading bot and the unrelated dirty `requirements.txt` changes.
+   - `phase0_attribution.py` — exposed the existing pure exact-size bid-side SELL walk.
+   - `docs/research/SHADOW_REPLAY_ARCHITECTURE_2026-08-06.md`,
+     `docs/research/STRATEGY_AND_EXPANSION_DECISIONS_2026-08-06.md`,
+     `docs/TODO_2026-08-06.md`, and this handoff — recorded implementation truth and unresolved
+     inference boundaries.
+3. **What changed:**
+   - Research dedup preserves separate same-wallet scaling fills; it removes only an identical
+     fill surrogate. Production Copy Bot dedup was not changed. A rolling one-hour trade-count and
+     notional feature is observation-only and labels an incomplete startup window.
+   - BUYs create immutable shadow entry lots for `$3/$5/$10`. Source SELLs reduce only lots the
+     shadow tier actually acquired. Default closure is conservative worst-execution-first with
+     deterministic FIFO/LIFO sensitivity; unmatched SELLs and unfilled shares create no realized
+     PnL. Raw source token `size` is preferred over fee-affected `usdcSize/price`, and the basis is
+     journaled.
+   - `wallet_signal_ingress` is persisted before REST. Signal-time book truth is the warmed public
+     WS state already known at that monotonic instant; later REST supplies fee/event enrichment but
+     is never back-dated as T0.
+   - T+100/T+500 observations are armed immediately and record exact deadline, callback lateness,
+     reconnect epoch/local generation, and whether the captured generation was already known by
+     the target deadline. The public WS exposes no compatible exchange SeqID, so that field remains
+     null and no blockchain-to-book causal join is claimed.
+   - `reported_visibility_lag_ms` is explicitly a proxy because the public activity timestamp's
+     exact semantic is undocumented. It does not prove Private RPC/MEV use and cannot auto-
+     quarantine a wallet.
+   - Local public-data sanity with one explicit startup sample and a 3-second WS warm-up observed
+     both delayed books, 0.860 ms T+100 lateness, 1.239 ms T+500 lateness, 8.574 ms signal-time WS
+     book age, zero poll error, and a clean stop. This proves recorder plumbing only, not alpha.
+   - Verification: focused Phase 0 suite **120 passed** before final deadline tests; full workspace
+     suite after all changes **759 passed**. No `.env`, key, credential, external bot, live order,
+     or strategy size was changed.
+   - Commit, GitHub, and AWS service state are recorded in the next deployment entry only; do not
+     infer deployment from this implementation entry.
+
 ## Change log
+
+### 2026-08-06 — Process-isolation blueprint and repository-scope cleanup
+
+1. **When:** 2026-08-06 HKT.
+2. **Files adjusted:**
+   - `docs/research/SHADOW_REPLAY_ARCHITECTURE_2026-08-06.md` — recorded the proposed C++ market-
+     data sidecar, Python trading process, best-effort journal egress, independent risk supervisor,
+     binary framing/precision contract, capital-opportunity capture, reconciliation states, and
+     honest timestamp boundary.
+   - `docs/TODO_2026-08-06.md` — added the protocol golden-vector, early-rejection, orphan-order
+     reconciliation, and latency-naming implementation gates.
+   - `config.py`, `packages/copy-trading/src/scanLeaderboard.ts`, and
+     `apps/dashboard/app/overview/page.tsx` — removed stale secondary-project research comments;
+     no trader address, discovery source, score, threshold, or runtime behavior changed.
+   - `docs/polymarket-copybot.code-workspace` — verified the secondary project remains an external
+     multi-root workspace link only. The link was briefly removed during cleanup, then restored
+     immediately after Joey reported it missing from VS Code; no external file was deleted.
+   - This handoff — recorded the exact boundary and verification state.
+3. **What changed:**
+   - Confirmed the active repository already has no secondary-project package, schema export,
+     dependency, command, or documentation tree. Historical Drizzle migrations remain immutable:
+     the latest forward migration removes the obsolete tables from old databases, and rewriting
+     applied history could break existing AWS/local migration journals. The external workspace
+     link is navigation only and does not reintroduce code, schema, dependency, Git history, or
+     deployment coupling. A fresh migration test must confirm the final schema contains none of
+     those obsolete tables.
+   - The proposed Process M -> T transport is cross-platform Unix-domain `SOCK_STREAM` with
+     length-prefixed, versioned frames. M uses event-armed coalesced push rather than a socket
+     "mailbox" or permanent 1 kHz poll; a partial frame is completed while only the latest not-yet-
+     started state may replace an older pending state.
+   - M -> journal egress uses a preallocated lock-free SPSC ring. Network partial writes and TCP
+     backpressure live outside the parser; overflow drops whole not-yet-enqueued journal frames and
+     records sequence gaps rather than blocking market data.
+   - Process S grants short-lived risk leases; T validates them before strategy work and again
+     inside the transport adapter immediately before dispatch, with a measured safety margin.
+     Expiry stops new exposure and triggers reconciliation, not blind liquidation. Local hard
+     limits remain enforceable without S.
+   - Protocol v1 uses canonical integer `e6` price/share/USD units, `__int128` intermediates in
+     C++, explicit directional rounding, and no float at the execution boundary. C++/Python golden
+     vectors are required before sidecar integration.
+   - When capital/risk gates already forbid entry, production records only a compact raw signal/BBO
+     rejection marker. Predicted EV, Kelly, and foregone-EV attribution are reconstructed offline;
+     production must not run the full model merely to observe an unactionable opportunity.
+   - Capital reservations require `orphaned` and `reconciled` transitions. An ambiguous timeout
+     remains frozen until an idempotent REST position/open-order/trade reconciliation resolves it;
+     `holding_time_p90` is research metadata, not an execution-finality timeout.
+   - Python can honestly record local monotonic user-space spans and end-to-end RTT only.
+     `socket.send()` return is not named kernel/NIC handoff, and exchange wall-clock match time is
+     not subtracted from local monotonic time. Kernel timestamps/eBPF remain optional later
+     instrumentation, not a prerequisite for the first recorder.
+   - Python full suite after the scope cleanup: **734 passed**. TypeScript and fresh-migration
+     verification are still pending at the time of this entry. No AWS deployment, DB mutation,
+     `.env`, key, credential, live-mode, trader-roster, or strategy change was made.
 
 ### 2026-08-06 — Pre-parse timing and deferred shadow materialization
 

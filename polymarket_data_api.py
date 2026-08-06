@@ -242,7 +242,8 @@ def _activity_trade_id(record):
 
 def fetch_wallet_trades(wallet_address, limit=DEFAULT_FETCH_LIMIT,
                         timeout=DEFAULT_TIMEOUT_SECONDS, start=None,
-                        known_trade_ids=None, capture_timing=False):
+                        known_trade_ids=None, capture_timing=False,
+                        max_pages=None):
     """Fetches one wallet's recent TRADE-type activity directly from
     Polymarket's own public Data API, over this thread's persistent
     connection (see module docstring). Returns the raw JSON list
@@ -257,6 +258,11 @@ def fetch_wallet_trades(wallet_address, limit=DEFAULT_FETCH_LIMIT,
     page is deliberate: downstream dedup removes its known rows, while any
     genuine gap on the same page remains visible instead of being skipped.
 
+    `max_pages` is a bounded caller override. Normal bot polling keeps the
+    established default; the independent soak recorder uses one page only
+    for its first dedup bootstrap so startup cannot hammer ten historical
+    pages per wallet merely to discard every pre-start row.
+
     `start` (optional, unix epoch seconds) filters server-side to trades at
     or after that time — confirmed live to work correctly (every returned
     record's timestamp was >= the requested start). Added specifically so
@@ -270,7 +276,8 @@ def fetch_wallet_trades(wallet_address, limit=DEFAULT_FETCH_LIMIT,
     """
     all_records = []
     offset = 0
-    for _ in range(MAX_PAGES_PER_FETCH):
+    page_limit = MAX_PAGES_PER_FETCH if max_pages is None else max(1, int(max_pages))
+    for _ in range(page_limit):
         page = _fetch_one_page(
             wallet_address, limit, timeout, start, offset,
             capture_timing=capture_timing,
@@ -373,7 +380,7 @@ def normalize_activity_record(record, wallet_address, received_timestamp_ms=None
 def fetch_all_wallets_concurrent(wallet_addresses, limit=DEFAULT_FETCH_LIMIT,
                                   max_workers=DEFAULT_MAX_WORKERS, timeout=DEFAULT_TIMEOUT_SECONDS,
                                   executor=None, start=None, known_trade_ids=None,
-                                  capture_timing=False):
+                                  capture_timing=False, max_pages_per_wallet=None):
     """Fetches every wallet's recent trade activity CONCURRENTLY via a
     thread pool. Pass a long-lived `executor` (created ONCE by the caller,
     reused across every poll cycle) to get the real connection-reuse speedup
@@ -401,6 +408,11 @@ def fetch_all_wallets_concurrent(wallet_addresses, limit=DEFAULT_FETCH_LIMIT,
         if known_trade_ids is not None:
             fetch_kwargs["known_trade_ids"] = known_trade_ids
         fetch_kwargs["capture_timing"] = capture_timing
+        if max_pages_per_wallet is not None:
+            # Recorder bootstrap needs only a current one-page dedup boundary;
+            # it must not replay ten historical pages per wallet merely to
+            # decide that every pre-start fill is old.
+            fetch_kwargs["max_pages"] = max_pages_per_wallet
         raw = fetch_wallet_trades(wallet_address, **fetch_kwargs)
         if not capture_timing:
             return [normalize_activity_record(record, wallet_address) for record in raw]

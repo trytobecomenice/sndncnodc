@@ -257,6 +257,22 @@ class TestPagination(unittest.TestCase):
         self.assertEqual(result, [{"id": 1}, {"id": 2}])
         self.assertEqual(mock_conn.request.call_count, 1)
 
+    def test_explicit_page_cap_stops_full_bootstrap_page(self):
+        _thread_local.conn = None
+        mock_conn = MagicMock()
+        mock_conn.getresponse.side_effect = [
+            _mock_response(200, [{"id": 1}, {"id": 2}]),
+        ]
+        with patch("http.client.HTTPSConnection", return_value=mock_conn):
+            result = fetch_wallet_trades("0xABC", limit=2, max_pages=1)
+        self.assertEqual(result, [{"id": 1}, {"id": 2}])
+        self.assertEqual(mock_conn.request.call_count, 1)
+
+    def test_concurrent_fetch_forwards_bootstrap_page_cap(self):
+        with patch("polymarket_data_api.fetch_wallet_trades", return_value=[]) as mock_fetch:
+            fetch_all_wallets_concurrent(["0xA"], max_pages_per_wallet=1)
+        self.assertEqual(mock_fetch.call_args.kwargs["max_pages"], 1)
+
     def test_follows_a_full_page_with_a_second_request_at_the_next_offset(self):
         _thread_local.conn = None
         mock_conn = MagicMock()

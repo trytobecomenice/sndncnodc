@@ -231,6 +231,7 @@ def fetch_market_info(market_slug, timeout=DEFAULT_TIMEOUT_SECONDS):
 
     return {
         "outcomes": outcomes, "clob_token_ids": clob_token_ids, "fee_rate": fee_rate,
+        "fees_enabled": fees_enabled,
         "event_slug": event_slug,
     }
 

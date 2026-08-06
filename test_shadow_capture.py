@@ -47,6 +47,14 @@ class TestPassiveShadowCapture(unittest.TestCase):
         )
         self.assertEqual(event.raw_payload, '{"side":"BUY"}')
         self.assertEqual(event.normalized_payload["passive_integrity"]["decision_queue_age_ms"], 20.0)
+        attribution = event.normalized_payload["phase0_attribution"]
+        self.assertEqual(attribution["version"], "phase0-attribution-v1")
+        self.assertEqual(attribution["side_adjusted_chase_micros"], 10_000)
+        self.assertIsNone(attribution["residual_alpha"]["lower_bound_micros"])
+        self.assertEqual(
+            attribution["residual_alpha"]["status"],
+            "uncalibrated_lower_bound_model_unavailable",
+        )
         self.assertEqual(decide_shadow_buy(event).action, "shadow_buy")
 
     def test_missing_original_raw_payload_is_honestly_flagged_as_reconstructed(self):
@@ -103,6 +111,45 @@ class TestPassiveShadowCapture(unittest.TestCase):
             build_event.assert_not_called()
             capsule.materialize_event()
             build_event.assert_called_once()
+
+    def test_records_real_fee_liquidation_and_context_without_an_extra_model(self):
+        trade = self._trade()
+        trade["_source_position_action"] = "open_observed_position"
+        book = self._book()
+        book["fee_rate"] = 0.05
+        book["event_slug"] = "event-one"
+        measurement = measure_passive_integrity(
+            trade, book, decision_monotonic_ns=1_020_000_000,
+            decision_timestamp_ms=10_020,
+        )
+        event = build_passive_shadow_event(
+            trade, book, 5, measurement, False, 10_020, 1_020_000_000,
+            strategy_context={
+                "event_slug": "event-one",
+                "category": "politics",
+                "wallet_model": {
+                    "model_version": "rules-v1",
+                    "sizing_tier": "category",
+                    "sample_count": 25,
+                    "shrunk_win_rate": 0.60,
+                },
+            },
+        )
+        attribution = event.normalized_payload["phase0_attribution"]
+        self.assertEqual(attribution["fee_rate_ppm"], 50_000)
+        self.assertGreater(attribution["buy_execution"]["taker_fee_usd_micros"], 0)
+        self.assertEqual(
+            attribution["projected_exit_liquidation"]["liquidation_ratio_ppm"],
+            1_000_000,
+        )
+        self.assertLess(
+            attribution["market_quality"]["immediate_round_trip_pnl_usd_micros"], 0
+        )
+        self.assertEqual(
+            attribution["risk_context"]["factor_ids"],
+            ["category:politics", "event:event-one"],
+        )
+        self.assertEqual(attribution["source_intent"], "unknown")
 
 
 if __name__ == "__main__":

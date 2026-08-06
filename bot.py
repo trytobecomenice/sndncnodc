@@ -660,7 +660,7 @@ def fetch_book_depth_snapshot(market_slug, outcome, capture_parse_timing=False):
     must never issue a duplicate request merely for watchdog measurement.
     """
     try:
-        _, book = polymarket_simulator.fetch_order_book_for_outcome(
+        market_info, book = polymarket_simulator.fetch_order_book_for_outcome(
             market_slug,
             outcome,
             capture_parse_timing=capture_parse_timing,
@@ -668,6 +668,11 @@ def fetch_book_depth_snapshot(market_slug, outcome, capture_parse_timing=False):
     except Exception:
         return None, None
 
+    # Preserve metadata returned by the same Gamma lookup. Shadow attribution
+    # must not make a second network request merely to recover fee/event data.
+    book["fee_rate"] = market_info.get("fee_rate")
+    book["fees_enabled"] = market_info.get("fees_enabled")
+    book["event_slug"] = market_info.get("event_slug")
     asks = book.get("asks") or []
     if not asks:
         return None, book
@@ -701,7 +706,8 @@ def _entry_integrity_thresholds():
 
 
 def record_passive_shadow_decision(trade, book, copy_size_usd, writer, risk_state,
-                                   decision_monotonic_ns=None, decision_timestamp_ms=None):
+                                   decision_monotonic_ns=None, decision_timestamp_ms=None,
+                                   strategy_context=None):
     """Measure, interlock, and enqueue one BUY signal without active polling.
 
     `book` is the snapshot process_trade already fetched for depth sizing.
@@ -747,6 +753,7 @@ def record_passive_shadow_decision(trade, book, copy_size_usd, writer, risk_stat
         proposed.active,
         decision_timestamp_ms,
         decision_monotonic_ns,
+        strategy_context,
     )
     accepted = writer.submit(capture)
     final_state = proposed
@@ -3310,6 +3317,12 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
                         "reconciled_whale_price": price})
             return
 
+        prior_source_shares = source_positions.get(key, 0.0)
+        # This is an inventory-action fact, not a claim about economic intent:
+        # a BUY that increases a position may still be a hedge/rebalance.
+        trade["_source_position_action"] = (
+            "increase_observed_position" if prior_source_shares > 0 else "open_observed_position"
+        )
         source_shares = source_size_usd / price if source_size_usd else 0.0
         source_positions[key] = source_positions.get(key, 0.0) + source_shares
         # Weighted-average cost basis of the source trader's currently-held
@@ -3528,6 +3541,16 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
                 trade_usd,
                 shadow_journal_writer,
                 risk_state,
+                strategy_context={
+                    "event_slug": event_slug,
+                    "category": category,
+                    "wallet_model": {
+                        "model_version": risk_state.get("active_rule_set_version"),
+                        "sizing_tier": sizing_tier,
+                        "sample_count": snapshot_trade_count,
+                        "shrunk_win_rate": shrunk_win_rate,
+                    },
+                },
             )
 
         # Rule 29 (2026-07-24): tracked wallets in

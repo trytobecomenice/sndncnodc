@@ -82,6 +82,7 @@ class TestFetchMarketInfo(unittest.TestCase):
         self.assertEqual(info["outcomes"], ["Yes", "No"])
         self.assertEqual(info["clob_token_ids"], ["111", "222"])
         self.assertAlmostEqual(info["fee_rate"], 0.05)
+        self.assertTrue(info["fees_enabled"])
         self.assertEqual(info["event_slug"], "what-will-happen-before-gta-vi")
 
     def test_missing_events_field_gives_none_event_slug_not_a_crash(self):
@@ -99,6 +100,7 @@ class TestFetchMarketInfo(unittest.TestCase):
         with patch("http.client.HTTPSConnection", return_value=mock_conn):
             info = fetch_market_info("some-slug")
         self.assertEqual(info["fee_rate"], 0.0)
+        self.assertFalse(info["fees_enabled"])
 
     def test_no_market_found_raises_rather_than_silently_returning_nothing(self):
         # Genuinely unknown slug: both the plain lookup AND the closed=true

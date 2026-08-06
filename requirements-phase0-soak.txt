@@ -1,0 +1,4 @@
+# Standalone read-only Phase-0 market WebSocket recorder only.
+# Kept separate so installing the recorder cannot mutate the trading bot's
+# dependency surface or bundle unrelated API-service requirements.
+aiohttp==3.14.3

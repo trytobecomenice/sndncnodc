@@ -78,6 +78,32 @@ def _risk_state():
 
 
 class TestPassiveShadowDecision(unittest.TestCase):
+    def test_book_snapshot_preserves_same_request_attribution_metadata(self):
+        market_info = {
+            "fee_rate": 0.03,
+            "fees_enabled": True,
+            "event_slug": "event-one",
+        }
+        raw_book = {
+            "bids": [(0.39, 100)],
+            "asks": [(0.40, 10), (0.41, 20)],
+        }
+        with patch(
+            "bot.polymarket_simulator.fetch_order_book_for_outcome",
+            return_value=(market_info, raw_book),
+        ) as fetch:
+            depth, book = bot.fetch_book_depth_snapshot(
+                "market", "Yes", capture_parse_timing=True
+            )
+
+        self.assertAlmostEqual(depth, 12.2)
+        self.assertEqual(book["fee_rate"], 0.03)
+        self.assertTrue(book["fees_enabled"])
+        self.assertEqual(book["event_slug"], "event-one")
+        fetch.assert_called_once_with(
+            "market", "Yes", capture_parse_timing=True
+        )
+
     def test_shadow_only_path_records_without_persistence_or_network(self):
         writer = _FakeWriter()
         state = _risk_state()
@@ -112,6 +138,47 @@ class TestPassiveShadowDecision(unittest.TestCase):
         self.assertTrue(accepted)
         materialize.assert_not_called()
         self.assertTrue(callable(writer.events[0].materialize_event))
+
+    def test_writer_materializes_phase0_wallet_and_market_context(self):
+        writer = _FakeWriter()
+        state = _risk_state()
+        book = _book()
+        book.update({"fee_rate": 0.02, "event_slug": "event-one"})
+        strategy_context = {
+            "event_slug": "event-one",
+            "category": "politics",
+            "wallet_model": {
+                "model_version": "rules-v1",
+                "sizing_tier": "category",
+                "sample_count": 20,
+                "shrunk_win_rate": 0.55,
+            },
+        }
+        with patch.object(config, "ENABLE_PASSIVE_ENTRY_INTERLOCK", False):
+            accepted = bot.record_passive_shadow_decision(
+                _trade(),
+                book,
+                5.0,
+                writer,
+                state,
+                decision_monotonic_ns=10_000_000_000,
+                decision_timestamp_ms=10_000,
+                strategy_context=strategy_context,
+            )
+
+        self.assertTrue(accepted)
+        attribution = writer.events[0].materialize_event().normalized_payload[
+            "phase0_attribution"
+        ]
+        self.assertEqual(attribution["fee_rate_ppm"], 20_000)
+        self.assertEqual(
+            attribution["wallet_model_observation"]["model_version"], "rules-v1"
+        )
+        self.assertEqual(
+            attribution["risk_context"]["factor_ids"],
+            ["category:politics", "event:event-one"],
+        )
+        self.assertIsNone(attribution["residual_alpha"]["lower_bound_micros"])
 
     def test_enforced_stale_book_trips_before_buy_gate(self):
         writer = _FakeWriter()

@@ -141,6 +141,13 @@ class TestShadowDecision(unittest.TestCase):
         self.assertEqual(decision.action, "shadow_buy")
         self.assertEqual(decision.reason, "quoted_not_submitted")
         self.assertIsNotNone(decision.executable_price_micros)
+        self.assertEqual(
+            [gate.gate for gate in decision.gate_trace],
+            ["signal_side", "copy_size", "entry_interlock", "decision_book",
+             "executable_liquidity", "residual_alpha_lcb"],
+        )
+        self.assertEqual(decision.gate_trace[-1].mode, "observe")
+        self.assertEqual(decision.gate_trace[-1].status, "unknown")
 
     def test_interlock_blocks_shadow_entry(self):
         decision = decide_shadow_buy(envelope(), entry_interlock_active=True)

@@ -1,14 +1,23 @@
 # Lean Shadow Recorder and Replay Architecture — 2026-08-06
 
-Status: Phase A polling vertical slice implemented locally on 2026-08-06; not production-active.
-The compact schema, bounded JSONL writer, virtual-clock replay, passive signal-time measurement,
-recoverable BUY interlock, and persistent malformed-risk panic path exist. No public-market
-WebSocket recorder, AWS feature activation/resize, or C++ service is running.
+Status: Phase A polling vertical slice, minimal Phase 0 attribution, and a standalone public-WS
+soak recorder were implemented locally on 2026-08-06. The recorder is paper/read-only and awaits
+the controlled AWS service deployment recorded below. The compact schema, bounded JSONL writer,
+virtual-clock replay, passive signal-time measurement, exact gate trace, size-aware entry/exit
+observation, conservative tax-lot shadow ledger, recoverable BUY interlock, and persistent
+malformed-risk panic path exist. No C++ service or live order path is running.
 
 Implemented files:
 
 - `shadow_replay.py`: v1 envelope, integer BBO/top-three/`$3/$5/$10` VWAP features, four named
-  causal checkpoints, non-blocking bounded writer health, and deterministic replay.
+  causal checkpoints, non-blocking bounded writer health, deterministic replay, and an exact
+  blocking/observation gate trace.
+- `phase0_attribution.py`: pure, fixed-point actual-size entry/exit observations, current fee and
+  chase evidence, wallet/model and sparse event/category context, and explicit unknowns for every
+  uncalibrated lower-bound input. It has no network, DB, key, clock, or order dependency.
+- `phase0_soak.py`, `phase0_soak_recorder.py`, and `inspect_phase0_soak.py`: pure incremental
+  conviction/tax-lot state, bounded public wallet/WS collection, online delayed observations, and a
+  streaming coverage/resource report. The recorder imports no signing or order module.
 - `entry_interlock.py`: pure immediate-trip/hysteretic-recovery state machine.
 - `passive_integrity.py` and `shadow_capture.py`: signal-triggered queue/book-age measurement and a
   real polling signal -> current REST book -> replayable shadow-event adapter, with no network or
@@ -17,13 +26,49 @@ Implemented files:
   existing sole BUY gate and decision journal; malformed core local state persistently hard-kills
   entries, invalidates delayed BUY intents, preserves SELL exits, and alerts an operator.
 - `polymarket_simulator.py`: the current direct REST adapter now preserves the server book
-  timestamp and book hash needed by shadow attribution.
+  timestamp, book hash, fee-enabled state, and fee rate needed by shadow attribution.
 
-The polling-path producer is implemented but intentionally defaults off pending burst testing.
+The in-process polling-path producer is implemented but intentionally defaults off pending burst
+testing. The separate soak process does not activate that producer or change the trading process.
 It passively derives signal queue age and book freshness at decision time without a timer or
 duplicate REST request. Recorder CPU/RSS, AWS CPU credits, a public WebSocket shadow process, and
-full sequence-aware reconciliation still need Phase B implementation. A disabled gate must not be
+full exchange-sequence reconciliation still need Phase B implementation. A disabled gate must not be
 described as operational protection.
+
+## Canonical scope and design-history coverage
+
+This is the single detailed handoff for the full architecture discussion, from the first
+deterministic-journal proposal through the process-isolated design. Later agents must not infer
+implementation merely because a design appears here. Every section labels the present boundary,
+the proposed boundary, and the evidence needed to cross it.
+
+Strategy, execution-policy, portfolio-risk, and expansion conclusions that were agreed after this
+architecture discussion are canonical in
+`docs/research/STRATEGY_AND_EXPANSION_DECISIONS_2026-08-06.md`. This file remains authoritative for
+journal/replay, process isolation, settlement/liquidity evidence, and Paper-validation mechanics;
+the strategy record remains authoritative for what may consume that evidence.
+
+The design history covered here is:
+
+1. raw event journal, virtual clock, deterministic replay, and look-ahead prevention;
+2. official-SDK facade/shadow comparison and version isolation;
+3. public WebSocket heartbeat, silent-disconnect detection, REST resync, generation/sequence race;
+4. Telegram human approval as a labeled research dataset, not a permanent strategy dependency;
+5. copy-alpha attribution including source-whale market impact and rejected-trade counterfactuals;
+6. external environment, process lag, network jitter, RPC/chain applicability, and clock honesty;
+7. `t3.small` CPU-credit/RAM/GC constraints, degradation ladder, BUY kill switch, and storage I/O;
+8. passive safety measurement, exact raw-ingress boundary, and real-corpus burst benchmark;
+9. Python GIL/GC limits and the measured path toward C++/separate processes;
+10. M/T/J/S ownership, cross-platform IPC, coalescing, SPSC journal egress, and risk leases;
+11. canonical fixed-point precision and C++/Python golden vectors;
+12. capital shadow cost, observer-safe early rejection, ambiguous order reservations, and
+    reconciliation;
+13. honest user-space RTT versus optional kernel timestamping; and
+14. evidence-gated rollout, failure matrix, and explicit non-goals.
+
+Domain-specific code, schema, dependencies, or research belonging to separately maintained bots
+must not be reintroduced here. The generally applicable conclusions retained here are limited to
+portfolio capital scarcity, model/version replay, and execution-system safety.
 
 ## Objective
 
@@ -31,6 +76,44 @@ Measure whether source-wallet signals retain positive **net copy alpha after obs
 before investing months in a full-depth replay platform. The first implementation must collect
 enough causal data for future attribution while remaining bounded on the current AWS host and
 never delaying the existing Copy Bot.
+
+Success is not message throughput, low latency in isolation, number of followed wallets, or a
+large gross source PnL. Success means a statistically credible positive distribution of **net
+copyable alpha** at our actual size after source impact, public detection delay, local delay,
+spread, fees, fill uncertainty, exit mismatch, and capital opportunity cost. If shadow evidence
+rejects that hypothesis, the correct result is an early pivot to slower/high-conviction research.
+
+## Deterministic journal and replay contract
+
+The journal is the first dependency of attribution, not an afterthought. Raw input, normalization,
+decision, intended action, execution observation, and reconciliation are separate causally linked
+events. An event stores both wall time for external correlation and monotonic time for local
+ordering. Timestamp precision does not imply accuracy; clock source and uncertainty travel with
+the record.
+
+Minimum invariants:
+
+- raw payload is retained before normalization with exact source bytes/text or an explicit
+  reconstruction flag;
+- receive ordering is immutable and duplicate/idempotency keys are stable;
+- `correlation_id` links signal -> checkpoints -> decision -> attempt -> fill/reject -> capital
+  release, while `causation_id` records the immediate parent;
+- code commit, config hash, roster version, policy/model version, schema version, and environment
+  snapshot are captured at the decision boundary;
+- missing book, sequence gap, fallback, stale state, parse failure, and journal loss are data, not
+  silently repaired history;
+- replay advances a virtual monotonic clock in receive order and rejects time regression;
+- a decision may use only events causally visible by its virtual time; later REST snapshots,
+  fills, resolutions, and operator actions cannot leak backward;
+- original inter-arrival timing is replayable at 1x; controlled 5x/10x acceleration changes only
+  arrival pressure, not causal order;
+- deterministic golden records produce the same decision digest or fail with an explicit schema/
+  policy incompatibility.
+
+Raw JSON alone is insufficient if its framing, receive time, source sequence, loss boundary, and
+runtime/config context are absent. Conversely, logging every full-depth object is not justified if
+it harms execution; bounded raw frames and explicit gaps are scientifically superior to a recorder
+that silently delays the trader.
 
 ## Verified production constraint
 
@@ -217,6 +300,60 @@ Build one attribution "walking skeleton" immediately: one recorded signal must r
 same decision and produce the initial impact/latency decomposition. This prevents several days of
 collecting a fast but scientifically unusable dataset.
 
+### Source adverse selection and market impact
+
+The source trader's headline alpha is not automatically copyable. A whale may consume the cheap
+levels before the public fill becomes visible. The attribution model therefore separates:
+
+```text
+source information alpha
+- impact paid by the source while sweeping the book
+- residual post-source impact inherited by the copier
+- signal/publication delay
+- local parse/queue/risk delay
+- spread and fee drag
+- our own incremental impact
+- fill and exit mismatch
+- marginal capital shadow cost
+= realized/counterfactual copy alpha
+```
+
+The journal cannot honestly claim to reconstruct the book one microsecond before a whale unless a
+coherent pre-source book was actually observed. It stores the last causally available pre-source
+generation, its age/uncertainty, the first post-signal generation, and executable depth at bounded
+size tiers. Traders that routinely sweep multiple levels can be classified as operationally
+uncopyable even if their own PnL remains excellent.
+
+Rejected trades are essential but are computed without production observer damage: when resources
+permit, the minimal signal/book/gate marker is retained; full EV, Kelly, and alternative-fill
+counterfactuals run offline under the same historical policy/model version.
+
+## SDK facade and order-authority boundary
+
+The bot must not call a changing official SDK shape throughout strategy/risk code. It owns a small
+internal order interface such as `prepare_order`, `submit_order`, `cancel_owned_order`,
+`get_open_orders`, `get_recent_trades`, and `reconcile_positions`. A pinned official SDK adapter or
+direct REST adapter implements that facade. Schema/API changes are confined to the adapter and
+contract tests rather than spreading through risk and OMS logic.
+
+Initial SDK evaluation is read-only/shadow where possible: compare normalized market metadata,
+book, tick, order-construction bytes, rounding, and error semantics against the existing adapter.
+Private keys and live submission do not enter the market-data recorder or replay process. An
+official client being beta, archived, or replaced is an operational dependency event that requires
+an explicit version bump and golden-vector rerun, never an unattended upgrade.
+
+## Operator console as labeled boundary-condition data
+
+Telegram approval/rejection is a temporary human-in-the-loop control, not permanent execution
+alpha. Each action must record request ID, candidate/intent, model/rule/config version, evidence
+shown, decision, timestamp, operator identity, and a structured reason code plus optional note.
+
+The audit serves two purposes: preserve accountability for roster/capital changes and identify
+boundary conditions the automated scorer does not yet model. It must not silently train on its own
+past recommendations; later automation requires out-of-sample validation, class/selection-bias
+checks, and an explicit rule change. Emergency risk actions remain human-authorized even if routine
+candidate approval becomes automated.
+
 ## WebSocket/REST reconciliation boundary
 
 Shadow capture can start before a complete production WebSocket decision path, but it must label
@@ -237,6 +374,9 @@ estimation.
 1. Define the compact event envelope and the minimum copy-alpha fields above.
 2. **Implemented, feature-disabled:** one real polling source-signal -> BBO/VWAP -> hypothetical
    decision journal path using the current direct REST adapter and the same already-fetched book.
+   The path now includes actual-size entry and projected immediate liquidation, same-request fee
+   metadata, wallet/model context, event/category factor IDs, and an exact shadow gate trace.
+   Uncalibrated signal-age bounds and residual-alpha LCB remain explicitly unknown.
 3. Implement a minimal virtual-clock replay test for that one path before live collection.
 4. **Partial:** passive queue/scheduling age, book freshness, dropped-event, writer error, and
    entry-interlock signals exist. Add low-cadence recorder RSS/CPU and CPU-credit observability,
@@ -293,6 +433,397 @@ Bare metal and kernel bypass are not current assumptions. Public Internet/API la
 exchange's own matching/data path will usually dominate a few microseconds saved in the local
 kernel. Consider those techniques only if measurements show host networking is material and an
 exchange-proximate deployment opportunity actually exists.
+
+## Proposed process-isolated protocol — design record, not implemented
+
+This section records the 2026-08-06 engineering discussion so a future agent does not mistake a
+proposal for deployed protection. None of Processes M/J/S, the binary protocol, or the public WS
+path below exists in production yet.
+
+### Process ownership
+
+```text
+public WS -> Process M (C++ market data)
+                  |-> bounded decision-state stream -> Process T (Python strategy/risk/orders)
+                  `-> lock-free SPSC -> journal egress -> Process J (prefer separate host)
+
+Process S (risk supervisor) -> short-lived permission lease -> Process T
+```
+
+- **M is deterministic, not strategic.** It decodes the feed, maintains sequence/generation-aware
+  books, and publishes objective BBO/top-three/VWAP state. It never decides whether a move is
+  economically "material."
+- **T owns trading semantics.** Trader scoring, materiality, Kelly/risk sizing, entry/exit policy,
+  and authenticated CLOB order submission stay in Python until measurement proves a narrower hot
+  path must move.
+- **J is lossy before it is blocking.** Research capture may drop with an explicit sequence gap;
+  it may never backpressure M or T.
+- **S is not a synchronous per-order oracle.** T retains non-bypassable local hard limits and uses
+  a cached, expiring lease from S. Loss of S fails closed for new exposure without blindly
+  liquidating positions into an uncertain market.
+
+### Cross-platform transport and coalescing
+
+The first M -> T implementation uses Unix-domain `SOCK_STREAM`, not `SOCK_SEQPACKET`, because the
+same behavior is required on the macOS development host and Linux production host. Every frame is
+length-prefixed and includes at least magic, protocol version, message type, payload length,
+source epoch, sequence/generation, local monotonic publish time, flags, payload, and checksum.
+Readers and writers must handle partial I/O, reconnect epochs, maximum frame length, unknown
+versions, fixed byte order, and broken pipes explicitly.
+
+A socket is FIFO, not an overwriteable mailbox. M therefore uses **event-armed coalesced push**:
+the first relevant book change arms a one-shot timer; subsequent deltas update the in-memory latest
+state; expiry publishes one fixed-size snapshot and disarms until another change. There is no
+permanent 1 ms polling wake-up. The coalescing window is an operational, benchmarked config, not a
+strategy threshold.
+
+If T falls behind, M's non-blocking writer may have one partially written frame plus one latest
+pending frame. A partial stream frame must finish; only a not-yet-started pending state may be
+replaced by a newer state. Each frame reports first/last source sequence and coalesced update count,
+so T can halt on stale data and the journal can quantify lost resolution. A future shared-memory
+latest-state mailbox is evidence-gated, not assumed necessary.
+
+### Journal isolation
+
+Parser -> journal egress uses a preallocated, fixed-capacity lock-free SPSC ring with one actual
+producer and one consumer, acquire/release ordering, and cache-line-separated indices. No mutex,
+condition variable, heap allocation, compression, or network write occurs in the parser enqueue.
+If multiple producer threads are introduced later, each gets its own SPSC or the design must
+explicitly change; silently turning SPSC into MPSC is invalid.
+
+The egress owner handles TCP partial-write state and reconnects. Queue-full or oversize input drops
+a complete frame before enqueue and increments counters containing source sequence/time/byte ranges.
+The receiver also detects sequence gaps independently because a drop marker can itself be lost.
+
+### Risk lease and unavoidable TOCTOU
+
+Process S emits a lease containing risk epoch, strictly increasing lease sequence, monotonic expiry,
+allowed-action mask, exposure ceiling, risk-state hash, and config version. T checks it before
+strategy work and again inside the low-level transport adapter after order construction/signing and
+connection acquisition, immediately before giving bytes to the OS.
+
+No userspace design can eliminate the final scheduler race after the last check. Dispatch therefore
+requires more than `lease_remaining > 0`: remaining lease time must exceed a safety margin derived
+from measured p99.9 scheduling/transport delay. Risk-lease expiry, quote freshness, book generation,
+and alpha/dispatch deadline are separate gates. Once bytes have entered the kernel they cannot be
+reliably unsent merely because a lease expires.
+
+S restart begins halted and must reconcile positions, open orders, recent trades, book generation,
+and local reservations before issuing a fresh lease. Host-level failure additionally needs remote
+monitoring and bounded-lifetime order semantics; S on the same host cannot solve whole-host death.
+
+### Fixed-point contract
+
+Protocol v1 uses one canonical scale, not an arbitrary per-message exponent:
+
+```text
+price_e6, share_size_e6, usd_notional_e6, tick_size_e6
+```
+
+Decimal feed strings parse directly to integers without binary float. Price/tick alignment uses
+integer remainder; VWAP/notional multiplication uses `unsigned __int128` intermediates in C++ and
+defined directional rounding. Token IDs remain 256-bit values (or a generation-scoped catalog key),
+not `uint64`. A future venue precision beyond v1 is an explicit protocol upgrade; consumers reject
+unsupported precision instead of silently rounding.
+
+C++ and Python must pass the same golden vectors for decimal parsing, binary bytes, malformed
+frames, overflow, VWAP, tick alignment, and BUY/SELL rounding before integration. The order adapter
+constructs exact integer/rational maker/taker amounts; no float crosses the execution boundary.
+
+### Observer-safe opportunity and capital evidence
+
+Do not run the full Python EV/Kelly pipeline merely to log an opportunity that cannot be acted on.
+Use an early rejection boundary:
+
+1. Always preserve a compact raw source signal, BBO/book generation, receive order, gate state, and
+   `dropped_due_to_capital`/risk reason when the bounded journal is healthy.
+2. If free capital is zero or a hard/recoverable entry gate is closed, stop before CPU-heavy model,
+   Kelly, or counterfactual calculations.
+3. Reconstruct predicted gross/net EV and foregone EV later with deterministic offline replay and
+   the historically correct policy/model/config version.
+
+This deliberately trades immediate model output for exit-path safety and lower observer cost. Raw
+capture is still bounded/degradable; if even the minimum marker threatens execution integrity it is
+dropped with an auditable gap rather than delaying an exit.
+
+Capital history stores primitives, not a stale `capital_velocity` scalar: capital snapshots,
+candidate signals, reserve/increase/release/settle transitions, and actual release time. Capital
+velocity and shadow cost are derived offline. A flat APY may remain a funding-carry baseline after
+conversion to the actual holding horizon, but the full shadow cost depends on competing opportunity
+arrival, fill probability, holding-time distribution, correlation, risk limits, and marginal
+liquidity value.
+
+### Ambiguous order state and reconciliation
+
+Reservation state includes at least:
+
+```text
+reserved -> submitted -> filled | rejected | cancelled
+                     `-> orphaned -> reconciled_filled | reconciled_released
+```
+
+An HTTP timeout means **unknown**, not rejected. The corresponding capital remains frozen and
+high-risk; releasing it early can double-spend the risk budget. `holding_time_p90` describes a
+position hypothesis and must not decide order finality. A separate low-cadence reconciliation loop,
+owned by S or an order supervisor, performs idempotent authenticated queries of order ID/client
+intent ID, recent trades, open orders, balances, and positions. Only corroborated venue state emits
+the reconciled transition. Persistent ambiguity keeps entries halted and alerts the operator while
+exits remain available subject to trustworthy position/book state.
+
+### Honest latency names
+
+Python can reliably compare timestamps only within its own monotonic clock domain. Record:
+
+- userspace dispatch preparation start;
+- connection-pool/TLS/request-library spans where exposed;
+- call into socket/TLS write and return from that call;
+- response first byte/complete and total local monotonic RTT;
+- exchange match wall time as a separate reconciliation fact with clock-source/uncertainty.
+
+Do not name `socket.send()` return `kernel_handoff` or NIC transmit: it proves only userspace
+acceptance into the socket/TLS path. Do not subtract exchange wall time from local monotonic time.
+Optional Linux `SO_TIMESTAMPING` or eBPF instrumentation can later estimate kernel/network spans,
+but it is not necessary for the first scientifically honest attribution report.
+
+Finally, CLOB order matching is off-chain and settlement follows on-chain. User-selected Polygon
+priority fee is not assumed to drive FOK/FAK fill probability. Gas/base-fee observations are tagged
+by execution path and used for settlement/RPC/relayer attribution only when causally applicable.
+
+## Execution uncertainty and paper-validation consensus — 2026-08-06
+
+Status: architecture/research decision only. The toxicity analytics, settlement-finality ledger,
+depth-survival model, multi-scenario paper report, and micro-live calibration stage below are not
+implemented or production-active. Copy Bot remains paper-only.
+
+This section records the conclusions jointly accepted after reviewing off-chain matching priority,
+provisional on-chain settlement, and disappearing L2 liquidity. It deliberately separates measured
+risk from allegations that the available data cannot establish.
+
+### Off-chain priority and order-toxicity evidence
+
+The CLOB operator validates and matches orders off-chain, so public market data cannot reveal the
+operator's complete internal arrival order or guarantee that our hypothetical order would have won
+simultaneous liquidity. This is an execution-priority/latency uncertainty, not automatically
+on-chain MEV. We have no evidence of operator front-running, a VIP tier, or spoofing, and a FOK
+reject followed by an adverse move does not prove any of them.
+
+A signed FOK limit order remains price-bounded: insufficient eligible liquidity should reject the
+whole order rather than permit an arbitrary worse execution. The research problem is whether our
+orders would fill at all and whether the fills available to us are adversely selected.
+
+The future analytics owner (Q/J or another research process, not the synchronous risk supervisor)
+must classify venue and local outcomes before estimating toxicity:
+
+- FOK insufficient-liquidity reject;
+- tick/price validation, balance, allowance, rate-limit, order-delay, or server reject;
+- local risk/lease/freshness reject; and
+- timeout or unknown finality, which is never silently relabeled rejected.
+
+For genuine liquidity-race observations, record side-adjusted post-outcome markouts at 10, 50,
+100, 250, 500, and 1,000 ms, requested size, arrival-book generation/depth, quote age, system
+pressure, local latency, market type, time-to-resolution, and volatility regime. Compare rejected
+orders against comparable signals for which no order was submitted; without this control group,
+ordinary signal selection and fast markets can look like reject-induced toxicity.
+
+Process S consumes only a versioned, expiring toxicity state. It does not fit the model. Automatic
+handling is graduated and reversible:
+
+```text
+NORMAL -> REDUCE_SIZE -> SHADOW_ONLY -> TEMP_QUARANTINE
+```
+
+A market requires a minimum sample, uncertainty/confidence bounds, hysteresis, TTL, and controlled
+shadow re-entry. A small sample never creates a permanent blacklist. Permanent exclusion requires
+review and evidence, not a label such as `spoofer` inferred from price movement alone.
+
+### Matched economic exposure versus settled finality
+
+`MATCHED` is a non-terminal trade state. The accepted model follows the venue lifecycle:
+
+```text
+RESERVED -> SUBMITTED -> MATCHED_PROVISIONAL -> MINED_PROVISIONAL -> CONFIRMED_SETTLED
+                               |                      |
+                               `------> RETRYING <---'
+                                           |
+                                           `-> CONFIRMED_SETTLED | FAILED_REVERSED
+```
+
+The authenticated user WebSocket is the primary low-latency lifecycle feed, authenticated CLOB
+REST queries provide idempotent reconciliation, and Polygon RPC receipts/block evidence provide an
+independent audit. RPC is corroboration rather than a replacement for the venue lifecycle. The
+system must not invent a contradictory confirmation rule without first specifying how it maps to
+the venue's `CONFIRMED`, `RETRYING`, and `FAILED` states.
+
+Risk and accounting use two simultaneous views:
+
+1. **Economic exposure:** from `MATCHED`, reserve capital and count the full worst-case position,
+   concentration, and loss exposure.
+2. **Settlement finality:** only `CONFIRMED` moves the final ledger to settled. `RETRYING` remains
+   frozen and high-risk; `FAILED` produces an append-only reversal/reconciliation event.
+
+"Settlement discount" must never reduce exposure and release buying power. It is a valuation
+haircut/risk surcharge and confidence flag while the capital remains unavailable. Any exit or hedge
+that assumes provisional inventory is sellable must first pass the venue balance/allowance and
+order-state gates; ambiguity halts related new exposure and alerts the operator.
+
+Paper replay must model provisional duration, `RETRYING`, and `FAILED` through empirical scenarios
+and fault injection. A simulated order does not become a real chain observation merely because the
+replay assigns it a settlement path.
+
+### Raw depth, surviving depth, and fill probability
+
+M preserves objective bounded L2, sequence/generation, quality flags, and level-change evidence.
+Liquidity-reward eligibility or short quote life is not, by itself, proof that a quote is fake.
+Strategy/research code—not M and not the synchronous risk supervisor—estimates usable liquidity.
+
+A fixed rule such as "quotes younger than 500 ms count 10%" may be a stress scenario but is not the
+canonical model. The required quantity is nonlinear:
+
+```text
+P(cumulative eligible depth surviving until hypothetical arrival >= requested size
+  | market, side, level age, distance to touch, size, volatility,
+    spread, time to resolution, update/cancel history, and system latency)
+```
+
+FOK uses the probability that the entire requested size survives and is eligible at arrival. FAK
+uses a fill-size distribution. A resting maker order uses conservative queue-ahead consumption and
+must not count touch as a fill. Cancel-versus-trade attribution remains uncertain unless public
+book changes are reconciled with the trade feed. Model versions and calibration samples travel
+with every derived result.
+
+### Paper PnL is a bounded estimate, not an asserted fill history
+
+Every hypothetical decision freezes its causal inputs and assumptions: decision and simulated
+arrival times, latency scenario, book generation, raw depth, quote/level age, fee policy,
+depth-survival model version, fill probability, and data-quality/coverage state. Later information
+may label the outcome but may not leak back into the decision.
+
+The report produces at least four separate scenarios:
+
+| Scenario | Fill assumption | Reporting use |
+| --- | --- | --- |
+| Optimistic upper bound | visible decision-time depth survives | diagnostic ceiling only |
+| Latency-adjusted | book observable at simulated order arrival | baseline comparison |
+| Persistence-qualified | only depth surviving the reaction/arrival window is eligible | primary conservative paper result |
+| Stress | worse latency quantile, depth haircut, fees, rejects, outages, and settlement failures | scale/readiness gate |
+
+The optimistic result is never the headline. For a hypothetical taker FOK, there is no maker-style
+"we are first in queue" assumption: replay requires sufficient eligible depth at simulated arrival.
+Even then, public data cannot identify the operator's exact internal priority, so the result is a
+calibrated probability or an upper/lower bound rather than a deterministic fill.
+
+```text
+expected_net_pnl
+  = P(fill | market, size, latency, regime) * net_pnl_if_filled
+    - settlement_failure_cost
+    - measured execution/risk costs
+```
+
+Rejected/no-submit opportunities, local gate rejects, journal gaps, and missing high-volatility
+windows remain in the denominator and coverage report. If the apparent profit is concentrated in
+periods without adequate critical-data coverage, no positive strategy claim is allowed.
+
+Calibration and evaluation use different time/market samples with walk-forward testing. Required
+evidence includes fill-probability calibration (reliability/Brier or log loss), confidence bounds,
+net EV after fees and observable friction, drawdown/concentration, and stress at larger latency,
+depth haircuts, 429/API outage, WS resync, system pressure, and settlement retry/failure regimes.
+
+### Scale gate
+
+Paper mode can reject a strategy but cannot by itself prove execution alpha, operator priority, or
+exact live fill probability. After conservative paper evidence is positive, a separately approved
+micro-live canary stage—with minimum notional, strict order/daily loss caps, and no automatic
+scaling—must compare actual accepts/rejects, fills, markouts, and settlement transitions with the
+paper model's predicted intervals. Capital and AWS capacity increase only after that agreement is
+demonstrated. Until explicit approval of that later stage, no live order or private-key custody is
+authorized by this decision record.
+
+Current official lifecycle references used for this decision:
+
+- <https://docs.polymarket.com/concepts/order-lifecycle>
+- <https://docs.polymarket.com/trading/orders/overview>
+- <https://docs.polymarket.com/market-data/websocket/user-channel>
+- <https://docs.polymarket.com/market-makers/liquidity-rewards>
+
+## Phase 0 soak implementation — 2026-08-06
+
+Status at this checkpoint: implemented and locally network-sanity-tested; paper/read-only. The AWS
+service is deployed only when the later handoff entry explicitly records its commit and service
+state. This section distinguishes implemented evidence from future inference.
+
+### Distinct fills and incremental conviction
+
+Production Copy Bot dedup is unchanged. The research recorder uses an isolated fill surrogate over
+the Data API identity plus price and cash notional because the public activity response does not
+document a unique fill ID. Only an identical research fill surrogate is idempotent. Separate fills
+from the same wallet, market, outcome, and side remain separate observations and update
+`wallet_recent_trade_count_1h` and recent notional. Repeated scaling-in is therefore evidence of
+conviction rather than an accidental duplicate.
+
+This is still an observation, not an automatic size multiplier. A one-hour feature collected for
+less than one hour is explicitly marked window-incomplete, and restart restoration rebuilds it only
+from retained journal history.
+
+### SELL lifecycle and conservative tax lots
+
+Each `$3/$5/$10` shadow tier stores individual entry lots, never one blended aggregate cost basis.
+The default replay policy is `worst_execution_first`; deterministic FIFO and LIFO alternatives are
+available for sensitivity analysis. A source SELL first computes the reduction fraction of the
+source inventory observed by this recorder, then applies only that fraction to shadow lots the bot
+actually acquired. A SELL with no observed source inventory or no shadow lots produces no realized
+PnL. Unfilled bid-side quantity is never treated as sold.
+
+Source token quantity prefers the untouched Data API `size` field. `usdcSize / price` is only a
+labeled fallback because the cash field can include fee effects and would distort the partial-SELL
+ratio. Every lifecycle event records `source_share_basis`, lot IDs, shares closed, cost basis closed,
+executable bid proceeds, and realized PnL. Open lots remain unrealized; source and shadow books are
+not mixed.
+
+### Honest signal and book time
+
+The append-only parent `wallet_signal_ingress` is written before any REST enrichment. The decision
+book is the public-WS state already known at that monotonic ingress instant. A book received after
+ingress, a stale locally received book, or no warmed book cannot be back-dated as T0 and causes the
+shadow lifecycle to skip. REST supplies fee/event metadata and its own latency only; its later book
+is not presented as the signal-time book.
+
+T+100 ms and T+500 ms tasks are armed immediately from the same local monotonic ingress deadline.
+Every observation stores target time, actual capture time, lateness, reconnect epoch, local
+generation, server timestamp/hash when supplied, and whether the latest captured generation was
+already known by the target deadline. The comparison is against the target, not the delayed callback
+time. If Python/GIL/host scheduling wakes the task late, that lateness remains visible rather than
+silently shifting the simulated arrival.
+
+The public market WS payload used here does not provide an exchange sequence ID compatible with the
+wallet activity stream. `exchange_sequence_id` is therefore explicitly null. Local generation and
+reconnect epoch prevent accidental reuse across a reconnect but do not prove blockchain-to-book
+causality. Offline replay may use conservative timing intervals or exclude ambiguous samples; it
+must not invent a causal join.
+
+Likewise, `first_local_seen - source reported timestamp` is stored only as
+`reported_visibility_lag_ms` with status `source_timestamp_semantics_not_documented`. It is useful
+for wallet/market cohort comparison but cannot, by itself, prove private RPC use, MEV routing, or the
+true off-chain match age and cannot automatically quarantine a wallet.
+
+### Resource and operational boundary
+
+The service polls the current tracked/challenger/retiring roster at a low cadence, bootstraps only
+one Data API page per wallet, subscribes to a bounded asset LRU, keeps full L2 only in memory, and
+writes signal-sized top-ten JSONL. It owns no key and has `order_capability=false`. Production
+bootstrap records zero historical samples; the optional sample/warm-up flags exist only for an
+explicit local sanity run.
+
+The Linux service contract adds a 768 MB address-space limit, systemd `MemoryMax=1G`, 50% CPU quota,
+low CPU/I/O priority, protected system paths, and one writable data directory. This limits research
+damage on the current `t3.small`; it does not prove burst safety. The streaming inspector reports
+malformed lines, file size, poll gaps/errors, delayed-book availability/lateness, reconnects,
+quality flags, sides, visibility-lag proxy, and realized shadow PnL without loading the journal into
+memory.
+
+Local live-public-data sanity (`bootstrap_sample_count=1`, warm-up only) observed one warmed asset,
+one source SELL, no poll error, both delayed books available, T+100 capture lateness 0.860 ms, T+500
+lateness 1.239 ms, and a signal-time WS book age of 8.574 ms. This validates plumbing only. It is not
+strategy evidence, a PnL claim, or permission to trade.
 
 ## Non-goals for the first release
 

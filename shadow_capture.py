@@ -10,6 +10,7 @@ path.
 from dataclasses import asdict, dataclass
 import json
 
+from phase0_attribution import build_phase0_attribution
 from shadow_replay import VWAP_TIERS_USD, build_rest_book_checkpoint, build_source_signal_envelope
 
 
@@ -26,7 +27,7 @@ def _fallback_raw_payload(trade):
 
 def build_passive_shadow_event(trade, book, copy_size_usd, measurement,
                                entry_interlock_active, decision_timestamp_ms,
-                               decision_monotonic_ns):
+                               decision_monotonic_ns, strategy_context=None):
     """Return one replayable source_trade_signal EventEnvelope."""
     book = book or {}
     quality_flags = set(measurement.quality_flags)
@@ -80,6 +81,9 @@ def build_passive_shadow_event(trade, book, copy_size_usd, measurement,
         "raw_payload_format": raw_payload_format,
         "entry_interlock_active": bool(entry_interlock_active),
         "passive_integrity": asdict(measurement),
+        "phase0_attribution": build_phase0_attribution(
+            trade, book, copy_size_usd, strategy_context=strategy_context
+        ),
     }
     return build_source_signal_envelope(
         event_id=str(trade.get("trade_id") or f"shadow-{signal_received_monotonic_ns}"),
@@ -112,6 +116,7 @@ class PassiveShadowCapture:
     entry_interlock_active: bool
     decision_timestamp_ms: int
     decision_monotonic_ns: int
+    strategy_context: dict | None = None
 
     def materialize_event(self):
         return build_passive_shadow_event(
@@ -122,12 +127,13 @@ class PassiveShadowCapture:
             self.entry_interlock_active,
             self.decision_timestamp_ms,
             self.decision_monotonic_ns,
+            self.strategy_context,
         )
 
 
 def build_passive_shadow_capture(trade, book, copy_size_usd, measurement,
                                  entry_interlock_active, decision_timestamp_ms,
-                                 decision_monotonic_ns):
+                                 decision_monotonic_ns, strategy_context=None):
     """Create the O(1) queue item; do not normalize or serialize here."""
     return PassiveShadowCapture(
         trade=trade,
@@ -137,4 +143,5 @@ def build_passive_shadow_capture(trade, book, copy_size_usd, measurement,
         entry_interlock_active=bool(entry_interlock_active),
         decision_timestamp_ms=int(decision_timestamp_ms),
         decision_monotonic_ns=int(decision_monotonic_ns),
+        strategy_context=strategy_context,
     )
