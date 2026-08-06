@@ -7,7 +7,7 @@
 > cap, mute, promotion, HWM, or drawdown figure. The external review's exact local figures are not
 > AWS truth; use the verified causal-classifier figures below.
 >
-> **Last live verification:** 2026-08-07 01:44 HKT. Read `CLAUDE_HANDOFF.md` for the exact AWS
+> **Last live verification:** 2026-08-07 02:19 HKT. Read `CLAUDE_HANDOFF.md` for the exact AWS
 > evidence, P0 replay fix, restart gate, and open operational risks.
 
 ## Repository scope
@@ -45,6 +45,21 @@ authority for fresh/current databases.
 - **P0 integrity isolation deployed:** AWS has 455 rows marked by classifier
   `paper-ledger-integrity-v1`; manifest SHA-256 starts `75755957`. No rows or PnL were deleted or
   rebased, and zero open positions matched the classifier.
+- **Factual resolution audit and v2 isolation:** Gamma `closedTime`/`umaEndDate` auditing of all
+  186 v1-clean rows produced 155 legit, 31 factual phantom, and zero unknown. All 23 residual
+  sub-ten-minute `resolved` rows were factual phantom, but duration remains a screen rather than
+  the classifier; eight additional factual phantom rows closed through `source_sell`. AWS marked
+  those 31 rows with `paper-ledger-resolution-facts-v2` under manifest SHA-256
+  `a2b4c7c20cd16aaa70092402a72d51b4886c9f57f8491d1458574f4f210dd820`. No raw row or PnL was
+  deleted/rebased and HWM was not changed.
+- **Current fact-clean row ledger:** 155 closes, `$865.51` cost, `-$78.50`, `-9.07%` ROI, 45.16%
+  win rate. This is not yet canonical economic PnL: `pnl_snapshot`/event-ledger realized PnL and
+  final-row PnL differ by about `$76.62`, probably because partial closes are represented
+  differently. Event-level reconciliation is the next P0 gate.
+- **Uncertainty:** 10,000-draw all-row trade bootstrap gives cost-weighted ROI 95% CI
+  `[-19.90%, +1.90%]`; wallet-cluster bootstrap gives `[-35.42%, -1.30%]` with effective wallet
+  N=10. Current-eligible rows are 101 trades across only six effective wallets and their
+  wallet-cluster ROI CI is `[-52.56%, +3.53%]`. Do not change the roster from this sample.
 - **Open book at verification:** 52 clean/unclassified positions; all 52 received a fresh mark at
   2026-08-07 01:44 HKT. This is markability evidence, not strategy profitability.
 - **Risk state:** contaminated HWM `$2,173.60` was removed after backup and classification; the
@@ -67,9 +82,11 @@ authority for fresh/current databases.
    from wallet EV/ranking, rolling evidence, dashboards, open-state loading, and clean PnL readers.
    Existing mute/status decisions were deliberately not auto-reversed; review them manually from
    clean evidence.
-6. `pnl_snapshot` still had zero rows after the first migrated TTP/HWM cycle. Snapshot activation
-   remains an operational gap even though all 52 open positions marked and post-restart errors were
-   zero.
+6. `pnl_snapshot` is no longer empty: 22 rows were present at 02:17 HKT (11 portfolio and 11
+   clean-epoch). The writer was delayed, not absent: repeated full scans of the multi-million-row
+   event log make the Paper loop enter long I/O waits. Commit `3315698` removes one duplicate scan,
+   but the running PID has not been restarted onto that code and canonical event/row reconciliation
+   remains pending.
 
 ## 2026-08-05 repository separation
 

@@ -46,11 +46,12 @@ potentially contaminating wallet EV caps, circuit breakers, category ranking, pr
 equity HWM. Read
 `docs/research/PAPER_LEDGER_INTEGRITY_INCIDENT_2026-08-07.md` before taking any economic action.
 
-Codex has now independently reproduced the core failure read-only on AWS. At approximately 00:37
-HKT the authoritative row ledger had 641 normal closes / raw `+$620.40`; causal v1 identified 455
-high-confidence replay/post-event candidates carrying `+$669.00`, leaving 186 rows / `-$48.60` /
-`-4.60%` ROI. The reviewer's 127 / `-$59.86` was a local, blanket-duration decomposition and must
-not replace the AWS causal result. Do not quote any old positive total as demonstrated alpha.
+Codex has now independently reproduced and factually extended the failure on AWS. The authoritative
+row ledger had 641 normal closes / raw `+$620.40`; causal v1 identified 455 candidates carrying
+`+$669.00`. A Gamma resolution-time audit of all 186 remaining rows then classified 31 more as
+factual phantom, 155 legit, and zero unknown. The fact-clean row ledger is now 155 rows /
+`-$78.50` / `-9.07%` ROI. Do not quote any old positive total as demonstrated alpha, and do not
+call `-$78.50` canonical until partial-close event reconciliation is complete.
 
 Immediate operator rules:
 
@@ -61,6 +62,18 @@ Immediate operator rules:
 - deploy the tested mark-only isolation only after DB backup, migration dry-run, manifest match,
   and a controlled Paper restart; and
 - repair TTP observability and exit coverage before strategy expansion.
+
+Evidence gates completed on 2026-08-07:
+
+- 52/52 open positions belonged to markets still active; zero open resolution verdicts were
+  unknown or already closed.
+- The 31-row v2 manifest SHA-256 is
+  `a2b4c7c20cd16aaa70092402a72d51b4886c9f57f8491d1458574f4f210dd820`; v2 only marked metadata,
+  deleted zero rows, changed no historical PnL, and did not alter HWM.
+- All-row wallet-clustered ROI CI is negative on this snapshot, but current-eligible clustered CI
+  crosses zero and effective wallet N is only six. No trader replacement is authorized.
+- `pnl_snapshot` has started writing (22 rows by 02:17 HKT), but event-ledger realized `+$28.02`
+  and row-ledger realized totals do not reconcile. This is now the first P0 investigation.
 
 The 2026-08-07 P0 incident queue at the top of `docs/TODO_2026-08-06.md` supersedes older feature
 priorities until the forensic and feedback-isolation gates pass.
@@ -392,6 +405,33 @@ priorities until the forensic and feedback-isolation gates pass.
      sizing claim.
 
 ## Change log
+
+### 2026-08-07 02:19 HKT — Factual resolution audit and v2 isolation
+
+1. **When:** 2026-08-07 01:45–02:19 HKT.
+2. **Files adjusted:**
+   - `audit_resolution_timing.py` and `polymarket_simulator.py` — factual Gamma resolution-time
+     capture with explicit `phantom / legit / unknown` verdicts.
+   - `analyze_clean_cohort.py` — separate equal-weight and cost-weighted estimators plus deterministic
+     trade and wallet-cluster bootstraps; can filter by a reviewed resolution audit.
+   - `apply_resolution_audit.py` — dry-run-first, exact-SHA-gated, mark-only v2 application.
+   - `audit_paper_ledger.py`, `bot.py`, and associated tests — permanent residual screen and removal
+     of one duplicate full event-log scan per snapshot cycle.
+   - `docs/CURRENT_STATE.md`, `docs/TODO_2026-08-06.md`, this handoff, and the incident review —
+     recorded the factual cohort and new event/row reconciliation blocker.
+3. **What changed:**
+   - Factual audit classified 31 of 186 v1-clean rows as post-resolution entries; all 23 fast
+     resolved residuals were confirmed, plus eight `source_sell` rows. Unknown count was zero.
+   - v2 marked exactly 31 rows under SHA `a2b4c7…dd820`; zero rows/PnL were deleted or rewritten and
+     HWM remained `$1,112.60`.
+   - Fact-clean row ledger is 155 / `-$78.50` / `-9.07%`. Current eligible evidence has only six
+     effective wallets and a clustered CI crossing zero, so no roster change was made.
+   - The open-book audit found all 52 markets active. `pnl_snapshot` now has 22 rows, disproving the
+     earlier “writer absent” hypothesis, but exposed an approximately `$76.62` event-versus-row
+     realized-PnL mismatch. Event-level reconciliation is now P0.
+   - Local full suite: 804 passed, 2 skipped. Commits `3315698`, `52c9d31`, and `cb8e366` were pushed
+     to GitHub and fast-forwarded on AWS. The existing Paper PID was deliberately not restarted;
+     it still has the earlier loaded code while the autodeploy lock remains present.
 
 ### 2026-08-07 — P0 Paper-ledger isolation deployed to AWS
 

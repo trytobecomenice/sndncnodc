@@ -16,6 +16,31 @@ Read with:
 
 ## 1. Executive conclusion and immediate decision
 
+### 2026-08-07 factual resolution update
+
+The causal v1 classifier was intentionally conservative and left 186 rows unmarked. A subsequent
+read-only audit fetched Gamma `closedTime`, falling back to `umaEndDate`, for all 108 markets in
+that remainder and compared the factual resolution timestamp with each Paper `opened_at`:
+
+```text
+legit:                         155 rows, -$78.501554
+factual phantom:               31 rows, +$29.902547
+unknown:                        0 rows
+fact-clean cost / ROI:   $865.514749 / -9.0699%
+```
+
+All 23 residual `resolved` rows held under ten minutes were factual phantom, but holding time was
+not used as the classifier. Eight more factual phantom rows closed through `source_sell`, proving
+that a duration/resolution-reason screen alone is incomplete. Classifier v2 marked the 31 rows
+without deleting or rebasing data; manifest SHA-256 is
+`a2b4c7c20cd16aaa70092402a72d51b4886c9f57f8491d1458574f4f210dd820`.
+
+The fact-clean row total is still not canonical economic PnL. Periodic snapshots calculate
+realized PnL from event-log close events, including partial closes, and currently differ from the
+final-row ledger by about `$76.62`. The next P0 gate is event-by-event reconciliation and factual
+allocation of phantom partial-close events; do not hand-subtract this difference or reseed HWM
+again before that work is complete.
+
 An external quant review alleges that a large part of historical Paper PnL came from stale/replayed
 source trades entering markets whose outcomes were already known, followed by near-immediate
 `resolved` closes. If reproducible, this is look-ahead/fill-simulation contamination rather than
