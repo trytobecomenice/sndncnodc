@@ -37,6 +37,20 @@ The cohort tab separates realized SELL-paired PnL from open committed cost basis
 lots are never silently excluded, but they also receive no invented point-in-time MtM. The aging
 warning threshold and US-hours reporting stratum are UI parameters, not trading gates.
 
+## One-click 24-hour post-mortem
+
+```bash
+.venv-research/bin/python research/generate_24h_postmortem_report.py \
+  data/phase0_soak_v1.jsonl --output-dir data/phase0-postmortem
+```
+
+The command fails closed when the observed journal span is under 24 hours. `--allow-incomplete` is
+for mock/preliminary pipeline checks only. It generates normalized CSV, optional Parquet/Plotly
+artifacts, displayed `$3/$5` fill-survival and markout evidence, source-exit-aligned realized PnL,
+and tax-lot cost/age distributions. T-1s/T+5m utility, MTBT, Brier, and log-loss remain explicitly
+unavailable until their required causal checkpoints, per-message arrivals, probabilities, and
+resolved outcomes exist.
+
 ## Virtual displayed CLOB
 
 ```bash

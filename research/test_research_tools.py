@@ -24,6 +24,7 @@ from research.virtual_matching_engine import (
     simulate_cash_buy, simulate_journals, simulate_share_sell,
 )
 from research.validate_matching_engine import validate_cases
+from research.generate_24h_postmortem_report import generate_report
 
 
 class TestHostileAutopsy(unittest.TestCase):
@@ -305,6 +306,60 @@ class TestMatchingValidation(unittest.TestCase):
             },
         }])
         self.assertEqual(report["status"], "PASS")
+
+
+class TestPostmortemReport(unittest.TestCase):
+    def test_mock_report_is_explicit_about_missing_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "hostile.jsonl"
+            write_hostile_journal(journal)
+            report = generate_report(
+                [journal], Path(tmp) / "report", required_hours=24,
+                allow_incomplete=True, write_plot=False,
+            )
+        self.assertEqual(report["status"], "PRELIMINARY_INCOMPLETE_WINDOW")
+        self.assertEqual(
+            report["capabilities"]["brier_and_log_loss"]["status"], "UNAVAILABLE"
+        )
+        utility = report["capabilities"]["economic_utility_t_minus_1s_to_t_plus_5m"]
+        self.assertEqual(utility["status"], "UNAVAILABLE")
+        self.assertEqual(utility["missing_required_checkpoints_ms"], [-1000, 300000])
+        self.assertEqual(
+            {item["tier_usd"] for item in report["s3_s5_displayed_fill_survival_and_markout"]},
+            {3, 5},
+        )
+        self.assertEqual(
+            {item["side"] for item in report["s3_s5_displayed_fill_survival_and_markout"]},
+            {"BUY", "SELL"},
+        )
+
+    def test_incomplete_window_fails_closed_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "hostile.jsonl"
+            write_hostile_journal(journal)
+            report = generate_report(
+                [journal], Path(tmp) / "report", required_hours=24,
+                write_plot=False,
+            )
+        self.assertEqual(report["status"], "FAIL_CLOSED_INCOMPLETE_WINDOW")
+
+    def test_mock_24h_window_becomes_ready_without_inventing_metrics(self):
+        base_ms = 1_800_000_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "hostile.jsonl"
+            write_hostile_journal(journal, base_timestamp_ms=base_ms)
+            with journal.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "event_type": "poll_cycle",
+                    "timestamp_ms": base_ms + 24 * 3_600_000 + 1,
+                }) + "\n")
+            report = generate_report(
+                [journal], Path(tmp) / "report", required_hours=24,
+                write_plot=False,
+            )
+        self.assertEqual(report["status"], "READY_FOR_REVIEW")
+        self.assertTrue(report["window_audit"]["window_complete"])
+        self.assertEqual(report["capabilities"]["mtbt"]["status"], "UNAVAILABLE")
 
 
 if __name__ == "__main__":
