@@ -47,7 +47,8 @@ class TestSeenTradePerWalletCap(unittest.TestCase):
             "buy_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, opened_at INTEGER, "
             "closed_at INTEGER, close_reason TEXT, realized_pnl_usd REAL, "
             "peak_profit_pct REAL NOT NULL DEFAULT 0, last_priced_at INTEGER, "
-            "decision_journal_id TEXT, is_demo_data INTEGER NOT NULL DEFAULT 0)"
+            "decision_journal_id TEXT, is_demo_data INTEGER NOT NULL DEFAULT 0, "
+            "is_phantom INTEGER NOT NULL DEFAULT 0)"
         )
         conn.execute(
             "CREATE TABLE wallet_profile (id TEXT PRIMARY KEY, wallet_address TEXT NOT NULL UNIQUE, "
@@ -118,6 +119,41 @@ class TestSeenTradePerWalletCap(unittest.TestCase):
         largest_poll = (config.DIRECT_API_PER_WALLET_LIMIT
                         * polymarket_data_api.MAX_PAGES_PER_FETCH)
         self.assertGreaterEqual(config.SEEN_TRADE_IDS_PER_WALLET_CAP, largest_poll)
+
+    def test_integrity_schema_rebuilds_performance_without_all_phantom_wallets(self):
+        conn = sqlite3.connect(self.tmp_path)
+        conn.execute(
+            "INSERT INTO wallet_profile VALUES "
+            "('w1','0xphantom','p','[9.9]',0,0,NULL,NULL,1,1),"
+            "('w2','0xclean','c','[8.8]',0,0,NULL,NULL,1,1)"
+        )
+        row = (
+            "p", "bot_filtered", "0xphantom", "m1", "Yes", 10.0, 10.0,
+            10.0, 1.0, "closed", 100, 100.0, 1,
+        )
+        conn.execute(
+            "INSERT INTO paper_trade "
+            "(id,strategy,wallet_address,market_slug,outcome,our_size_usd,cost_basis_usd,"
+            "our_shares,avg_entry_price,status,closed_at,realized_pnl_usd,is_phantom) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", row,
+        )
+        clean_row = list(row)
+        clean_row[0] = "c"
+        clean_row[2] = "0xclean"
+        clean_row[-2] = -2.0
+        clean_row[-1] = 0
+        conn.execute(
+            "INSERT INTO paper_trade "
+            "(id,strategy,wallet_address,market_slug,outcome,our_size_usd,cost_basis_usd,"
+            "our_shares,avg_entry_price,status,closed_at,realized_pnl_usd,is_phantom) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", clean_row,
+        )
+        conn.commit()
+        conn.close()
+
+        performance = db.load_state()["trader_performance"]
+        self.assertNotIn("0xphantom", performance)
+        self.assertEqual(performance["0xclean"]["recent_returns"], [-0.2])
 
 
 if __name__ == "__main__":

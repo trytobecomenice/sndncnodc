@@ -1,10 +1,11 @@
 # Current State — Copy Bot Only
 
 > **Economic-integrity alert — 2026-08-07:** historical Paper PnL is quarantined after an external
-> review identified likely post-event/replayed-trade phantom profits. Read
+> review identified post-event/replayed-trade phantom profits and Codex independently reproduced
+> the core finding against the authoritative AWS database read-only. Read
 > `docs/research/PAPER_LEDGER_INTEGRITY_INCIDENT_2026-08-07.md` before using any PnL, wallet rank,
-> cap, mute, promotion, HWM, or drawdown figure. The exact clean totals remain pending independent
-> AWS reproduction.
+> cap, mute, promotion, HWM, or drawdown figure. The external review's exact local figures are not
+> AWS truth; use the verified causal-classifier figures below.
 >
 > **Last live verification:** 2026-08-05 03:50 HKT. Read `CLAUDE_HANDOFF.md` for the exact AWS
 > evidence, P0 replay fix, restart gate, and open operational risks.
@@ -27,11 +28,20 @@ authority for fresh/current databases.
   `/home/ubuntu/polymarket-copybot`.
 - **Roster:** 17 tracked wallets, 5 circuit-breaker muted, 12 eligible for normal copying at the
   last live check.
-- **Normal Copy Bot raw ledger:** 634 closed positions with reported realized PnL `+$639.74`; this
-  is a historical database total, **not trusted economic PnL or demonstrated alpha** pending the
-  2026-08-07 phantom-trade reproduction. An external review separately reported a local raw sample
-  of 457 closes / `+$519.16` and a candidate clean result of 127 closes / `-$59.86`; neither local
-  scope nor candidate clean total may replace an authoritative AWS recomputation.
+- **Authoritative AWS read-only reproduction (2026-08-07 about 00:37 HKT):** 641 closed normal
+  Copy Bot rows, `$4,332.84` cost, raw row-ledger PnL `+$620.40`. A versioned causal classifier
+  identifies 455 high-confidence replay/post-event candidates carrying `+$669.00`; the 186-row
+  candidate-clean remainder is `-$48.60`, `-4.60%` ROI, 48.39% win rate. This disproves the old
+  profit claim but remains a forensic classification, not demonstrated live alpha.
+- **External/local scope remains separate:** the reviewer's laptop sample was 457 closes /
+  `+$519.16`; its 127 / `-$59.86` result came from treating all 330 sub-ten-minute closes as bad.
+  We confirmed the raw local total but rejected holding time alone as ground truth. The causal
+  classifier on that same local DB flags 316 rows / `+$524.59`, leaving 141 / `-$5.43` /
+  `-0.75%` ROI.
+- **Post-stale-guard AWS cohort:** 65 closes, `$385.85` cost, `-$33.06`, `-8.57%` ROI. The external
+  claim of 14 / `-$40.74` was a different snapshot and is not current AWS truth.
+- **AWS equity HWM:** `$2,173.60` at the read-only check, not the reviewer's older/local
+  `$1,853.36`; it remains quarantined because historical phantom PnL fed the ratchet.
 - **Open book at the earlier live check:** 56 positions with `$356.26` recorded cost basis. The
   markability statement below describes that point-in-time operational check, not clean strategy
   profitability.
@@ -52,9 +62,10 @@ authority for fresh/current databases.
    Copy Bot exposure and PnL.
 4. Historical PnL can remain concentrated in a small number of wallets even when the roster count
    appears diversified.
-5. Historical Paper PnL, wallet EV/ranking, circuit-breaker outcomes, and equity HWM may be
-   contaminated by replayed/post-event phantom positions. Treat all downstream economic decisions
-   as quarantined until the 2026-08-07 incident protocol is completed.
+5. Historical Paper PnL, wallet EV/ranking, circuit-breaker outcomes, and equity HWM are
+   contaminated by replayed/post-event phantom positions. A local isolation patch is tested but
+   not yet applied to AWS; treat downstream economic decisions as quarantined until controlled
+   migration, classification, HWM reseed, and restart verification complete.
 
 ## 2026-08-05 repository separation
 

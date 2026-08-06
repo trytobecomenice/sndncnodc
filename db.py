@@ -107,6 +107,60 @@ def _connect():
     return conn
 
 
+def _paper_trade_has_column(conn, column_name):
+    """Backward-compatible schema capability check.
+
+    Production deploys migrate before restart, but many focused unit tests
+    deliberately construct the smallest historical paper_trade schema.  A
+    missing integrity column therefore means "classification unavailable",
+    never "all rows are phantom" and never a startup crash.
+    """
+    return column_name in {
+        row["name"] for row in conn.execute("PRAGMA table_info(paper_trade)").fetchall()
+    }
+
+
+def _clean_paper_trade_predicate(conn, alias=None):
+    """SQL predicate excluding confirmed phantom Paper rows when available."""
+    if not _paper_trade_has_column(conn, "is_phantom"):
+        return "1 = 1"
+    prefix = f"{alias}." if alias else ""
+    return f"COALESCE({prefix}is_phantom, 0) = 0"
+
+
+def _non_demo_paper_trade_predicate(conn, alias=None):
+    """Compatibility twin for pre-is_demo_data focused test schemas."""
+    if not _paper_trade_has_column(conn, "is_demo_data"):
+        return "1 = 1"
+    prefix = f"{alias}." if alias else ""
+    return f"COALESCE({prefix}is_demo_data, 0) = 0"
+
+
+def _confirmed_phantom_realized_pnl(conn, start_timestamp=None):
+    """Audited Paper PnL adjustment used to clean event-log totals.
+
+    bot_event_log remains immutable and is still the authority for partial
+    close events.  Historical integrity classification lives on paper_trade,
+    so subtract the final PnL attached to confirmed phantom rows rather than
+    deleting/rebasing either ledger.  The v1 classifier is dominated by full
+    resolved closes; any future partial-close classifier must reconcile its
+    event-level allocation explicitly before promotion to confirmed.
+    """
+    if not _paper_trade_has_column(conn, "is_phantom"):
+        return 0.0
+    query = (
+        "SELECT COALESCE(SUM(realized_pnl_usd), 0) AS total FROM paper_trade "
+        "WHERE strategy = 'bot_filtered' AND status = 'closed' AND is_demo_data = 0 "
+        "AND is_phantom = 1"
+    )
+    params = []
+    if start_timestamp is not None:
+        query += " AND closed_at >= ?"
+        params.append(int(start_timestamp))
+    row = conn.execute(query, params).fetchone()
+    return float(row["total"] or 0.0)
+
+
 def _new_id():
     return str(uuid.uuid4())
 
@@ -157,10 +211,12 @@ def load_state():
                           for row in cur.fetchall()]
 
         positions = {}
+        clean_open_predicate = _clean_paper_trade_predicate(conn)
         cur = conn.execute(
             "SELECT wallet_address, market_slug, outcome, our_shares, cost_basis_usd, "
             "avg_entry_price, buy_count, peak_profit_pct, opened_at, last_priced_at FROM paper_trade "
-            "WHERE status = 'open' AND strategy = 'bot_filtered' AND is_demo_data = 0"
+            "WHERE status = 'open' AND strategy = 'bot_filtered' AND is_demo_data = 0 "
+            f"AND {clean_open_predicate}"
         )
         for row in cur.fetchall():
             key = f"{row['wallet_address']}|{row['market_slug']}|{row['outcome']}"
@@ -245,6 +301,36 @@ def load_state():
                     "reason": row["mute_reason"],
                 }
 
+        # P0 Paper-ledger integrity (2026-08-07): once the versioned
+        # classification column exists, the persisted recent_results_json
+        # may itself contain phantom returns. Rebuild the rolling windows
+        # deterministically from confirmed-clean bot_filtered rows on every
+        # load. This changes evidence only; it deliberately does NOT auto-
+        # unmute a wallet whose historical decision now needs human review.
+        if _paper_trade_has_column(conn, "is_phantom"):
+            # Do not leave an all-phantom wallet's persisted rolling window
+            # behind merely because it has zero clean rows to overwrite it.
+            trader_performance = {}
+            clean_rows = conn.execute(
+                "SELECT lower(wallet_address) AS wallet_address, realized_pnl_usd, "
+                "cost_basis_usd FROM paper_trade "
+                "WHERE strategy = 'bot_filtered' AND status = 'closed' "
+                "AND is_demo_data = 0 AND COALESCE(is_phantom, 0) = 0 "
+                "AND realized_pnl_usd IS NOT NULL AND cost_basis_usd >= ? "
+                "ORDER BY closed_at ASC",
+                (config.MUTE_MIN_TRADE_COST_USD,),
+            ).fetchall()
+            rebuilt = {}
+            for clean_row in clean_rows:
+                if not clean_row["cost_basis_usd"]:
+                    continue
+                values = rebuilt.setdefault(clean_row["wallet_address"], [])
+                values.append(clean_row["realized_pnl_usd"] / clean_row["cost_basis_usd"])
+                if len(values) > config.MUTE_EV_MIN_SAMPLES:
+                    del values[:-config.MUTE_EV_MIN_SAMPLES]
+            for wallet_address, recent_returns in rebuilt.items():
+                trader_performance[wallet_address] = {"recent_returns": recent_returns}
+
         return {
             "seen_trade_ids": seen_trade_ids,
             "positions": positions,
@@ -296,9 +382,11 @@ def save_state(state):
                 (key, shares, source_cost_basis.get(key, 0.0)),
             )
 
+        clean_open_predicate = _clean_paper_trade_predicate(conn)
         cur = conn.execute(
             "SELECT id, wallet_address, market_slug, outcome FROM paper_trade "
-            "WHERE status = 'open' AND strategy = 'bot_filtered' AND is_demo_data = 0"
+            "WHERE status = 'open' AND strategy = 'bot_filtered' AND is_demo_data = 0 "
+            f"AND {clean_open_predicate}"
         )
         existing = {
             (r["wallet_address"], r["market_slug"], r["outcome"]): r["id"] for r in cur.fetchall()
@@ -1021,11 +1109,14 @@ def get_wallet_realized_ev_stats():
     """
     conn = _connect()
     try:
+        clean_predicate = _clean_paper_trade_predicate(conn)
+        non_demo_predicate = _non_demo_paper_trade_predicate(conn)
         cur = conn.execute(
             "SELECT wallet_address, "
             "avg(realized_pnl_usd / nullif(cost_basis_usd, 0)) AS ev_pct, "
             "count(*) AS trade_count "
             "FROM paper_trade WHERE status = 'closed' AND strategy = 'bot_filtered' "
+            f"AND {non_demo_predicate} AND {clean_predicate} "
             "GROUP BY wallet_address"
         )
         rows = cur.fetchall()
@@ -1151,6 +1242,8 @@ def get_replacement_wallet_candidate():
     """Worst muted tracked wallet, ranked by realized copy PnL then EV."""
     conn = _connect()
     try:
+        clean_predicate = _clean_paper_trade_predicate(conn, alias="pt")
+        non_demo_predicate = _non_demo_paper_trade_predicate(conn, alias="pt")
         row = conn.execute(
             "SELECT wp.wallet_address, wp.nickname, count(pt.id) AS trade_count, "
             "COALESCE(sum(pt.realized_pnl_usd), 0) AS realized_pnl_usd, "
@@ -1158,6 +1251,7 @@ def get_replacement_wallet_candidate():
             "FROM wallet_profile wp LEFT JOIN paper_trade pt "
             "ON lower(pt.wallet_address) = lower(wp.wallet_address) "
             "AND pt.strategy = 'bot_filtered' AND pt.status = 'closed' "
+            f"AND {non_demo_predicate} AND {clean_predicate} "
             "WHERE wp.status = 'track' AND wp.circuit_breaker_muted = 1 "
             "GROUP BY wp.wallet_address ORDER BY realized_pnl_usd ASC, ev_pct ASC LIMIT 1"
         ).fetchone()
@@ -1429,7 +1523,8 @@ def realized_pnl_total():
             f"FROM bot_event_log WHERE event_type IN ({placeholders})",
             _REALIZED_PNL_EVENT_TYPES,
         )
-        return float(cur.fetchone()["total"])
+        raw_total = float(cur.fetchone()["total"])
+        return raw_total - _confirmed_phantom_realized_pnl(conn)
     finally:
         conn.close()
 
@@ -1453,7 +1548,8 @@ def realized_pnl_today(now=None):
             f"FROM bot_event_log WHERE event_type IN ({placeholders}) AND timestamp >= ?",
             (*_REALIZED_PNL_EVENT_TYPES, start_of_day),
         )
-        return float(cur.fetchone()["total"])
+        raw_total = float(cur.fetchone()["total"])
+        return raw_total - _confirmed_phantom_realized_pnl(conn, start_of_day)
     finally:
         conn.close()
 
@@ -1468,7 +1564,8 @@ def realized_pnl_since(start_timestamp):
             f"FROM bot_event_log WHERE event_type IN ({placeholders}) AND timestamp >= ?",
             (*_REALIZED_PNL_EVENT_TYPES, int(start_timestamp)),
         ).fetchone()
-        return float(row["total"])
+        raw_total = float(row["total"])
+        return raw_total - _confirmed_phantom_realized_pnl(conn, start_timestamp)
     finally:
         conn.close()
 
@@ -1503,16 +1600,22 @@ def get_or_create_evaluation_epoch(now=None):
 def get_closed_trade_stats_since(start_timestamp, strategy="bot_filtered"):
     conn = _connect()
     try:
+        clean_predicate = _clean_paper_trade_predicate(conn)
         row = conn.execute(
             "SELECT count(*) AS closed_count, "
             "sum(CASE WHEN realized_pnl_usd > 0 THEN 1 ELSE 0 END) AS wins "
             "FROM paper_trade WHERE strategy = ? AND status = 'closed' "
-            "AND closed_at >= ? AND is_demo_data = 0",
+            f"AND closed_at >= ? AND is_demo_data = 0 AND {clean_predicate}",
             (strategy, int(start_timestamp)),
         ).fetchone()
         count = int(row["closed_count"] or 0)
         wins = int(row["wins"] or 0)
-        return {"closed_count": count, "win_rate": (wins / count if count else None)}
+        return {
+            "closed_count": count,
+            "wins": wins,
+            "losses": count - wins,
+            "win_rate": (wins / count if count else None),
+        }
     finally:
         conn.close()
 

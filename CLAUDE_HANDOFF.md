@@ -40,25 +40,26 @@ high-conviction strategy, that is good quant research rather than failure.
 
 ## Urgent P0 — 2026-08-07 Paper-ledger integrity quarantine
 
-An external quant review has produced strong evidence that historical replayed/post-event Paper
+An external quant review produced strong evidence that historical replayed/post-event Paper
 entries were closed as near-immediate `resolved` winners, materially inflating reported PnL and
 potentially contaminating wallet EV caps, circuit breakers, category ranking, promotions, and the
 equity HWM. Read
 `docs/research/PAPER_LEDGER_INTEGRITY_INCIDENT_2026-08-07.md` before taking any economic action.
 
-Do not quote `+$639.74` as demonstrated alpha. It remains a raw AWS ledger figure from an earlier
-check. The reviewer separately reports a local candidate clean result of 127 closes, `-$59.86`,
-and `-9.38%` ROI, but Codex has not yet independently reproduced that result against the
-authoritative AWS DB. Both errors are prohibited: do not trust the raw total, and do not silently
-promote the external clean estimate to production truth.
+Codex has now independently reproduced the core failure read-only on AWS. At approximately 00:37
+HKT the authoritative row ledger had 641 normal closes / raw `+$620.40`; causal v1 identified 455
+high-confidence replay/post-event candidates carrying `+$669.00`, leaving 186 rows / `-$48.60` /
+`-4.60%` ROI. The reviewer's 127 / `-$59.86` was a local, blanket-duration decomposition and must
+not replace the AWS causal result. Do not quote any old positive total as demonstrated alpha.
 
 Immediate operator rules:
 
 - remain Paper-only;
 - do not add wallets/strategies, raise size, alter roster status, or reseed HWM by hand;
-- independently reproduce row-level contamination and chronology read-only;
+- preserve the completed row-level read-only reproduction and SHA-256 manifest;
 - preserve historical rows and use a versioned/auditable classification;
-- cut contaminated rows out of decision inputs only after tests and review; and
+- deploy the tested mark-only isolation only after DB backup, migration dry-run, manifest match,
+  and a controlled Paper restart; and
 - repair TTP observability and exit coverage before strategy expansion.
 
 The 2026-08-07 P0 incident queue at the top of `docs/TODO_2026-08-06.md` supersedes older feature
@@ -391,6 +392,33 @@ priorities until the forensic and feedback-isolation gates pass.
      sizing claim.
 
 ## Change log
+
+### 2026-08-07 — Independent P0 reproduction and local feedback isolation
+
+1. **When:** 2026-08-07 HKT.
+2. **Files adjusted:**
+   - `audit_paper_ledger.py` and `test_audit_paper_ledger.py` — versioned, causal, dry-run-first,
+     mark-only historical classifier with row manifest and HWM-reset option.
+   - `packages/db/src/schema.ts`, migration `0023_lame_timeslip.sql`, and Drizzle metadata — added
+     auditable phantom classification fields without deleting historical evidence.
+   - `db.py`, `dashboard.py`, and `apps/dashboard/app/overview/page.tsx` — excluded only confirmed
+     rows from economic decision inputs and operator totals; open confirmed rows are quarantined
+     from loaded trading state.
+   - `bot.py` and `test_bot_risk_checks.py` — normalized malformed/blank/non-finite price values at
+     the TTP boundary so strings cannot abort a sweep comparison.
+   - `test_db_quant_p0.py` and `test_db_wallet_ev_stats.py` — regression coverage for clean PnL and
+     wallet EV inputs.
+   - `docs/CURRENT_STATE.md`, `docs/TODO_2026-08-06.md`, the incident report, and this handoff —
+     replaced pending-verification language with the independently reproduced AWS evidence.
+3. **What changed:**
+   - Verified the external review's central conclusion but rejected its exact blanket-duration
+     classification as AWS truth. AWS causal v1 leaves 186 closes / `-$48.60` / `-4.60%` ROI.
+   - Implemented a reversible classifier that never deletes or rebases rows and changes no wallet
+     status automatically.
+   - Full Python suite: 793 passed, 2 skipped. DB and dashboard TypeScript checks passed. Migration,
+     dry-run, apply, manifest stability, and HWM reset passed against a copied local DB.
+   - Local implementation only at this entry: no AWS DB mutation, process restart, GitHub push,
+     `.env`, key, credential, or unrelated dirty-worktree file changed.
 
 ### 2026-08-07 — Paper-ledger integrity incident record and metric quarantine
 

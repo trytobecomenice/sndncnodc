@@ -275,6 +275,14 @@ export const paperTrade = sqliteTable(
     // often enough that an in-memory 24h clock would rarely, if ever, fire.
     lastPricedAt: integer("last_priced_at", { mode: "timestamp" }),
     decisionJournalId: text("decision_journal_id"),
+    // Historical Paper-ledger integrity classification (2026-08-07).
+    // Rows are never deleted/rebased: confirmed look-ahead/replayed fills
+    // remain auditable but are excluded from PnL-fed decisions.  The
+    // classifier metadata makes every backfill reversible and reviewable.
+    isPhantom: integer("is_phantom", { mode: "boolean" }).notNull().default(false),
+    phantomReason: text("phantom_reason"),
+    phantomClassifierVersion: text("phantom_classifier_version"),
+    phantomClassifiedAt: integer("phantom_classified_at", { mode: "timestamp" }),
     isDemoData: integer("is_demo_data", { mode: "boolean" }).notNull().default(false),
   },
   (t) => [index("paper_trade_lookup_idx").on(t.walletAddress, t.marketSlug, t.outcome, t.status)]

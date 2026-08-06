@@ -880,6 +880,28 @@ class TestGetMarketPrices(unittest.TestCase):
         self.assertIsNone(indicative)
         self.assertIsNotNone(err)
 
+    def test_blank_or_malformed_price_strings_never_escape_into_ttp_math(self):
+        fake_book = {
+            "bids": [("", 100.0)], "asks": [("not-a-price", 100.0)],
+            "last_trade_price": "",
+        }
+        with patch("bot.polymarket_simulator.fetch_order_book_for_outcome", return_value=({}, fake_book)):
+            best_bid, indicative, err = bot.get_market_prices("some-market", "Yes")
+        self.assertIsNone(best_bid)
+        self.assertIsNone(indicative)
+        self.assertIn("no usable price", err)
+
+    def test_numeric_price_strings_are_normalized_to_floats(self):
+        fake_book = {
+            "bids": [("0.48", 100.0)], "asks": [("0.50", 100.0)],
+            "last_trade_price": "0.49",
+        }
+        with patch("bot.polymarket_simulator.fetch_order_book_for_outcome", return_value=({}, fake_book)):
+            best_bid, indicative, err = bot.get_market_prices("some-market", "Yes")
+        self.assertIsNone(err)
+        self.assertEqual(best_bid, 0.48)
+        self.assertEqual(indicative, 0.48)
+
     def test_fetch_failure_fails_soft_with_an_error_string(self):
         with patch("bot.polymarket_simulator.fetch_order_book_for_outcome", side_effect=RuntimeError("no market")):
             best_bid, indicative, err = bot.get_market_prices("some-market", "Yes")

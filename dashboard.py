@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
 import config
-from db import get_tracked_traders
+from db import get_closed_trade_stats_since, get_tracked_traders, realized_pnl_total
 
 PORT = 8787
 PID_PATH = os.path.join(config.BASE_DIR, "bot.pid")
@@ -201,8 +201,16 @@ def build_status():
             elif et == "unknown_fill_state":
                 unknown_fill_count += 1
 
-        closed = wins + losses
-        win_rate = (wins / closed * 100) if closed else None
+        # P0 ledger integrity (2026-08-07): event history remains useful for
+        # operational counts, but its raw close PnL includes confirmed
+        # phantom rows. Economic totals and win rate come from db.py's
+        # classification-aware readers instead.
+        clean_stats = get_closed_trade_stats_since(0)
+        closed = clean_stats["closed_count"]
+        wins = clean_stats["wins"]
+        losses = clean_stats["losses"]
+        win_rate = clean_stats["win_rate"] * 100 if clean_stats["win_rate"] is not None else None
+        realized_pnl = realized_pnl_total()
 
         # Reflects whichever source config.TRACKED_TRADERS_SOURCE is
         # currently set to (static config.py dict or wallet_profile), same

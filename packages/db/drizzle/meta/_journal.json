@@ -162,6 +162,13 @@
       "when": 1785875801069,
       "tag": "0022_goofy_paladin",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1786035679725,
+      "tag": "0023_lame_timeslip",
+      "breakpoints": true
     }
   ]
 }

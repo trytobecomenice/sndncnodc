@@ -22,7 +22,12 @@ const RISK_CONFIG = {
   maxDrawdownFromPeakUsd: 450.0,
 };
 
-const closedTradeFilter = and(eq(paperTrade.status, "closed"), eq(paperTrade.strategy, "bot_filtered"));
+const closedTradeFilter = and(
+  eq(paperTrade.status, "closed"),
+  eq(paperTrade.strategy, "bot_filtered"),
+  eq(paperTrade.isDemoData, false),
+  eq(paperTrade.isPhantom, false)
+);
 const openTradeFilter = and(eq(paperTrade.status, "open"), eq(paperTrade.strategy, "bot_filtered"));
 
 // Same per-dollar-staked blended EV metric as db.compute_live_edge_pct()

@@ -1,7 +1,7 @@
 # Paper Ledger Integrity Incident Review — 2026-08-07
 
-Status: **P0 external-review finding; economic metrics quarantined pending independent
-reproduction.** This document records the complete structured review received on 2026-08-07 and
+Status: **P0 independently reproduced; local isolation patch tested; AWS mutation/deployment
+pending.** This document records the complete structured review received on 2026-08-07 and
 the immediate operating decisions that follow from it. It does not silently rewrite historical
 rows, authorize a production database mutation, or assert that an external calculation is already
 verified production truth.
@@ -30,9 +30,49 @@ candidate clean win rate:      61.4%
 post-stale-guard sample:        14 rows, -$40.74, -54.77% ROI
 ```
 
-These exact figures are **external-review claims, not yet independently reproduced by Codex from
-the authoritative AWS database**. Nevertheless, the evidence is serious enough that the following
-operating decisions take effect immediately:
+These exact figures are **external-review/local-snapshot claims and are not the authoritative AWS
+result**. Codex independently confirmed the core failure, but not this exact decomposition.
+
+### 1.1 Independent verification — 2026-08-07
+
+Read-only AWS query at approximately 00:37 HKT, checkout `1d36f63`:
+
+```text
+raw bot_filtered closes:                  641
+raw paper_trade realized PnL:       +$620.40
+raw cost basis:                     $4,332.84
+
+causal v1 candidates:                     455
+candidate PnL:                       +$669.00
+candidate cost:                     $3,277.10
+
+candidate-clean remainder:                186
+candidate-clean PnL:                  -$48.60
+candidate-clean ROI:                   -4.60%
+candidate-clean win rate:              48.39%
+
+post-2026-07-31 UTC closes:                 65
+post-guard PnL / ROI:              -$33.06 / -8.57%
+AWS equity_hwm:                     $2,173.60
+```
+
+The classifier is intentionally causal rather than purely duration-based:
+
+1. a new Paper row opened after this local ledger had already resolved the same market; or
+2. a `resolved` row whose slug contains a valid event date and whose opening was at least one full
+   UTC day later.
+
+On AWS, rule 1 identified 407 rows, rule 2 identified 310, with 262 overlap; the union is 455.
+The exact cited market was also present on AWS, with nine repeated identical `0.32` entries on
+2026-07-30 and repeated resolution profits. That independently proves the time-machine mechanism.
+
+The external review's 127-row clean result dropped all 330 sub-ten-minute closes. That is useful
+anomaly evidence but too broad to become a destructive classifier: legitimate trailing exits can
+also close quickly. On the exact local 457-row DB, causal v1 instead flags 316 rows carrying
+`+$524.59`, leaving 141 rows / `-$5.43` / `-0.75%` ROI. Both defensible clean views reject the old
+profit claim; neither proves a profitable strategy.
+
+The following operating decisions therefore take effect immediately:
 
 1. Historical reported PnL is quarantined from claims of demonstrated alpha.
 2. No old PnL-dependent wallet ranking, cap, circuit-breaker decision, challenger promotion,
@@ -87,9 +127,10 @@ historical source trade reappears in a polling/feed replay
   -> guaranteed-looking profit is booked as realized PnL
 ```
 
-This mechanism is plausible and consistent with the earlier replay/dedup incident fixed on
-2026-08-05 plus the stale-market guard added on 2026-07-31. It is not considered proven until the
-exact rows, event dates, source trade IDs, price evidence, and close transitions are reproduced.
+This mechanism is consistent with the earlier replay/dedup incident fixed on 2026-08-05 plus the
+stale-market guard added on 2026-07-31. The repeated open-after-local-resolution rows and dated
+post-event rows independently reproduce it on AWS. Source-feed provenance remains a separate
+follow-up, but the economic contamination itself is proven sufficiently to quarantine decisions.
 
 ## 3. Finding B — candidate feedback contamination
 

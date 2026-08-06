@@ -35,6 +35,7 @@ can read it directly, alongside bot.py's own local dashboard.py.
 
 import json
 import logging
+import math
 import signal
 import sys
 import time
@@ -538,6 +539,20 @@ def measure_paper_shortfall(market_slug, outcome, side, preview_amount, source_p
     return result
 
 
+def _finite_price(value, *, allow_zero=False):
+    """Normalize an API price without leaking strings/NaN into TTP math."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    minimum_ok = parsed >= 0 if allow_zero else parsed > 0
+    return parsed if math.isfinite(parsed) and minimum_ok else None
+
+
+def _positive_finite_price(value):
+    return _finite_price(value, allow_zero=False)
+
+
 def get_market_prices(market_slug, outcome, ignore_staleness=False):
     """Fetch current prices directly from Polymarket's own public order book
     (polymarket_simulator.py, 2026-07-22 — migrated off `bullpen polymarket
@@ -592,24 +607,28 @@ def get_market_prices(market_slug, outcome, ignore_staleness=False):
             return None, None, f"price check failed: {e2}"
         midpoint = None
         if book["bids"] and book["asks"]:
-            midpoint = (book["bids"][0][0] + book["asks"][0][0]) / 2
-        indicative = midpoint or book.get("last_trade_price")
-        if not indicative or indicative <= 0:
+            stale_bid = _finite_price(book["bids"][0][0], allow_zero=True)
+            stale_ask = _positive_finite_price(book["asks"][0][0])
+            if stale_bid is not None and stale_ask is not None:
+                midpoint = (stale_bid + stale_ask) / 2
+        indicative = midpoint or _positive_finite_price(book.get("last_trade_price"))
+        if indicative is None:
             return None, None, f"no usable stale-fallback price for {market_slug}/{outcome}: {book}"
         return None, indicative, None
     except Exception as e:
         return None, None, f"price check failed: {e}"
 
-    best_bid = book["bids"][0][0] if book["bids"] else None
-    if not best_bid or best_bid <= 0:
-        best_bid = None
+    best_bid = _positive_finite_price(book["bids"][0][0]) if book["bids"] else None
 
     midpoint = None
     if book["bids"] and book["asks"]:
-        midpoint = (book["bids"][0][0] + book["asks"][0][0]) / 2
+        midpoint_bid = _finite_price(book["bids"][0][0], allow_zero=True)
+        midpoint_ask = _positive_finite_price(book["asks"][0][0])
+        if midpoint_bid is not None and midpoint_ask is not None:
+            midpoint = (midpoint_bid + midpoint_ask) / 2
 
-    indicative = best_bid or midpoint or book.get("last_trade_price")
-    if not indicative or indicative <= 0:
+    indicative = best_bid or midpoint or _positive_finite_price(book.get("last_trade_price"))
+    if indicative is None:
         return None, None, f"no usable price for {market_slug}/{outcome}: {book}"
     return best_bid, indicative, None
 

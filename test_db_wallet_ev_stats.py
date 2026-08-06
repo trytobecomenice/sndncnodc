@@ -26,7 +26,8 @@ class TestGetWalletRealizedEvStats(unittest.TestCase):
             "CREATE TABLE paper_trade (id TEXT PRIMARY KEY, strategy TEXT NOT NULL "
             "DEFAULT 'bot_filtered', wallet_address TEXT NOT NULL, market_slug TEXT NOT NULL, "
             "outcome TEXT NOT NULL, cost_basis_usd REAL NOT NULL DEFAULT 0, "
-            "status TEXT NOT NULL, realized_pnl_usd REAL)"
+            "status TEXT NOT NULL, realized_pnl_usd REAL, is_demo_data INTEGER DEFAULT 0, "
+            "is_phantom INTEGER DEFAULT 0)"
         )
         conn.commit()
         conn.close()
@@ -37,12 +38,14 @@ class TestGetWalletRealizedEvStats(unittest.TestCase):
         self._patcher.stop()
         os.remove(self.tmp_path)
 
-    def _insert(self, wallet, cost_basis, pnl, strategy="bot_filtered", status="closed"):
+    def _insert(self, wallet, cost_basis, pnl, strategy="bot_filtered", status="closed",
+                is_phantom=0):
         conn = sqlite3.connect(self.tmp_path)
         conn.execute(
             "INSERT INTO paper_trade (id, strategy, wallet_address, market_slug, outcome, "
-            "cost_basis_usd, status, realized_pnl_usd) VALUES (?, ?, ?, 'm', 'Yes', ?, ?, ?)",
-            (os.urandom(8).hex(), strategy, wallet, cost_basis, status, pnl),
+            "cost_basis_usd, status, realized_pnl_usd, is_phantom) "
+            "VALUES (?, ?, ?, 'm', 'Yes', ?, ?, ?, ?)",
+            (os.urandom(8).hex(), strategy, wallet, cost_basis, status, pnl, is_phantom),
         )
         conn.commit()
         conn.close()
@@ -69,6 +72,13 @@ class TestGetWalletRealizedEvStats(unittest.TestCase):
         self._insert("0xabc", 10.0, 5.0, strategy="shadow_rehab")
         stats = db.get_wallet_realized_ev_stats()
         self.assertNotIn("0xabc", stats)
+
+    def test_confirmed_phantom_trades_are_excluded(self):
+        self._insert("0xabc", 10.0, 100.0, is_phantom=1)
+        self._insert("0xabc", 10.0, -2.0)
+        stats = db.get_wallet_realized_ev_stats()
+        self.assertEqual(stats["0xabc"]["trade_count"], 1)
+        self.assertAlmostEqual(stats["0xabc"]["ev_pct"], -0.2)
 
     def test_zero_cost_basis_does_not_crash_on_division(self):
         self._insert("0xabc", 0.0, 5.0)

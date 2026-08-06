@@ -21,7 +21,7 @@ class TestQuantP0Persistence(unittest.TestCase):
         CREATE TABLE bot_event_log (id TEXT PRIMARY KEY, timestamp INTEGER, event_type TEXT,
           trader_address TEXT, market_slug TEXT, outcome TEXT, side TEXT, payload_json TEXT NOT NULL);
         CREATE TABLE paper_trade (id TEXT PRIMARY KEY, strategy TEXT, status TEXT, closed_at INTEGER,
-          realized_pnl_usd REAL, is_demo_data INTEGER DEFAULT 0);
+          realized_pnl_usd REAL, is_demo_data INTEGER DEFAULT 0, is_phantom INTEGER DEFAULT 0);
         CREATE TABLE pnl_snapshot (id TEXT PRIMARY KEY, captured_at INTEGER, scope TEXT, strategy TEXT,
           wallet_address TEXT, realized_pnl_usd REAL, unrealized_pnl_usd REAL,
           open_positions_count INTEGER, closed_trades_count INTEGER, win_rate REAL);
@@ -58,6 +58,17 @@ class TestQuantP0Persistence(unittest.TestCase):
         row = conn.execute("SELECT scope, realized_pnl_usd FROM pnl_snapshot").fetchone()
         conn.close()
         self.assertEqual(row, ("clean_epoch", -2.0))
+
+    def test_realized_since_subtracts_confirmed_phantom_close(self):
+        conn = sqlite3.connect(self.path)
+        conn.execute("INSERT INTO bot_event_log VALUES ('p', 200, 'position_resolved', NULL,NULL,NULL,NULL,?)",
+                     (json.dumps({"pnl_usd": 8.0}),))
+        conn.execute(
+            "INSERT INTO paper_trade VALUES ('p','bot_filtered','closed',200,8.0,0,1)"
+        )
+        conn.commit()
+        conn.close()
+        self.assertEqual(db.realized_pnl_since(150), 0.0)
 
 
 if __name__ == "__main__":
