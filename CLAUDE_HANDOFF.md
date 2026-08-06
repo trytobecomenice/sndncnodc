@@ -346,6 +346,13 @@ high-conviction strategy, that is good quant research rather than failure.
      After two polls it was active with zero restart, about 39.7 MB RAM, one healthy WS connection,
      0 poll errors, 0 malformed lines, p50 poll 909 ms, and no historical fake signal. Empty
      T+100/T+500 counts are expected until the first genuinely new followed-wallet fill.
+   - Follow-up live checkpoint captured three genuinely new BUYs. The first two used WS books last
+     updated 1.857s and 2.462s before signal ingress and created one then two lots in every
+     `$3/$5/$10` tier using `source_reported_share_size`. The third saw a 15.821s-old WS book,
+     emitted `ws_book_stale_at_signal`, and correctly created no lot. At the preceding completed
+     inspector checkpoint, T+100 and T+500 were both 2/2 available with p50 callback lateness
+     0.785ms and 0.854ms. Service remained at zero restart and about 46 MB RAM. This is useful gate
+     evidence, not an alpha/PnL conclusion.
    - The journal is `/home/ubuntu/polymarket-copybot/data/phase0_soak_v1.jsonl`; it is runtime data,
      untracked by Git, and contains no key/order capability. `.env` and credentials were not
      staged, pushed, copied, or printed.
