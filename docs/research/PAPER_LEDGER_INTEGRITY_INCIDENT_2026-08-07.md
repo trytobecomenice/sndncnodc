@@ -35,11 +35,21 @@ that a duration/resolution-reason screen alone is incomplete. Classifier v2 mark
 without deleting or rebasing data; manifest SHA-256 is
 `a2b4c7c20cd16aaa70092402a72d51b4886c9f57f8491d1458574f4f210dd820`.
 
-The fact-clean row total is still not canonical economic PnL. Periodic snapshots calculate
-realized PnL from event-log close events, including partial closes, and currently differ from the
-final-row ledger by about `$76.62`. The next P0 gate is event-by-event reconciliation and factual
-allocation of phantom partial-close events; do not hand-subtract this difference or reseed HWM
-again before that work is complete.
+The fact-clean row total is not economic PnL because `source_sell` rows store only the last partial
+close. A subsequent interval reconciliation allocated all 14,614 realized events to exactly one
+closed/open tax lot, with zero unmatched and zero ambiguous events. It produced:
+
+```text
+clean closed-lot cumulative realized:  -$20.364972
+clean open-lot partial realized:         -$0.004762
+clean portfolio cumulative realized:   -$20.369734
+phantom cumulative event PnL:          +$717.385620
+```
+
+This is the strongest current realized-PnL evidence, but runtime persistence remains wrong:
+`realized_pnl_total()` subtracts final-row phantom PnL rather than allocated phantom event PnL.
+Implement and backfill a durable event-to-tax-lot allocation/cumulative ledger before treating
+snapshots or HWM inputs as canonical. Do not hand-subtract aggregates or reseed HWM again.
 
 An external quant review alleges that a large part of historical Paper PnL came from stale/replayed
 source trades entering markets whose outcomes were already known, followed by near-immediate

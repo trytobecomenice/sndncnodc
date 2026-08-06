@@ -53,9 +53,13 @@ authority for fresh/current databases.
   `a2b4c7c20cd16aaa70092402a72d51b4886c9f57f8491d1458574f4f210dd820`. No raw row or PnL was
   deleted/rebased and HWM was not changed.
 - **Current fact-clean row ledger:** 155 closes, `$865.51` cost, `-$78.50`, `-9.07%` ROI, 45.16%
-  win rate. This is not yet canonical economic PnL: `pnl_snapshot`/event-ledger realized PnL and
-  final-row PnL differ by about `$76.62`, probably because partial closes are represented
-  differently. Event-level reconciliation is the next P0 gate.
+  win rate. This is not economic realized PnL because a `source_sell` row stores only its final
+  partial-close event.
+- **Exact event/tax-lot reconciliation:** all 14,614 realized events matched exactly one tax lot;
+  unmatched=0 and ambiguous=0. Clean closed-lot cumulative realized PnL is `-$20.364972`; open-lot
+  partial realized PnL is `-$0.004762`; total clean portfolio realized is `-$20.369734`. Phantom
+  events contributed `+$717.385620`. Open-lot unrealized PnL is separate, so this is not total
+  equity or final strategy expectancy.
 - **Uncertainty:** 10,000-draw all-row trade bootstrap gives cost-weighted ROI 95% CI
   `[-19.90%, +1.90%]`; wallet-cluster bootstrap gives `[-35.42%, -1.30%]` with effective wallet
   N=10. Current-eligible rows are 101 trades across only six effective wallets and their
@@ -64,7 +68,9 @@ authority for fresh/current databases.
   2026-08-07 01:44 HKT. This is markability evidence, not strategy profitability.
 - **Risk state:** contaminated HWM `$2,173.60` was removed after backup and classification; the
   restarted bot cleanly reseeded HWM to `$1,112.60`.
-- **Runtime:** paper process PID `105229` on commit `a7f7a00`; verify live before relying on this PID.
+- **Runtime:** exactly one paper process PID `105229`, still loaded from the earlier controlled
+  restart; AWS checkout is `164c7bd`. The autodeploy lock intentionally prevents an implicit main
+  bot restart.
 - **Services:** watchdog, autodeploy, Telegram approval listener, daily wallet scan/score workflow,
   and OMS shadow mirror were deployed at the last check.
 
@@ -85,8 +91,15 @@ authority for fresh/current databases.
 6. `pnl_snapshot` is no longer empty: 22 rows were present at 02:17 HKT (11 portfolio and 11
    clean-epoch). The writer was delayed, not absent: repeated full scans of the multi-million-row
    event log make the Paper loop enter long I/O waits. Commit `3315698` removes one duplicate scan,
-   but the running PID has not been restarted onto that code and canonical event/row reconciliation
-   remains pending.
+   but the running PID has not been restarted onto that code. Snapshot portfolio realized PnL is
+   still wrong because runtime subtracts final-row phantom PnL instead of allocated phantom event
+   PnL; durable allocation accounting/backfill is the next P0 implementation.
+7. At 02:19 HKT Codex found two concurrent `bot.py` processes. The cron watchdog had trusted only
+   a missing/stale shared `bot.pid` and started a duplicate even though PID `105229` was alive.
+   Both cron duplicates were terminated, leaving PID `105229`. Commit `164c7bd` now discovers all
+   same-repository bot processes through `/proc`, repairs a missing PID file, serializes starts with
+   an OS file lock, and alerts/fails closed if duplicates exist. A live missing-PID simulation and
+   the next cron tick both left exactly one process.
 
 ## 2026-08-05 repository separation
 

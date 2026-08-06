@@ -73,7 +73,8 @@ Evidence gates completed on 2026-08-07:
 - All-row wallet-clustered ROI CI is negative on this snapshot, but current-eligible clustered CI
   crosses zero and effective wallet N is only six. No trader replacement is authorized.
 - `pnl_snapshot` has started writing (22 rows by 02:17 HKT), but event-ledger realized `+$28.02`
-  and row-ledger realized totals do not reconcile. This is now the first P0 investigation.
+  and row-ledger realized totals did not reconcile. Exact allocation subsequently established
+  clean cumulative event realized PnL `-$20.369734`; runtime persistence remains to be fixed.
 
 The 2026-08-07 P0 incident queue at the top of `docs/TODO_2026-08-06.md` supersedes older feature
 priorities until the forensic and feedback-isolation gates pass.
@@ -431,7 +432,47 @@ priorities until the forensic and feedback-isolation gates pass.
      realized-PnL mismatch. Event-level reconciliation is now P0.
    - Local full suite: 804 passed, 2 skipped. Commits `3315698`, `52c9d31`, and `cb8e366` were pushed
      to GitHub and fast-forwarded on AWS. The existing Paper PID was deliberately not restarted;
-     it still has the earlier loaded code while the autodeploy lock remains present.
+   it still has the earlier loaded code while the autodeploy lock remains present.
+
+### 2026-08-07 02:28 HKT — Duplicate Paper process incident contained
+
+1. **When:** 2026-08-07 02:19–02:28 HKT.
+2. **Files adjusted:**
+   - `dashboard.py` — same-repository `/proc` discovery, stale/missing PID repair, atomic PID write,
+     and `flock`-serialized starts.
+   - `watchdog.py` — detects multiple bot PIDs, alerts once per PID set, and fails closed without
+     killing or starting another process.
+   - `test_watchdog.py` and `test_dashboard_process_control.py` — regression coverage for duplicate
+     detection, one-time alerting, missing-PID repair, and locked recheck.
+   - Current-state, TODO, and handoff documents — recorded the incident and live verification.
+3. **What changed:**
+   - Cron had started PID `105628` at 18:00 UTC and PID `107118` at 18:24 UTC because the watchdog
+     trusted only `bot.pid`; PID `105229` was alive throughout. Both duplicates were gracefully
+     terminated and exactly one main process remains.
+   - Commit `164c7bd` passed 15 targeted tests and was pulled to AWS without restarting the main
+     bot. A live test deleted `bot.pid`; process discovery found PID `105229` and atomically repaired
+     the file without launching another bot. After the next cron tick `dashboard.bot_pids()` still
+     returned only `[105229]`; watchdog is unpaused, recorder active, and `LIVE_MODE=False`.
+
+### 2026-08-07 02:35 HKT — Partial-close event ledger reconciled
+
+1. **When:** 2026-08-07 02:29–02:35 HKT.
+2. **Files adjusted:**
+   - `reconcile_paper_trade_events.py` — read-only interval allocator across closed and open tax
+     lots, with explicit unmatched and ambiguous evidence gaps.
+   - `test_reconcile_paper_trade_events.py` — unique, unmatched, and overlapping allocation tests.
+   - Current-state, TODO, and handoff documents — replaced misleading final-row economics with the
+     exact event-level evidence and recorded the remaining persistence gap.
+3. **What changed:**
+   - All 14,614 realized events matched exactly one of 693 tax lots; unmatched and ambiguous counts
+     were both zero. All 641 closed rows had events; eight of 52 open rows had partial-close events.
+   - Clean cumulative realized PnL is `-$20.369734`, not final-row `-$78.50` and not the existing
+     snapshot value. Phantom events contributed `+$717.385620`.
+   - Commits `06315d8` and `702dd4c` were pushed and pulled to AWS. Reconciliation ran under low
+     CPU/I/O priority and did not restart the main bot or recorder.
+   - Do not call the runtime accounting fixed yet. The next P0 implementation is a persisted
+     event-to-tax-lot allocation/cumulative PnL ledger plus exact historical backfill; until then
+     snapshot realized PnL and HWM inputs retain an approximately `$18.49` overstatement.
 
 ### 2026-08-07 — P0 Paper-ledger isolation deployed to AWS
 
