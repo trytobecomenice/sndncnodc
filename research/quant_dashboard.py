@@ -93,7 +93,14 @@ def main():
             row["deterioration_from_t0_micros"] / 1_000_000
             if row.get("deterioration_from_t0_micros") is not None else None
         )
-    frame = pl.DataFrame(rows) if rows else pl.DataFrame()
+    # Real journals can have fields that stay null for the first 100+ rows and
+    # become integers later (for example delayed SELL evidence). Polars' small
+    # default inference window then locks the column to Null and crashes. This
+    # is offline research, so scan all rows for a stable schema.
+    frame = (
+        pl.DataFrame(rows, infer_schema_length=None, strict=False)
+        if rows else pl.DataFrame()
+    )
 
     overview_tab, decay_tab, micro_tab = st.tabs([
         "Cohort Overview", "Alpha Decay", "Microstructure"
@@ -171,10 +178,29 @@ def main():
             st.info("Provide the source JSONL journal to inspect visible depth checkpoints.")
         else:
             depth = extract_depth_observations(existing_journals)
-            depth_frame = pl.DataFrame(depth) if depth else pl.DataFrame()
+            depth_frame = (
+                pl.DataFrame(depth, infer_schema_length=None, strict=False)
+                if depth else pl.DataFrame()
+            )
             if depth_frame.is_empty():
                 st.info("No book checkpoints available.")
             else:
+                depth_markets = sorted(
+                    value for value in depth_frame["market_slug"].unique().to_list()
+                    if value
+                )
+                selected_depth_markets = st.multiselect(
+                    "Microstructure markets",
+                    depth_markets,
+                    default=depth_markets[: min(6, len(depth_markets))],
+                    help="Limit facets so a large market universe stays readable.",
+                )
+                if not selected_depth_markets:
+                    st.info("Select at least one market to draw depth checkpoints.")
+                    return
+                depth_frame = depth_frame.filter(
+                    pl.col("market_slug").is_in(selected_depth_markets)
+                )
                 depth_long = depth_frame.unpivot(
                     index=["signal_event_id", "wallet", "market_slug", "observation_delay_ms"],
                     on=["visible_bid_notional_usd", "visible_ask_notional_usd"],
