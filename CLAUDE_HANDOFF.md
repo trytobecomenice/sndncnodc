@@ -473,6 +473,8 @@ priorities until the forensic and feedback-isolation gates pass.
    - Do not call the runtime accounting fixed yet. The next P0 implementation is a persisted
      event-to-tax-lot allocation/cumulative PnL ledger plus exact historical backfill; until then
      snapshot realized PnL and HWM inputs retain an approximately `$18.49` overstatement.
+   - The earlier trade/wallet bootstrap used final-row PnL and is now a superseded diagnostic.
+     Rerun it on cumulative allocated lot PnL before any statistical or roster conclusion.
 
 ### 2026-08-07 — P0 Paper-ledger isolation deployed to AWS
 

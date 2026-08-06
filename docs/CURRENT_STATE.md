@@ -60,10 +60,13 @@ authority for fresh/current databases.
   partial realized PnL is `-$0.004762`; total clean portfolio realized is `-$20.369734`. Phantom
   events contributed `+$717.385620`. Open-lot unrealized PnL is separate, so this is not total
   equity or final strategy expectancy.
-- **Uncertainty:** 10,000-draw all-row trade bootstrap gives cost-weighted ROI 95% CI
+- **Superseded row-close uncertainty diagnostic:** 10,000-draw all-row bootstrap on final-row PnL
+  gave cost-weighted ROI 95% CI
   `[-19.90%, +1.90%]`; wallet-cluster bootstrap gives `[-35.42%, -1.30%]` with effective wallet
   N=10. Current-eligible rows are 101 trades across only six effective wallets and their
-  wallet-cluster ROI CI is `[-52.56%, +3.53%]`. Do not change the roster from this sample.
+  wallet-cluster ROI CI is `[-52.56%, +3.53%]`. These intervals are not economic strategy CIs
+  because final rows omit earlier partial-close PnL. Rerun both bootstraps on allocated cumulative
+  lot PnL; do not change the roster from this sample.
 - **Open book at verification:** 52 clean/unclassified positions; all 52 received a fresh mark at
   2026-08-07 01:44 HKT. This is markability evidence, not strategy profitability.
 - **Risk state:** contaminated HWM `$2,173.60` was removed after backup and classification; the
