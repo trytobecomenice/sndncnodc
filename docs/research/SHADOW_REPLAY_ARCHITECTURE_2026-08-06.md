@@ -813,8 +813,10 @@ writes signal-sized top-ten JSONL. It owns no key and has `order_capability=fals
 bootstrap records zero historical samples; the optional sample/warm-up flags exist only for an
 explicit local sanity run.
 
-The Linux service contract adds a 768 MB address-space limit, systemd `MemoryMax=1G`, 50% CPU quota,
-low CPU/I/O priority, protected system paths, and one writable data directory. This limits research
+The Linux service contract adds a 384 MB address-space limit, systemd `MemoryMax=512M`, 35% CPU
+quota, a 64-asset LRU, low CPU/I/O priority, protected system paths, and one writable data
+directory. These values were tightened after preflight showed about 906 MB available RAM and no
+swap: the research process must not consume the paper bot's last memory. This limits research
 damage on the current `t3.small`; it does not prove burst safety. The streaming inspector reports
 malformed lines, file size, poll gaps/errors, delayed-book availability/lateness, reconnects,
 quality flags, sides, visibility-lag proxy, and realized shadow PnL without loading the journal into

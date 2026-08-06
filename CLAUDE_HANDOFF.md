@@ -287,7 +287,8 @@ high-conviction strategy, that is good quant research rather than failure.
    - `polymarket_data_api.py` and `test_polymarket_data_api.py` — added a caller-bounded first-page
      bootstrap without changing normal production pagination defaults.
    - `deploy/phase0-soak-recorder.service` — added a separate paper/read-only systemd unit with
-     memory/CPU/I/O/path limits; production bootstrap sample count remains zero.
+     384 MB process/512 MB cgroup memory limits, 35% CPU quota, a 64-asset LRU, low I/O priority,
+     and protected paths; production bootstrap sample count remains zero.
    - `requirements-phase0-soak.txt` — isolated the recorder's pinned `aiohttp` dependency from the
      trading bot and the unrelated dirty `requirements.txt` changes.
    - `phase0_attribution.py` — exposed the existing pure exact-size bid-side SELL walk.
