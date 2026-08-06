@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import unittest
+import json
+from pathlib import Path
+import tempfile
 
 from audit_resolution_timing import classify_resolution_timing, parse_timestamp
-from analyze_clean_cohort import bootstrap, estimators
+from analyze_clean_cohort import bootstrap, estimators, load_resolution_audit
 
 
 class TestResolutionTiming(unittest.TestCase):
@@ -28,6 +31,23 @@ class TestResolutionTiming(unittest.TestCase):
 
 
 class TestClusterBootstrap(unittest.TestCase):
+    def test_resolution_audit_separates_phantom_and_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audit.json"
+            path.write_text(json.dumps({
+                "audit_version": "resolution-timing-v1",
+                "rows": [
+                    {"id": "p", "verdict": "phantom"},
+                    {"id": "u", "verdict": "unknown"},
+                    {"id": "l", "verdict": "legit"},
+                ],
+            }))
+            phantom, unknown, summary = load_resolution_audit(path)
+        self.assertEqual(phantom, {"p"})
+        self.assertEqual(unknown, {"u"})
+        self.assertEqual(summary["factual_phantom_count_excluded"], 1)
+        self.assertEqual(summary["unknown_count_excluded_from_fact_clean_estimators"], 1)
+
     def test_estimators_separate_equal_and_cost_weighting(self):
         rows = [
             {"wallet": "a", "pnl": 1.0, "cost": 1.0},

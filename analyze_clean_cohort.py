@@ -76,12 +76,28 @@ def summarize(rows, draws, seed):
     }
 
 
-def analyze(db_path, draws=10_000, seed=20260807):
+def load_resolution_audit(path):
+    if path is None:
+        return set(), set(), None
+    report = json.loads(Path(path).read_text())
+    phantom_ids = {row["id"] for row in report.get("rows", [])
+                   if row.get("verdict") == "phantom"}
+    unknown_ids = {row["id"] for row in report.get("rows", [])
+                   if row.get("verdict") == "unknown"}
+    return phantom_ids, unknown_ids, {
+        "audit_version": report.get("audit_version"),
+        "factual_phantom_count_excluded": len(phantom_ids),
+        "unknown_count_excluded_from_fact_clean_estimators": len(unknown_ids),
+    }
+
+
+def analyze(db_path, draws=10_000, seed=20260807, resolution_audit=None):
+    phantom_ids, unknown_ids, audit_summary = load_resolution_audit(resolution_audit)
     conn = sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         db_rows = conn.execute(
-            "SELECT lower(pt.wallet_address) wallet,pt.market_slug market,"
+            "SELECT pt.id,lower(pt.wallet_address) wallet,pt.market_slug market,"
             "pt.realized_pnl_usd pnl,pt.cost_basis_usd cost,"
             "COALESCE(wp.circuit_breaker_muted,1) muted "
             "FROM paper_trade pt LEFT JOIN wallet_profile wp "
@@ -92,13 +108,17 @@ def analyze(db_path, draws=10_000, seed=20260807):
         ).fetchall()
     finally:
         conn.close()
-    rows = [dict(row) for row in db_rows]
+    rows = [dict(row) for row in db_rows
+            if row["id"] not in phantom_ids and row["id"] not in unknown_ids]
     eligible = [row for row in rows if not row["muted"]]
-    return {
+    report = {
         "draws": draws, "seed": seed,
         "all_clean_rows": summarize(rows, draws, seed),
         "currently_eligible_wallet_rows": summarize(eligible, draws, seed + 10),
     }
+    if audit_summary is not None:
+        report["resolution_audit_filter"] = audit_summary
+    return report
 
 
 def main():
@@ -106,9 +126,13 @@ def main():
     parser.add_argument("--db", default=config.SQLITE_PATH)
     parser.add_argument("--draws", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=20260807)
+    parser.add_argument(
+        "--resolution-audit", type=Path,
+        help="Exclude factual phantom rows; keep UNKNOWN outside fact-clean estimators.",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    report = analyze(args.db, args.draws, args.seed)
+    report = analyze(args.db, args.draws, args.seed, args.resolution_audit)
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
