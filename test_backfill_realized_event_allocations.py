@@ -20,6 +20,7 @@ class TestAllocationBackfill(unittest.TestCase):
             Path(path).read_text() for path in (
                 "packages/db/drizzle/0024_small_xavin.sql",
                 "packages/db/drizzle/0025_smart_rocket_racer.sql",
+                "packages/db/drizzle/0028_ledger_seals.sql",
             )
         ).replace("--> statement-breakpoint", "")
         conn.executescript("""

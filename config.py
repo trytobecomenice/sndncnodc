@@ -1124,6 +1124,7 @@ LOG_BACKUP_COUNT = 5
 # still bounding the table's long-run growth (was 127MB/15k+ rows and
 # growing with zero pruning before this).
 EVENT_LOG_RETENTION_DAYS = 180
+LEDGER_INTEGRITY_INTERVAL_SECONDS = 3600
 PRUNE_INTERVAL_SECONDS = 86400  # once/day — cheap, no need to run more often
 
 # "static": get_tracked_traders() returns TRACKED_TRADERS above, unchanged
@@ -1235,15 +1236,16 @@ ENABLE_OMS_SHADOW_MIRROR = False
 # built) -- reused here, not re-invented.
 ENABLE_TELEGRAM_ALERTS = True
 
-# A single Python exception (event_type="error") sends an immediate
-# Telegram alert, but no more than one per this many seconds -- a burst of
-# the same underlying failure (e.g. a CLOB outage hitting every open
-# position in one sweep) must not flood Telegram the way it would flood a
-# human's phone. Suppressed-during-the-window errors are folded into the
-# next alert's count rather than silently dropped. 5 min matches the TTP
-# sweep cadence this codebase already treats as its "reaction time" unit
-# elsewhere (risk_manager.py's kill-switch equity refresh).
+# Legacy compatibility constant. Generic error alerts now use durable,
+# fingerprint-scoped exponential backoff in db.py, so one noisy resource
+# cannot suppress a distinct auth/risk failure.
 TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS = 300
+
+# Behavioural backstop for permanent market-data failures whose API wording
+# is not yet in the narrow permanent-error classifier.  It never auto-
+# quarantines: after this continuous age it raises SUSPECTED_STRUCTURAL for
+# one operator decision while remaining in the Gate-A failure denominator.
+TTP_SUSPECTED_STRUCTURAL_AFTER_SECONDS = 6 * 3600
 
 # The daily Telegram PnL summary piggybacks on
 # maybe_snapshot_daily_portfolio()'s existing once-per-UTC-day trigger

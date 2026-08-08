@@ -17,6 +17,11 @@ from pathlib import Path
 import sqlite3
 
 import config
+import db
+from ledger_integrity import audit_ledger
+from qualification_gates import evaluate_ttp_gates, gate_failures
+from ledger_integrity import audit_ledger
+from qualification_gates import evaluate_ttp_gates, gate_failures
 from db import (
     _REALIZED_ALLOCATION_TABLE,
     _REALIZED_ALLOCATOR_VERSION,
@@ -84,14 +89,18 @@ def evaluate_preconditions(conn, protocol, now_ts):
     if unresolved is None or unresolved > 0:
         reasons.append("realized_event_allocation_not_complete")
 
+    ledger_integrity = audit_ledger(conn, db._REALIZED_PNL_EVENT_TYPES)
+    checks["ledger_integrity"] = ledger_integrity
+    if ledger_integrity["status"] != "PASS":
+        reasons.append("ledger_integrity_not_proven")
+
     quarantine = _risk_value(conn, _TTP_PRICE_QUARANTINE_KEY) or {}
-    active_quarantines = sum(
-        isinstance(item, dict) and item.get("status") == "QUARANTINED_UNPRICEABLE"
-        for item in (quarantine.get("entries") or {}).values()
-    )
+    quarantine_entries = {
+        key: item for key, item in (quarantine.get("entries") or {}).items()
+        if isinstance(item, dict) and item.get("status") == "QUARANTINED_UNPRICEABLE"
+    }
+    active_quarantines = len(quarantine_entries)
     checks["active_unpriceable_quarantines"] = active_quarantines
-    if active_quarantines:
-        reasons.append("active_unpriceable_market_quarantine")
 
     rows = conn.execute(
         "SELECT timestamp,payload_json FROM bot_event_log "
@@ -101,9 +110,9 @@ def evaluate_preconditions(conn, protocol, now_ts):
     attempted = successful = executable = 0
     for row in rows:
         payload = json.loads(row["payload_json"])
-        attempted += int(payload.get("attempted_positions") or 0)
-        successful += int(payload.get("successful_price_reads") or 0)
-        executable += int(payload.get("executable_bid_reads") or 0)
+        attempted += int(payload.get("fetch_attempted_positions") or 0)
+        successful += int(payload.get("pipeline_successful_price_reads") or 0)
+        executable += int(payload.get("pipeline_executable_bid_reads") or 0)
     timestamps = [row["timestamp"] for row in rows]
     max_gap_seconds = max(
         (right - left for left, right in zip(timestamps, timestamps[1:])), default=None
@@ -121,6 +130,41 @@ def evaluate_preconditions(conn, protocol, now_ts):
         json.loads(row["payload_json"]).get("qualification_schema_version")
         == q["ttp_observation_schema_version"] for row in rows
     )
+    # Conservative equity subtracts unpriceable cost from the latest marked
+    # portfolio equity; UNKNOWN stays UNKNOWN when the snapshot/schema is absent.
+    paper_columns = ({item["name"] for item in conn.execute("PRAGMA table_info(paper_trade)")}
+                     if _table_exists(conn, "paper_trade") else set())
+    quarantined_cost = 0.0
+    if {"market_slug", "outcome", "cost_basis_usd", "status"}.issubset(paper_columns):
+        for item in quarantine_entries.values():
+            row = conn.execute(
+                "SELECT COALESCE(SUM(cost_basis_usd),0) value FROM paper_trade "
+                "WHERE status='open' AND market_slug=? AND outcome=?",
+                (item.get("market_slug"), item.get("outcome")),
+            ).fetchone()
+            quarantined_cost += float(row["value"] or 0)
+    marked_equity = None
+    if _table_exists(conn, "pnl_snapshot"):
+        snapshot = conn.execute(
+            "SELECT realized_pnl_usd,unrealized_pnl_usd FROM pnl_snapshot "
+            "WHERE scope='portfolio' ORDER BY captured_at DESC LIMIT 1"
+        ).fetchone()
+        if snapshot:
+            marked_equity = (float(config.PAPER_BANKROLL_USD)
+                             + float(snapshot["realized_pnl_usd"])
+                             + float(snapshot["unrealized_pnl_usd"])
+                             - quarantined_cost)
+    new_quarantines = sum(
+        int(item.get("quarantined_at") or 0) >= cutoff
+        for item in quarantine_entries.values()
+    )
+    gates = evaluate_ttp_gates(
+        fetch_attempted=attempted, successful=successful, executable=executable,
+        quarantined_count=active_quarantines,
+        quarantined_cost_basis_usd=quarantined_cost,
+        conservative_equity_usd=marked_equity, new_quarantines=new_quarantines,
+        policy=q,
+    )
     price_rate = successful / attempted if attempted else None
     bid_rate = executable / attempted if attempted else None
     checks["ttp"] = {"attempted": attempted, "successful": successful,
@@ -129,12 +173,17 @@ def evaluate_preconditions(conn, protocol, now_ts):
                      "max_gap_seconds": max_gap_seconds,
                      "schema_version_ok": ttp_schema_ok,
                      "termination_classifier_heartbeat": classifier_heartbeat_ok}
+    checks["structural_unpriceable"] = {
+        "active_count": active_quarantines,
+        "cost_basis_usd": quarantined_cost,
+        "conservative_equity_usd": marked_equity,
+        "new_in_window": new_quarantines,
+        "legacy_keys_frozen": sorted(q.get("legacy_quarantine_keys", [])),
+    }
+    checks["qualification_gates"] = [gate.to_dict() for gate in gates]
     if not ttp_span_ok:
         reasons.append("ttp_qualification_window_incomplete")
-    if price_rate is None or price_rate < q["ttp_price_read_success_rate_min"]:
-        reasons.append("ttp_price_read_slo_failed")
-    if bid_rate is None or bid_rate < q["ttp_executable_bid_rate_min"]:
-        reasons.append("ttp_executable_bid_slo_failed")
+    reasons.extend(gate_failures(gates))
     if not classifier_heartbeat_ok:
         reasons.append("termination_classifier_qualification_window_incomplete")
     if not ttp_schema_ok:

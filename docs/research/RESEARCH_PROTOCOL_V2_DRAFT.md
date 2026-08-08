@@ -43,18 +43,25 @@ The epoch cannot start until all are true for a continuous seven-day window:
 
 1. durable event-to-tax-lot PnL ledger is authoritative with zero unresolved
    allocations;
-2. TTP price-read success and executable-bid rates are each at least 99%;
+2. Gate A pricing-pipeline price-read success and executable-bid rates are
+   each at least 99%, using actual fetch attempts as the denominator; zero
+   attempts are `UNKNOWN`, never a vacuous PASS;
 3. event-time termination classifier is deployed and `UNKNOWN <= 1%` among
    final `bot_filtered` lot terminations whose allocation source is `live`
    and whose event time falls inside the qualification window. Historical
    backfill and partial reductions are excluded from this denominator;
-4. there are zero active `QUARANTINED_UNPRICEABLE` positions. Quarantine
-   suppresses retry noise but never turns an unknown mark into a successful
-   observation or accounting finality;
+4. Gate B reports `QUARANTINED_UNPRICEABLE` separately by frozen legacy
+   identity/count, cost basis divided by conservative equity, age and hourly
+   official-reconciliation freshness. Any new quarantine in the seven-day
+   window resets the clock. Quarantine never turns an unknown mark into a
+   successful observation or accounting finality;
 5. frozen latency ECDF, entity clustering version, termination classifier,
    dataset schema, protocol, evaluator, MC seed/code, and reference parameter
    table are present in one SHA-256 manifest;
 6. selected and randomized matched-control cohorts are fixed.
+7. hourly E/A/L integrity observations pass, every pruned realized-event
+   range has an append-only canonical SHA-256 seal, and acquired/sold/remaining
+   shares conserve. Missing quantity evidence is `UNKNOWN`, never zero.
 
 ## Statistical units and controls
 

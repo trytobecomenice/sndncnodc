@@ -7,9 +7,12 @@
   "qualification": {
     "window_days": 7,
     "coverage_grace_seconds": 600,
-    "ttp_observation_schema_version": "ttp-sweep-observation-v2",
+    "ttp_observation_schema_version": "ttp-sweep-observation-v3",
     "ttp_price_read_success_rate_min": 0.99,
     "ttp_executable_bid_rate_min": 0.99,
+    "legacy_quarantine_keys": [],
+    "legacy_quarantine_count_max": 0,
+    "quarantined_cost_basis_to_equity_max": 0.10,
     "termination_unknown_rate_max": 0.01
   },
   "evidence": {

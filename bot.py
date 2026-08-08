@@ -1316,21 +1316,40 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
     latencies_ms = sorted(
         result[3] for result in price_results.values() if result[3] is not None
     )
-    successful_prices = sum(result[1] is not None for result in price_results.values())
-    executable_bids = sum(result[0] is not None for result in price_results.values())
+    fetch_results = [price_results[item[0]] for item in fetchable]
+    successful_prices = sum(result[1] is not None for result in fetch_results)
+    executable_bids = sum(result[0] is not None for result in fetch_results)
+    quarantined_cost_basis = sum(
+        float((positions.get(key) or {}).get("cost_basis_usd") or 0)
+        for key in quarantined_keys
+    )
+    suspected_structural = sum(
+        state.get("status") == "SUSPECTED_STRUCTURAL"
+        for state in ttp_price_failure_states.values()
+    )
     append_log({
         "timestamp": now_iso(),
         "event_type": "ttp_sweep_observation",
         "attempted_positions": len(eligible),
+        "fetch_attempted_positions": len(fetchable),
+        "pipeline_successful_price_reads": successful_prices,
+        "pipeline_executable_bid_reads": executable_bids,
+        "pipeline_failed_price_reads": len(fetchable) - successful_prices,
+        # Legacy observability only; protocol v2 must not use these mixed
+        # pipeline+inventory denominators.
         "successful_price_reads": successful_prices,
         "executable_bid_reads": executable_bids,
         "failed_price_reads": len(eligible) - successful_prices,
         "quarantined_positions": len(quarantined_keys),
-        "price_read_success_rate": successful_prices / len(eligible),
-        "executable_bid_rate": executable_bids / len(eligible),
+        "quarantined_cost_basis_usd": quarantined_cost_basis,
+        "suspected_structural_positions": suspected_structural,
+        "price_read_success_rate": (successful_prices / len(fetchable)
+                                    if fetchable else None),
+        "executable_bid_rate": (executable_bids / len(fetchable)
+                                if fetchable else None),
         "latency_p50_ms": latencies_ms[len(latencies_ms) // 2] if latencies_ms else None,
         "latency_max_ms": latencies_ms[-1] if latencies_ms else None,
-        "qualification_schema_version": "ttp-sweep-observation-v2",
+        "qualification_schema_version": "ttp-sweep-observation-v3",
         "termination_classifier_version": "termination-cause-v1",
     })
 
@@ -1392,21 +1411,35 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
                 pos["ttp_eligible_pricing_failure_count"] = (
                     int(pos.get("ttp_eligible_pricing_failure_count", 0)) + 1
                 )
-            if persistent_quarantine and _is_permanent_ttp_price_failure(err):
-                state = record_ttp_permanent_price_failure(
-                    market_slug, outcome, err, threshold=3
-                )
+            if persistent_quarantine:
+                permanent = _is_permanent_ttp_price_failure(err)
+                if permanent:
+                    state = record_ttp_permanent_price_failure(
+                        market_slug, outcome, err, threshold=3,
+                    )
+                    state.setdefault("newly_suspected", False)
+                else:
+                    state = record_ttp_price_failure(
+                        market_slug, outcome, err, permanent=False,
+                        quarantine_threshold=3,
+                        suspected_after_seconds=config.TTP_SUSPECTED_STRUCTURAL_AFTER_SECONDS,
+                    )
                 ttp_price_failure_states[(market_slug, outcome)] = state
-                append_log({
-                    "timestamp": now_iso(),
-                    "event_type": ("ttp_market_quarantined" if state["newly_quarantined"]
-                                   else "ttp_permanent_price_failure_observed"),
-                    "trader_address": trader, "market_slug": market_slug,
-                    "outcome": outcome, "consecutive_failures": state["consecutive_failures"],
-                    "quarantine_status": state["status"],
-                    "error": f"trailing_tp price check: {err}",
-                })
-            else:
+                if state["newly_quarantined"] or state["newly_suspected"] or permanent:
+                    append_log({
+                        "timestamp": now_iso(),
+                        "event_type": ("ttp_market_quarantined" if state["newly_quarantined"]
+                                       else "ttp_market_suspected_structural"
+                                       if state["newly_suspected"]
+                                       else "ttp_permanent_price_failure_observed"),
+                        "trader_address": trader, "market_slug": market_slug,
+                        "outcome": outcome,
+                        "consecutive_failures": state["consecutive_failures"],
+                        "failure_age_seconds": state.get("failure_age_seconds"),
+                        "quarantine_status": state["status"],
+                        "error": f"trailing_tp price check: {err}",
+                    })
+            if not persistent_quarantine or not _is_permanent_ttp_price_failure(err):
                 append_log({"timestamp": now_iso(), "event_type": "error",
                             "trader_address": trader, "market_slug": market_slug,
                             "outcome": outcome, "error": f"trailing_tp price check: {err}"})
@@ -1655,6 +1688,7 @@ def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_
                     "market_slug": market_slug, "outcome": outcome,
                     "final_price": final_price,
                     "our_shares_closed": pos["shares"],
+                    "our_shares_remaining": 0.0,
                     "proceeds_usd": proceeds_usd,
                     "cost_basis_usd": pos["cost_basis_usd"],
                     "pnl_usd": pnl_usd,
@@ -2412,7 +2446,7 @@ from db import (  # noqa: E402
     load_state, save_state, append_log, get_tracked_traders, get_monitored_noncopying_traders,
     get_wallet_composite_scores,
     get_wallet_realized_ev_stats,
-    get_realized_ledger_reader_status,
+    get_realized_ledger_reader_status, get_realized_ledger_integrity_status,
     get_risk_value, set_risk_value, clear_risk_value, load_market_events, save_market_event,
     load_market_categories, save_market_category, get_active_rule_set_version,
     realized_pnl_total, realized_pnl_since, get_or_create_evaluation_epoch,
@@ -2428,7 +2462,8 @@ from db import (  # noqa: E402
     update_shadow_patient_exit_price, close_shadow_patient_exit,
     load_market_end_dates, save_market_end_date,
     load_shadow_positions, save_shadow_positions, get_shadow_rehab_returns,
-    load_ttp_price_failure_states, record_ttp_permanent_price_failure,
+    load_ttp_price_failure_states, record_ttp_price_failure,
+    record_ttp_permanent_price_failure,
     clear_ttp_price_failure_state,
     has_snapshot_for_today, record_daily_snapshot, realized_pnl_today,
 )
@@ -2496,6 +2531,27 @@ def engage_panic_protocol(risk_state, reasons):
         f"{reason_text}"
     )
     return kill_switch
+
+
+def enforce_realized_ledger_integrity(risk_state):
+    """Observe hourly; any proven mismatch immediately latches entry closed."""
+    status = get_realized_ledger_integrity_status()
+    append_log({"timestamp": now_iso(), "event_type": "ledger_integrity_observation", **status})
+    if status.get("status") != "FAIL":
+        return status
+    reasons = [f"ledger_integrity:{reason}" for reason in status.get("failures", [])]
+    current = risk_state.get("entry_interlock")
+    if not current or not current.get("active"):
+        interlock = {
+            "active": True, "status": "interlocked", "reasons": reasons,
+            "triggered_at": now_iso(), "requires_manual_clear": True,
+        }
+        risk_state["entry_interlock"] = interlock
+        set_risk_value("entry_interlock", interlock)
+        METRIC_ENTRY_INTERLOCK_ACTIVE.set(1)
+        append_log({"timestamp": now_iso(), "event_type": "risk_entry_interlock_triggered",
+                    "reasons": reasons})
+    return status
 
 
 def resolve_market_event(market_slug):
@@ -2818,6 +2874,7 @@ def _execute_shadow_buy(base_event, key, trader, market_slug, outcome, price, sh
     new_cost = pos["cost_basis_usd"] + actual_cost_usd
     pos["avg_entry_price"] = new_cost / new_shares if new_shares else 0.0
     pos["shares"] = new_shares
+    pos["total_acquired_shares"] = float(pos.get("total_acquired_shares") or 0) + our_shares
     pos["cost_basis_usd"] = new_cost
     pos["buy_count"] = pos.get("buy_count", 0) + 1
     shadow_positions[key] = pos
@@ -3263,6 +3320,7 @@ def _execute_buy(base_event, key, trader, market_slug, outcome, price, trade_usd
     new_cost = pos["cost_basis_usd"] + actual_cost_usd
     pos["avg_entry_price"] = new_cost / new_shares if new_shares else 0.0
     pos["shares"] = new_shares
+    pos["total_acquired_shares"] = float(pos.get("total_acquired_shares") or 0) + our_shares
     pos["cost_basis_usd"] = new_cost
     pos["buy_count"] = prior_buy_count + 1
     if price_source is not None:
@@ -4329,6 +4387,7 @@ def main():
     last_closeout_sweep = 0.0
     last_zombie_sweep = 0.0
     last_prune_sweep = 0.0
+    last_ledger_integrity_sweep = 0.0
     last_roster_refresh = time.time()
 
     while not SHUTDOWN_REQUESTED:
@@ -4638,6 +4697,18 @@ def main():
                     append_log({"timestamp": now_iso(), "event_type": "error",
                                 "error": f"zombie position sweep failed: {e}"})
                 persist()
+
+            if (not SHUTDOWN_REQUESTED
+                    and now - last_ledger_integrity_sweep
+                    >= config.LEDGER_INTEGRITY_INTERVAL_SECONDS):
+                last_ledger_integrity_sweep = now
+                try:
+                    enforce_realized_ledger_integrity(risk_state)
+                except Exception as e:
+                    # Failure to run an audit is observable degradation, but
+                    # not proof that the ledger itself mismatched.
+                    append_log({"timestamp": now_iso(), "event_type": "error",
+                                "error": f"ledger integrity audit failed: {e}"})
 
             # bot_event_log retention (2026-07-22) — see db.prune_event_log()'s
             # docstring for why this is a DELETE sweep, not a logging-handler

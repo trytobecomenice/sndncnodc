@@ -11,6 +11,7 @@ Run: python3 -m unittest test_db_prune -v
 """
 
 import os
+import json
 import sqlite3
 import tempfile
 import time
@@ -19,6 +20,7 @@ from unittest.mock import patch
 
 import config
 import db
+from ledger_integrity import audit_ledger
 
 
 class TestPruneEventLog(unittest.TestCase):
@@ -31,6 +33,26 @@ class TestPruneEventLog(unittest.TestCase):
             "event_type TEXT, trader_address TEXT, market_slug TEXT, outcome TEXT, "
             "side TEXT, payload_json TEXT NOT NULL)"
         )
+        conn.executescript("""
+        CREATE TABLE paper_trade(id TEXT PRIMARY KEY,cumulative_realized_pnl_usd REAL DEFAULT 0,
+          realized_event_count INTEGER DEFAULT 0,total_acquired_shares REAL,our_shares REAL,
+          status TEXT);
+        CREATE TABLE paper_trade_realized_allocation(
+          event_id TEXT PRIMARY KEY,paper_trade_id TEXT,event_timestamp INTEGER,event_type TEXT,
+          strategy TEXT,pnl_usd REAL,cost_basis_usd REAL,allocation_status TEXT,
+          termination_cause TEXT,termination_classifier_version TEXT,
+          shares_closed REAL,shares_remaining REAL);
+        CREATE TABLE paper_trade_event_seal(
+          id TEXT PRIMARY KEY,range_start INTEGER,range_end INTEGER,event_count INTEGER,
+          pnl_micros INTEGER,shares_micros INTEGER,canonical_sha256 TEXT,sealer_version TEXT,
+          previous_chain_sha256 TEXT,chain_sha256 TEXT,sealed_at INTEGER);
+        CREATE UNIQUE INDEX paper_trade_event_seal_range_unique
+          ON paper_trade_event_seal(range_start,range_end);
+        CREATE TRIGGER paper_trade_event_seal_no_update BEFORE UPDATE ON paper_trade_event_seal
+          BEGIN SELECT RAISE(ABORT,'paper_trade_event_seal is append-only'); END;
+        CREATE TRIGGER paper_trade_event_seal_no_delete BEFORE DELETE ON paper_trade_event_seal
+          BEGIN SELECT RAISE(ABORT,'paper_trade_event_seal is append-only'); END;
+        """)
         conn.commit()
         conn.close()
         self._patcher = patch.object(config, "SQLITE_PATH", self.tmp_path)
@@ -80,6 +102,51 @@ class TestPruneEventLog(unittest.TestCase):
         deleted = db.prune_event_log()  # no explicit retention_days
         self.assertEqual(deleted, 1)
         self.assertEqual(self._row_count(), 1)
+
+    def _insert_realized_evidence(self, allocation_pnl=1.25):
+        ts = int(time.time() - 200 * 86400)
+        conn = sqlite3.connect(self.tmp_path)
+        conn.execute("INSERT INTO paper_trade VALUES('lot',?,1,2,0,'closed')", (allocation_pnl,))
+        conn.execute(
+            "INSERT INTO bot_event_log(id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+            ("sell-1", ts, "paper_sell", json.dumps({
+                "pnl_usd": 1.25, "our_shares_closed": 2, "our_shares_remaining": 0,
+            })),
+        )
+        conn.execute(
+            "INSERT INTO paper_trade_realized_allocation VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("sell-1", "lot", ts, "paper_sell", "bot_filtered", allocation_pnl, 1,
+             "matched", "SOURCE_EXIT", db._TERMINATION_CLASSIFIER_VERSION, 2, 0),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_realized_evidence_is_sealed_atomically_before_prune(self):
+        self._insert_realized_evidence()
+        self.assertEqual(db.prune_event_log(retention_days=180), 1)
+        conn = sqlite3.connect(self.tmp_path)
+        conn.row_factory = sqlite3.Row
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_trade_event_seal").fetchone()[0], 1)
+        self.assertEqual(audit_ledger(conn, db._REALIZED_PNL_EVENT_TYPES)["status"], "PASS")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+            conn.execute("UPDATE paper_trade_event_seal SET event_count=2")
+        conn.close()
+
+    def test_mismatched_economic_evidence_aborts_prune_and_keeps_event(self):
+        self._insert_realized_evidence(allocation_pnl=9.0)
+        with self.assertRaisesRegex(RuntimeError, "PnL mismatch"):
+            db.prune_event_log(retention_days=180)
+        self.assertEqual(self._row_count(), 1)
+
+    def test_never_reduced_open_lot_still_obeys_share_conservation(self):
+        conn = sqlite3.connect(self.tmp_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("INSERT INTO paper_trade VALUES('open-lot',0,0,3,2,'open')")
+        conn.commit()
+        result = audit_ledger(conn, db._REALIZED_PNL_EVENT_TYPES)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["quantity_mismatch_lots"], 1)
+        conn.close()
 
 
 if __name__ == "__main__":

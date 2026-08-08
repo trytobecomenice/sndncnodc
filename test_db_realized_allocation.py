@@ -186,6 +186,20 @@ class TestDurableRealizedAllocation(unittest.TestCase):
         self.assertTrue(db.clear_ttp_price_failure_state("dead-market", "Yes", now=50))
         self.assertEqual(db.load_ttp_price_failure_states(), {})
 
+    def test_unknown_wording_becomes_suspected_but_never_auto_quarantined(self):
+        first = db.record_ttp_price_failure(
+            "changed-api", "Yes", "410 Gone", permanent=False,
+            suspected_after_seconds=3600, now=100,
+        )
+        later = db.record_ttp_price_failure(
+            "changed-api", "Yes", "different permanent-looking wording",
+            permanent=False, suspected_after_seconds=3600, now=3701,
+        )
+        self.assertEqual(first["status"], "OBSERVING")
+        self.assertEqual(later["status"], "SUSPECTED_STRUCTURAL")
+        self.assertTrue(later["newly_suspected"])
+        self.assertFalse(later["newly_quarantined"])
+
     def test_explicit_resolution_cause_and_source_snapshot_are_preserved(self):
         self.insert_trade()
         event = {"timestamp": "t", "event_type": "position_resolved",

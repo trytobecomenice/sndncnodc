@@ -122,6 +122,14 @@ authority for fresh/current databases.
     denominator, and leaves official resolution to the low-frequency sweep. Deployment is blocked
     by disk preflight: free `8,537,518,080` bytes is below required `9,696,513,433`; another local
     backup would project 88.61% utilization. No AWS mutation was attempted.
+11. **2026-08-09 invariant release is implemented locally, still not deployed:** shared Gate A/B
+    definitions now drive both preflight and evaluator; hourly E/A/L accounting checks cover
+    event IDs, integer-micro PnL and tax-lot share conservation. Destructive 180-day event-log
+    retention first writes an append-only, chained SHA-256 economic seal in the same transaction,
+    or aborts the prune. Unknown long-running TTP failures become `SUSPECTED_STRUCTURAL` without
+    automatic quarantine. Generic Telegram errors now use durable per-fingerprint exponential
+    backoff and emit a recovery transition, so a dead market cannot mask an unrelated auth error.
+    This release has not changed AWS, started qualification, reset HWM, or authorized Live.
 
 ## 2026-08-05 repository separation
 

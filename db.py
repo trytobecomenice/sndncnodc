@@ -26,6 +26,8 @@ the two systems would silently fight each other.
 
 import json
 import logging
+import hashlib
+import re
 import sqlite3
 import time
 import uuid
@@ -48,12 +50,11 @@ _EVENTS_TOTAL = Counter(
     "copybot_events_total", "Count of bot_event_log events by type", ["event_type"],
 )
 
-# Throttle state for the "error" event Telegram alert below — module-level
-# and in-memory on purpose (same convention as bot.py's
-# _closeout_fetch_failures): a restart resetting this to "send immediately"
-# is fine, unlike a real risk-state value that must survive restarts.
-_last_error_alert_ts = 0
-_errors_suppressed_since_last_alert = 0
+# Durable, fingerprint-scoped generic error-alert state. Restarts must not
+# reset a noisy fault's backoff or let that fault mask an unrelated alert.
+_ERROR_ALERT_STATE_KEY = "telegram_error_alert_state_v2"
+_ERROR_ALERT_STATE_VERSION = "telegram-error-fingerprint-v2"
+_ERROR_ALERT_BACKOFF_SECONDS = (0, 900, 3600, 21600, 86400)
 
 # Named logger, no handlers attached HERE (2026-07-22, disk-exhaustion
 # hardening — replaces append_log()'s old print()). Deliberately relies on
@@ -214,6 +215,16 @@ def get_realized_ledger_reader_status():
         conn.close()
 
 
+def get_realized_ledger_integrity_status():
+    """Read-only E/A/L + retention-seal invariant used by runtime/preflight."""
+    from ledger_integrity import audit_ledger
+    conn = _connect()
+    try:
+        return audit_ledger(conn, _REALIZED_PNL_EVENT_TYPES)
+    finally:
+        conn.close()
+
+
 def _clean_paper_trade_predicate(conn, alias=None):
     """SQL predicate excluding confirmed phantom Paper rows when available."""
     if not _paper_trade_has_column(conn, "is_phantom"):
@@ -314,8 +325,10 @@ def load_state():
                 ).fetchall()
             }
         clean_open_predicate = _clean_paper_trade_predicate(conn)
+        quantity_select = ("total_acquired_shares" if _paper_trade_has_column(
+            conn, "total_acquired_shares") else "our_shares AS total_acquired_shares")
         cur = conn.execute(
-            "SELECT id,wallet_address, market_slug, outcome, our_shares, cost_basis_usd, "
+            f"SELECT id,wallet_address, market_slug, outcome, our_shares, {quantity_select}, cost_basis_usd, "
             "avg_entry_price, buy_count, peak_profit_pct, opened_at, last_priced_at FROM paper_trade "
             "WHERE status = 'open' AND strategy = 'bot_filtered' AND is_demo_data = 0 "
             f"AND {clean_open_predicate}"
@@ -352,6 +365,8 @@ def load_state():
                 # entry-to-resolution runway has elapsed.
                 "opened_at": row["opened_at"],
             }
+            if _paper_trade_has_column(conn, "total_acquired_shares"):
+                positions[key]["total_acquired_shares"] = row["total_acquired_shares"]
 
         source_positions = {}
         source_cost_basis = {}
@@ -462,6 +477,7 @@ def save_state(state):
     """
     conn = _connect()
     try:
+        has_total_acquired = _paper_trade_has_column(conn, "total_acquired_shares")
         for entry in state.get("seen_trade_ids", []):
             conn.execute(
                 "INSERT OR IGNORE INTO bot_seen_trade (trade_id, wallet_address, seen_at) VALUES (?, ?, ?)",
@@ -512,6 +528,7 @@ def save_state(state):
             trader, market_slug, outcome = parts
             seen_keys.add((trader, market_slug, outcome))
             shares = pos.get("shares", 0.0)
+            total_acquired_shares = pos.get("total_acquired_shares")
             cost_basis = pos.get("cost_basis_usd", 0.0)
             avg_entry = pos.get("avg_entry_price", 0.0)
             buy_count = pos.get("buy_count", 0)
@@ -533,24 +550,44 @@ def save_state(state):
             last_decision_journal_id = pos.get("last_decision_journal_id")
             row_id = existing.get((trader, market_slug, outcome))
             if row_id:
-                conn.execute(
-                    "UPDATE paper_trade SET our_shares=?, cost_basis_usd=?, avg_entry_price=?, "
-                    "buy_count=?, peak_profit_pct=?, last_priced_at=? WHERE id=?",
-                    (shares, cost_basis, avg_entry, buy_count, peak, last_priced_at, row_id),
-                )
+                if has_total_acquired:
+                    conn.execute(
+                        "UPDATE paper_trade SET our_shares=?, total_acquired_shares=?, cost_basis_usd=?, avg_entry_price=?, "
+                        "buy_count=?, peak_profit_pct=?, last_priced_at=? WHERE id=?",
+                        (shares, total_acquired_shares, cost_basis, avg_entry, buy_count, peak,
+                         last_priced_at, row_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE paper_trade SET our_shares=?, cost_basis_usd=?, avg_entry_price=?, "
+                        "buy_count=?, peak_profit_pct=?, last_priced_at=? WHERE id=?",
+                        (shares, cost_basis, avg_entry, buy_count, peak, last_priced_at, row_id),
+                    )
             else:
                 row_id = _new_id()
-                conn.execute(
+                if has_total_acquired:
+                    conn.execute(
                     "INSERT INTO paper_trade (id, strategy, wallet_address, market_slug, outcome, "
-                    "our_size_usd, cost_basis_usd, our_shares, avg_entry_price, buy_count, status, "
+                    "our_size_usd, cost_basis_usd, our_shares, total_acquired_shares, avg_entry_price, buy_count, status, "
                     "opened_at, peak_profit_pct, last_priced_at, decision_journal_id) "
-                    "VALUES (?, 'bot_filtered', ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
+                    "VALUES (?, 'bot_filtered', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
                     (
                         row_id, trader, market_slug, outcome, cost_basis, cost_basis,
-                        shares, avg_entry, buy_count, _now_ts(), peak, last_priced_at or _now_ts(),
+                        shares, total_acquired_shares, avg_entry, buy_count, _now_ts(), peak,
+                        last_priced_at or _now_ts(),
                         last_decision_journal_id,
                     ),
-                )
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO paper_trade (id,strategy,wallet_address,market_slug,outcome,"
+                        "our_size_usd,cost_basis_usd,our_shares,avg_entry_price,buy_count,status,"
+                        "opened_at,peak_profit_pct,last_priced_at,decision_journal_id) "
+                        "VALUES(?,'bot_filtered',?,?,?,?,?,?,?,?,'open',?,?,?,?)",
+                        (row_id, trader, market_slug, outcome, cost_basis, cost_basis, shares,
+                         avg_entry, buy_count, _now_ts(), peak, last_priced_at or _now_ts(),
+                         last_decision_journal_id),
+                    )
 
             if last_decision_journal_id:
                 conn.execute(
@@ -666,8 +703,10 @@ def load_shadow_positions(strategy="shadow_rehab"):
     strategy = _validate_shadow_strategy(strategy)
     conn = _connect()
     try:
+        quantity_select = ("total_acquired_shares" if _paper_trade_has_column(
+            conn, "total_acquired_shares") else "our_shares AS total_acquired_shares")
         cur = conn.execute(
-            "SELECT wallet_address, market_slug, outcome, our_shares, cost_basis_usd, "
+            f"SELECT wallet_address, market_slug, outcome, our_shares, {quantity_select}, cost_basis_usd, "
             "avg_entry_price, buy_count FROM paper_trade "
             "WHERE status = 'open' AND strategy = ? AND is_demo_data = 0",
             (strategy,),
@@ -681,6 +720,8 @@ def load_shadow_positions(strategy="shadow_rehab"):
                 "avg_entry_price": row["avg_entry_price"],
                 "buy_count": row["buy_count"],
             }
+            if _paper_trade_has_column(conn, "total_acquired_shares"):
+                shadow_positions[key]["total_acquired_shares"] = row["total_acquired_shares"]
         return shadow_positions
     finally:
         conn.close()
@@ -697,6 +738,7 @@ def save_shadow_positions(shadow_positions, strategy="shadow_rehab"):
     strategy = _validate_shadow_strategy(strategy)
     conn = _connect()
     try:
+        has_total_acquired = _paper_trade_has_column(conn, "total_acquired_shares")
         cur = conn.execute(
             "SELECT id, wallet_address, market_slug, outcome FROM paper_trade "
             "WHERE status = 'open' AND strategy = ? AND is_demo_data = 0",
@@ -714,26 +756,42 @@ def save_shadow_positions(shadow_positions, strategy="shadow_rehab"):
             trader, market_slug, outcome = parts
             seen_keys.add((trader, market_slug, outcome))
             shares = pos.get("shares", 0.0)
+            total_acquired_shares = pos.get("total_acquired_shares")
             cost_basis = pos.get("cost_basis_usd", 0.0)
             avg_entry = pos.get("avg_entry_price", 0.0)
             buy_count = pos.get("buy_count", 0)
             row_id = existing.get((trader, market_slug, outcome))
             if row_id:
-                conn.execute(
-                    "UPDATE paper_trade SET our_shares=?, cost_basis_usd=?, avg_entry_price=?, "
+                if has_total_acquired:
+                    conn.execute(
+                    "UPDATE paper_trade SET our_shares=?, total_acquired_shares=?, cost_basis_usd=?, avg_entry_price=?, "
                     "buy_count=? WHERE id=?",
-                    (shares, cost_basis, avg_entry, buy_count, row_id),
-                )
+                    (shares, total_acquired_shares, cost_basis, avg_entry, buy_count, row_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE paper_trade SET our_shares=?,cost_basis_usd=?,avg_entry_price=?,"
+                        "buy_count=? WHERE id=?", (shares, cost_basis, avg_entry, buy_count, row_id)
+                    )
             else:
-                conn.execute(
+                if has_total_acquired:
+                    conn.execute(
                     "INSERT INTO paper_trade (id, strategy, wallet_address, market_slug, outcome, "
-                    "our_size_usd, cost_basis_usd, our_shares, avg_entry_price, buy_count, status, "
-                    "opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)",
+                    "our_size_usd, cost_basis_usd, our_shares, total_acquired_shares, avg_entry_price, buy_count, status, "
+                    "opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)",
                     (
                         _new_id(), strategy, trader, market_slug, outcome, cost_basis, cost_basis,
-                        shares, avg_entry, buy_count, _now_ts(),
+                        shares, total_acquired_shares, avg_entry, buy_count, _now_ts(),
                     ),
-                )
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO paper_trade(id,strategy,wallet_address,market_slug,outcome,"
+                        "our_size_usd,cost_basis_usd,our_shares,avg_entry_price,buy_count,status,opened_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,'open',?)",
+                        (_new_id(), strategy, trader, market_slug, outcome, cost_basis, cost_basis,
+                         shares, avg_entry, buy_count, _now_ts()),
+                    )
 
         # Same fail-safe as save_state(): a row still open here with a key
         # missing from shadow_positions means something closed it without
@@ -915,17 +973,36 @@ def _allocate_realized_event(conn, event_id, event, strategy, event_timestamp):
         ).fetchall()
     status = "matched" if len(candidates) == 1 else ("unmatched" if not candidates else "ambiguous")
     paper_trade_id = candidates[0]["id"] if len(candidates) == 1 else None
-    inserted = conn.execute(
-        f"INSERT OR IGNORE INTO {_REALIZED_ALLOCATION_TABLE} "
-        "(event_id,paper_trade_id,event_timestamp,event_type,strategy,pnl_usd,cost_basis_usd,"
-        "allocation_status,candidate_count,allocator_version,allocation_source,termination_cause,"
-        "source_shares_at_termination,termination_classifier_version,allocated_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (event_id, paper_trade_id, event_timestamp, event.get("event_type"), strategy,
-         pnl_usd, cost_basis_usd, status, len(candidates), _REALIZED_ALLOCATOR_VERSION,
-         "live", _termination_cause_for_event(event), event.get("source_shares_at_termination"),
-         _TERMINATION_CLASSIFIER_VERSION, _now_ts()),
-    )
+    allocation_columns = {
+        row["name"] for row in conn.execute(
+            f"PRAGMA table_info({_REALIZED_ALLOCATION_TABLE})"
+        ).fetchall()
+    }
+    if {"shares_closed", "shares_remaining"}.issubset(allocation_columns):
+        inserted = conn.execute(
+            f"INSERT OR IGNORE INTO {_REALIZED_ALLOCATION_TABLE} "
+            "(event_id,paper_trade_id,event_timestamp,event_type,strategy,pnl_usd,cost_basis_usd,"
+            "allocation_status,candidate_count,allocator_version,allocation_source,termination_cause,"
+            "source_shares_at_termination,shares_closed,shares_remaining,"
+            "termination_classifier_version,allocated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (event_id, paper_trade_id, event_timestamp, event.get("event_type"), strategy,
+             pnl_usd, cost_basis_usd, status, len(candidates), _REALIZED_ALLOCATOR_VERSION,
+             "live", _termination_cause_for_event(event), event.get("source_shares_at_termination"),
+             event.get("our_shares_closed"), event.get("our_shares_remaining"),
+             _TERMINATION_CLASSIFIER_VERSION, _now_ts()),
+        )
+    else:
+        inserted = conn.execute(
+            f"INSERT OR IGNORE INTO {_REALIZED_ALLOCATION_TABLE} "
+            "(event_id,paper_trade_id,event_timestamp,event_type,strategy,pnl_usd,cost_basis_usd,"
+            "allocation_status,candidate_count,allocator_version,allocation_source,termination_cause,"
+            "source_shares_at_termination,termination_classifier_version,allocated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (event_id, paper_trade_id, event_timestamp, event.get("event_type"), strategy,
+             pnl_usd, cost_basis_usd, status, len(candidates), _REALIZED_ALLOCATOR_VERSION,
+             "live", _termination_cause_for_event(event), event.get("source_shares_at_termination"),
+             _TERMINATION_CLASSIFIER_VERSION, _now_ts()),
+        )
     if paper_trade_id and inserted.rowcount == 1:
         conn.execute(
             "UPDATE paper_trade SET cumulative_realized_pnl_usd="
@@ -1090,6 +1167,13 @@ def append_log(event):
             "High-frequency retries stopped; position remains unpriceable and in risk. "
             "Official-resolution reconciliation continues at low frequency."
         )
+    elif event_type == "ttp_market_suspected_structural":
+        telegram_alerts.send_telegram_alert(
+            f"⚠️ TTP pricing failure needs classification: {event.get('market_slug')} / "
+            f"{event.get('outcome')} has failed continuously for "
+            f"{event.get('failure_age_seconds', '?')}s. It remains in the pipeline SLO "
+            "denominator and has NOT been auto-quarantined."
+        )
     elif event_type == "error":
         _maybe_send_throttled_error_alert(event)
 
@@ -1097,22 +1181,69 @@ def append_log(event):
 
 
 def _maybe_send_throttled_error_alert(event):
-    """See config.TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS's docstring: at most
-    one Telegram alert per window for `event_type="error"` rows, folding
-    any suppressed-during-the-window count into the next alert sent rather
-    than dropping it silently.
-    """
-    global _last_error_alert_ts, _errors_suppressed_since_last_alert
-    now = time.time()
-    if now - _last_error_alert_ts < config.TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS:
-        _errors_suppressed_since_last_alert += 1
-        return
-    suffix = (f" ({_errors_suppressed_since_last_alert} more suppressed in the last "
-              f"{config.TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS}s)"
-              if _errors_suppressed_since_last_alert else "")
-    telegram_alerts.send_telegram_alert(f"⚠️ copybot error: {event.get('error', '?')}{suffix}")
-    _last_error_alert_ts = now
-    _errors_suppressed_since_last_alert = 0
+    """Fingerprint-scoped OPEN/reminder alerts; one fault cannot mask another."""
+    now = int(time.time())
+    error = str(event.get("error") or "unknown error")
+    component = re.sub(r"\d+(?:\.\d+)?", "#",
+                       error.split(":", 1)[0].strip().lower())[:120]
+    resource = "|".join(str(event.get(key) or "") for key in (
+        "market_slug", "outcome", "trader_address"
+    ))
+    normalized = re.sub(r"\d+(?:\.\d+)?", "#", error.lower())[:500]
+    fingerprint = hashlib.sha256(
+        f"{component}\x1f{resource}\x1f{normalized}".encode("utf-8")
+    ).hexdigest()
+    conn = _connect()
+    send = False
+    suppressed = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value_json FROM bot_risk_state WHERE key=?", (_ERROR_ALERT_STATE_KEY,)
+        ).fetchone()
+        try:
+            state = json.loads(row["value_json"]) if row else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            state = {}
+        if state.get("version") != _ERROR_ALERT_STATE_VERSION:
+            state = {"version": _ERROR_ALERT_STATE_VERSION, "entries": {}}
+        entries = state.setdefault("entries", {})
+        item = entries.get(fingerprint)
+        if not item or item.get("status") == "RECOVERED":
+            item = {
+            "status": "OPEN", "first_seen_at": now, "last_alert_at": 0,
+            "alert_count": 0, "suppressed_count": 0,
+            }
+        index = min(int(item.get("alert_count") or 0), len(_ERROR_ALERT_BACKOFF_SECONDS) - 1)
+        delay = _ERROR_ALERT_BACKOFF_SECONDS[index]
+        if now - int(item.get("last_alert_at") or 0) >= delay:
+            send = True
+            suppressed = int(item.get("suppressed_count") or 0)
+            item["last_alert_at"] = now
+            item["alert_count"] = int(item.get("alert_count") or 0) + 1
+            item["suppressed_count"] = 0
+        else:
+            item["suppressed_count"] = int(item.get("suppressed_count") or 0) + 1
+        item.update({"last_seen_at": now, "last_error": error[:1000],
+                     "component": component, "resource": resource})
+        entries[fingerprint] = item
+        conn.execute(
+            "INSERT INTO bot_risk_state(key,value_json,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+            (_ERROR_ALERT_STATE_KEY, json.dumps(state, sort_keys=True), now),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        logger.exception("failed to persist Telegram error fingerprint state")
+        send = True  # alert-state failure must not silence the original error
+    finally:
+        conn.close()
+    if send:
+        suffix = f" ({suppressed} same-fingerprint occurrence(s) suppressed)" if suppressed else ""
+        telegram_alerts.send_telegram_alert(
+            f"⚠️ copybot error [{fingerprint[:10]}]: {error}{suffix}"
+        )
 
 
 def prune_event_log(retention_days=None):
@@ -1135,9 +1266,18 @@ def prune_event_log(retention_days=None):
     cutoff = _now_ts() - retention_days * 86400
     conn = _connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        # Once migration 0028 exists, destructive retention and its proof are
+        # one atomic operation. A missing/unresolved/mismatched realized event
+        # aborts the DELETE rather than silently erasing the authority layer.
+        from ledger_integrity import seal_realized_events_before
+        seal_realized_events_before(conn, cutoff, _REALIZED_PNL_EVENT_TYPES)
         cur = conn.execute("DELETE FROM bot_event_log WHERE timestamp < ?", (cutoff,))
         conn.commit()
         return cur.rowcount
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1599,7 +1739,9 @@ def load_ttp_price_failure_states():
     return result
 
 
-def record_ttp_permanent_price_failure(market_slug, outcome, error, threshold=3, now=None):
+def record_ttp_price_failure(market_slug, outcome, error, *, permanent=False,
+                             quarantine_threshold=3, suspected_after_seconds=21600,
+                             now=None):
     """Atomically count a structurally permanent book failure.
 
     The first transition to QUARANTINED_UNPRICEABLE is returned to the caller
@@ -1627,13 +1769,19 @@ def record_ttp_permanent_price_failure(market_slug, outcome, error, threshold=3,
             "consecutive_failures": 0, "status": "OBSERVING",
             "first_failure_at": now,
         }
-        was_quarantined = item.get("status") == "QUARANTINED_UNPRICEABLE"
+        previous_status = item.get("status")
+        was_quarantined = previous_status == "QUARANTINED_UNPRICEABLE"
         item["consecutive_failures"] = int(item.get("consecutive_failures") or 0) + 1
         item["last_failure_at"] = now
         item["last_error"] = str(error)[:1000]
-        if item["consecutive_failures"] >= int(threshold):
+        if permanent and item["consecutive_failures"] >= int(quarantine_threshold):
             item["status"] = "QUARANTINED_UNPRICEABLE"
             item.setdefault("quarantined_at", now)
+        elif (not permanent and not was_quarantined
+              and now - int(item.get("first_failure_at") or now)
+              >= int(suspected_after_seconds)):
+            item["status"] = "SUSPECTED_STRUCTURAL"
+            item.setdefault("suspected_at", now)
         entries[state_id] = item
         conn.execute(
             "INSERT INTO bot_risk_state(key,value_json,updated_at) VALUES(?,?,?) "
@@ -1641,14 +1789,26 @@ def record_ttp_permanent_price_failure(market_slug, outcome, error, threshold=3,
             (_TTP_PRICE_QUARANTINE_KEY, json.dumps(state, sort_keys=True), now),
         )
         conn.commit()
-        return {**item, "newly_quarantined": (
-            not was_quarantined and item["status"] == "QUARANTINED_UNPRICEABLE"
-        )}
+        return {**item,
+                "failure_age_seconds": now - int(item.get("first_failure_at") or now),
+                "newly_quarantined": (
+                    not was_quarantined and item["status"] == "QUARANTINED_UNPRICEABLE"),
+                "newly_suspected": (
+                    previous_status != "SUSPECTED_STRUCTURAL"
+                    and item["status"] == "SUSPECTED_STRUCTURAL")}
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def record_ttp_permanent_price_failure(market_slug, outcome, error, threshold=3, now=None):
+    """Compatibility wrapper for the narrow, operator-reviewed classifier."""
+    return record_ttp_price_failure(
+        market_slug, outcome, error, permanent=True,
+        quarantine_threshold=threshold, now=now,
+    )
 
 
 def clear_ttp_price_failure_state(market_slug, outcome, now=None):
@@ -1679,7 +1839,35 @@ def clear_ttp_price_failure_state(market_slug, outcome, now=None):
             "UPDATE bot_risk_state SET value_json=?,updated_at=? WHERE key=?",
             (json.dumps(state, sort_keys=True), now, _TTP_PRICE_QUARANTINE_KEY),
         )
+        # Close matching generic error-alert fingerprints in the same durable
+        # state transition. A later recurrence opens a fresh incident rather
+        # than inheriting the previous incident's 24-hour backoff.
+        recovery_count = 0
+        alert_row = conn.execute(
+            "SELECT value_json FROM bot_risk_state WHERE key=?",
+            (_ERROR_ALERT_STATE_KEY,),
+        ).fetchone()
+        if alert_row:
+            try:
+                alert_state = json.loads(alert_row["value_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                alert_state = {}
+            prefix = f"{market_slug}|{outcome}|"
+            for item in (alert_state.get("entries") or {}).values():
+                if item.get("status") == "OPEN" and str(item.get("resource") or "").startswith(prefix):
+                    item.update({"status": "RECOVERED", "recovered_at": now})
+                    recovery_count += 1
+            if recovery_count:
+                conn.execute(
+                    "UPDATE bot_risk_state SET value_json=?,updated_at=? WHERE key=?",
+                    (json.dumps(alert_state, sort_keys=True), now, _ERROR_ALERT_STATE_KEY),
+                )
         conn.commit()
+        if recovery_count:
+            telegram_alerts.send_telegram_alert(
+                f"✅ TTP pricing recovered: {market_slug} / {outcome}; "
+                f"closed {recovery_count} error fingerprint incident(s)."
+            )
         return True
     except Exception:
         conn.rollback()

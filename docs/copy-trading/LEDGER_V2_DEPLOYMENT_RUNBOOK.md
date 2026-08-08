@@ -15,8 +15,10 @@ does not authorize Live, a wallet change, an HWM reset, or larger sizing.
 4. If the root volume fails either test, move a verified old backup off-volume
    or use another mounted volume. Never begin migration/backfill hoping space
    will last. Never delete the only verified recovery point.
-5. The release contains ledger migrations/backfill, readiness-gated readers,
-   shadow/challenger allocations, TTP quarantine and its tests. The seven-day
+5. The release contains ledger migrations/backfill through 0028, append-only
+   retention seals, shares conservation, shared Gate A/B definitions and
+   preflight, readiness-gated readers, shadow/challenger allocations, TTP
+   quarantine and its tests. The seven-day
    qualification clock is zero until this final release is running.
 
 ## One maintenance window
@@ -29,7 +31,7 @@ does not authorize Live, a wallet change, an HWM reset, or larger sizing.
    `backup_sqlite_online.py`; retain its SHA-256 and require
    `PRAGMA integrity_check = ok`. Because the bot is stopped first, restoring
    this backup cannot discard post-backup bot trades.
-4. Pull the reviewed release and apply additive migrations 0024–0027. Do not
+4. Pull the reviewed release and apply additive migrations 0024–0028. Do not
    create the readiness key manually.
 5. Generate a fresh reconciliation-v3 report *after the stop*. It must include
    `bot_filtered`, `shadow_rehab`, and `shadow_challenger`, with strategy in the
@@ -46,6 +48,13 @@ does not authorize Live, a wallet change, an HWM reset, or larger sizing.
    - no mutation of immutable event PnL, legacy final-row PnL, or phantom flags;
    - all decision-reader queries select `cumulative_realized_pnl_usd` when the
      key is present and legacy PnL when it is absent.
+   - `preflight_protocol_v2.py` reports the exact Gate A/B numerator,
+     denominator, threshold and reason for every gate;
+   - E/A/L money and shares invariants pass, and every already-pruned realized
+     range reproduces its append-only retention seal and previous-hash chain.
+   - export the latest retention-seal chain head into the non-overwriting,
+     externally stored recovery manifest. In-database triggers do not protect
+     against a same-owner process dropping the trigger and rewriting history.
 9. Start exactly one Paper bot. Its first `realized_ledger_reader_status` event
    must say `reader_column=cumulative_realized_pnl_usd`, readiness true and
    unresolved zero. Verify wallet EV, rolling mute rebuild, rehab, challenger,
@@ -74,8 +83,10 @@ The seven-day clock starts after the final release and successful cutover—not
 after migration, and never across a restart/code change. Historical allocations
 use `allocation_source='historical_backfill'` and are excluded from termination
 UNKNOWN qualification. UNKNOWN <=1% applies only to in-window, live-classifier,
-matched terminations. Active `QUARANTINED_UNPRICEABLE` positions fail the epoch
-precondition even though their high-frequency retries are suppressed.
+matched terminations. Gate A excludes known quarantines from its network-fetch
+denominator; Gate B exposes them separately. Frozen legacy identities do not
+hide any quarantine created inside the qualification window: a new one resets
+the seven-day clock.
 
 Quarantine is not accounting finality. It stops repeated syscalls and sends one
 operator alert, while the position stays unpriceable and remains in risk/SLO.

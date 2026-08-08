@@ -3528,7 +3528,7 @@ class TestTtpPersistentQuarantine(unittest.TestCase):
         return {"shares": 10.0, "cost_basis_usd": 5.0, "avg_entry_price": 0.5,
                 "buy_count": 1, "peak_profit_pct": 0.0}
 
-    def test_quarantined_position_skips_network_but_remains_in_slo_denominator(self):
+    def test_quarantined_position_skips_network_and_moves_to_structural_gate(self):
         positions = {"0xA|dead-market|Yes": self._position()}
         states = {("dead-market", "Yes"): {"status": "QUARANTINED_UNPRICEABLE"}}
         with patch.object(config, "ENABLE_THETA_DECAY_TP_ACTIVATION", False), \
@@ -3546,6 +3546,9 @@ class TestTtpPersistentQuarantine(unittest.TestCase):
         )
         self.assertEqual(observation["attempted_positions"], 1)
         self.assertEqual(observation["failed_price_reads"], 1)
+        self.assertEqual(observation["fetch_attempted_positions"], 0)
+        self.assertEqual(observation["pipeline_failed_price_reads"], 0)
+        self.assertIsNone(observation["price_read_success_rate"])
         self.assertEqual(observation["quarantined_positions"], 1)
         self.assertFalse(any(call.args[0]["event_type"] == "error"
                              for call in mock_log.call_args_list))

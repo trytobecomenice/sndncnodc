@@ -253,6 +253,7 @@ export const paperTrade = sqliteTable(
     // once MAX_BUYS_PER_TRADER_OUTCOME allows averaging up.
     costBasisUsd: real("cost_basis_usd").notNull().default(0),
     ourShares: real("our_shares").notNull(),
+    totalAcquiredShares: real("total_acquired_shares"),
     avgEntryPrice: real("avg_entry_price").notNull(),
     // Number of buys applied to this position (bot.py's pos["buy_count"]),
     // enforced against config.MAX_BUYS_PER_TRADER_OUTCOME.
@@ -316,6 +317,8 @@ export const paperTradeRealizedAllocation = sqliteTable(
     allocationSource: text("allocation_source").notNull(), // live | historical_backfill
     terminationCause: text("termination_cause").notNull(),
     sourceSharesAtTermination: real("source_shares_at_termination"),
+    sharesClosed: real("shares_closed"),
+    sharesRemaining: real("shares_remaining"),
     terminationClassifierVersion: text("termination_classifier_version").notNull(),
     allocatedAt: integer("allocated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   },
@@ -324,6 +327,27 @@ export const paperTradeRealizedAllocation = sqliteTable(
     index("paper_trade_realized_allocation_status_idx").on(t.allocationStatus),
     index("paper_trade_realized_allocation_timestamp_idx").on(t.eventTimestamp),
   ]
+);
+
+// Cryptographic retention boundary for realized-event evidence.  A seal is
+// inserted in the same transaction immediately before old bot_event_log rows
+// are pruned. Triggers in migration 0028 make the table append-only.
+export const paperTradeEventSeal = sqliteTable(
+  "paper_trade_event_seal",
+  {
+    id: id(),
+    rangeStart: integer("range_start", { mode: "timestamp" }).notNull(),
+    rangeEnd: integer("range_end", { mode: "timestamp" }).notNull(),
+    eventCount: integer("event_count").notNull(),
+    pnlMicros: integer("pnl_micros").notNull(),
+    sharesMicros: integer("shares_micros").notNull(),
+    canonicalSha256: text("canonical_sha256").notNull(),
+    previousChainSha256: text("previous_chain_sha256").notNull(),
+    chainSha256: text("chain_sha256").notNull(),
+    sealerVersion: text("sealer_version").notNull(),
+    sealedAt: integer("sealed_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+  },
+  (t) => [uniqueIndex("paper_trade_event_seal_range_unique").on(t.rangeStart, t.rangeEnd)]
 );
 
 // Event-time competing-risk state for an open tax lot. It survives restarts

@@ -33,6 +33,10 @@ class _TempDbTestCase(unittest.TestCase):
             "side TEXT, payload_json TEXT NOT NULL)"
         )
         conn.execute(
+            "CREATE TABLE bot_risk_state (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, "
+            "updated_at INTEGER NOT NULL)"
+        )
+        conn.execute(
             "CREATE TABLE decision_journal (id TEXT PRIMARY KEY, created_at INTEGER, "
             "wallet_address TEXT NOT NULL, observed_trade_id TEXT, market_slug TEXT NOT NULL, "
             "outcome TEXT NOT NULL, side TEXT, decision_type TEXT NOT NULL, "
@@ -93,15 +97,11 @@ class TestKillSwitchTelegramAlert(_TempDbTestCase):
 class TestThrottledErrorAlert(_TempDbTestCase):
     def setUp(self):
         super().setUp()
-        db._last_error_alert_ts = 0
-        db._errors_suppressed_since_last_alert = 0
         self._saved_throttle = config.TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS
         config.TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS = 300
 
     def tearDown(self):
         config.TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS = self._saved_throttle
-        db._last_error_alert_ts = 0
-        db._errors_suppressed_since_last_alert = 0
         super().tearDown()
 
     def test_first_error_sends_immediately(self):
@@ -122,12 +122,32 @@ class TestThrottledErrorAlert(_TempDbTestCase):
             mock_time.return_value = 1000.0
             db.append_log({"timestamp": "t", "event_type": "error", "error": "boom1"})
             db.append_log({"timestamp": "t", "event_type": "error", "error": "boom2"})
-            mock_time.return_value = 1000.0 + config.TELEGRAM_ERROR_ALERT_THROTTLE_SECONDS + 1
+            mock_time.return_value = 1000.0 + 901
             db.append_log({"timestamp": "t", "event_type": "error", "error": "boom3"})
         self.assertEqual(mock_send.call_count, 2)
         second_alert_text = mock_send.call_args_list[1].args[0]
         self.assertIn("boom3", second_alert_text)
-        self.assertIn("1 more suppressed", second_alert_text)
+        self.assertIn("1 same-fingerprint occurrence", second_alert_text)
+
+    def test_distinct_error_fingerprints_do_not_mask_each_other(self):
+        with patch("db.telegram_alerts.send_telegram_alert") as mock_send:
+            db.append_log({"timestamp": "t", "event_type": "error",
+                           "error": "trailing_tp price check: timeout", "market_slug": "m"})
+            db.append_log({"timestamp": "t", "event_type": "error",
+                           "error": "auth failure: token expired"})
+        self.assertEqual(mock_send.call_count, 2)
+
+    def test_recovered_fingerprint_reopens_as_a_fresh_incident(self):
+        error = {"timestamp": "t", "event_type": "error",
+                 "error": "trailing_tp price check: timeout",
+                 "market_slug": "m", "outcome": "Yes"}
+        with patch("db.telegram_alerts.send_telegram_alert") as mock_send:
+            db.append_log(error)
+            db.record_ttp_price_failure("m", "Yes", "timeout", now=10)
+            self.assertTrue(db.clear_ttp_price_failure_state("m", "Yes", now=20))
+            db.append_log(error)
+        self.assertEqual(mock_send.call_count, 3)
+        self.assertIn("recovered", mock_send.call_args_list[1].args[0].lower())
 
 
 if __name__ == "__main__":

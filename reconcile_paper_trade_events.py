@@ -72,7 +72,9 @@ def reconcile(db_path):
             f"market_slug,outcome,json_extract(payload_json,'$.pnl_usd') pnl_usd,"
             f"json_extract(payload_json,'$.cost_basis_usd') cost_basis_usd,"
             f"json_extract(payload_json,'$.termination_cause') termination_cause,"
-            f"json_extract(payload_json,'$.source_shares_at_termination') source_shares_at_termination "
+            f"json_extract(payload_json,'$.source_shares_at_termination') source_shares_at_termination,"
+            f"json_extract(payload_json,'$.our_shares_closed') shares_closed,"
+            f"json_extract(payload_json,'$.our_shares_remaining') shares_remaining "
             f"FROM bot_event_log WHERE timestamp BETWEEN ? AND ? "
             f"AND event_type IN ({placeholders}) ORDER BY timestamp,id",
             (lower, upper, *_REALIZED_PNL_EVENT_TYPES),
@@ -99,6 +101,8 @@ def reconcile(db_path):
                                if event.get("cost_basis_usd") is not None else None),
             "termination_cause": _termination_cause_for_event(event),
             "source_shares_at_termination": event.get("source_shares_at_termination"),
+            "shares_closed": event.get("shares_closed"),
+            "shares_remaining": event.get("shares_remaining"),
         } for event in assigned)
         rows.append({
             **trade,

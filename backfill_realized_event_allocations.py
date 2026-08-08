@@ -66,7 +66,8 @@ def apply_report(db_path, report, sha256):
                 "(event_id,paper_trade_id,event_timestamp,event_type,strategy,pnl_usd,"
                 "cost_basis_usd,allocation_status,candidate_count,allocator_version,"
                 "allocation_source,termination_cause,source_shares_at_termination,"
-                "termination_classifier_version,allocated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "shares_closed,shares_remaining,termination_classifier_version,allocated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(event_id) DO UPDATE SET "
                 "paper_trade_id=excluded.paper_trade_id,event_timestamp=excluded.event_timestamp,"
                 "event_type=excluded.event_type,strategy=excluded.strategy,pnl_usd=excluded.pnl_usd,"
@@ -74,13 +75,15 @@ def apply_report(db_path, report, sha256):
                 "candidate_count=excluded.candidate_count,allocator_version=excluded.allocator_version,"
                 "allocation_source=excluded.allocation_source,termination_cause=excluded.termination_cause,"
                 "source_shares_at_termination=excluded.source_shares_at_termination,"
+                "shares_closed=excluded.shares_closed,shares_remaining=excluded.shares_remaining,"
                 "termination_classifier_version=excluded.termination_classifier_version,"
                 "allocated_at=excluded.allocated_at",
                 (row["event_id"], row["paper_trade_id"], int(row["event_timestamp"]),
                  row["event_type"], row.get("strategy", "bot_filtered"), float(row["pnl_usd"]),
                  row.get("cost_basis_usd"), "matched", 1, _REALIZED_ALLOCATOR_VERSION,
                  "historical_backfill", row.get("termination_cause", "UNKNOWN"),
-                 row.get("source_shares_at_termination"), _TERMINATION_CLASSIFIER_VERSION, now),
+                 row.get("source_shares_at_termination"), row.get("shares_closed"),
+                 row.get("shares_remaining"), _TERMINATION_CLASSIFIER_VERSION, now),
             )
 
         conn.execute(
@@ -89,6 +92,16 @@ def apply_report(db_path, report, sha256):
             "WHERE a.paper_trade_id=paper_trade.id AND a.allocation_status='matched'"
             "),0), realized_event_count=(SELECT COUNT(*) FROM "
             f"{_REALIZED_ALLOCATION_TABLE} a WHERE a.paper_trade_id=paper_trade.id "
+            "AND a.allocation_status='matched')"
+        )
+        conn.execute(
+            "UPDATE paper_trade SET total_acquired_shares=(SELECT "
+            "CASE WHEN COUNT(*)=0 THEN NULL "
+            "WHEN SUM(CASE WHEN a.shares_closed IS NULL OR a.shares_remaining IS NULL THEN 1 ELSE 0 END)>0 "
+            "THEN NULL ELSE SUM(a.shares_closed)+COALESCE((SELECT a2.shares_remaining FROM "
+            f"{_REALIZED_ALLOCATION_TABLE} a2 WHERE a2.paper_trade_id=paper_trade.id "
+            "AND a2.allocation_status='matched' ORDER BY a2.event_timestamp DESC,a2.event_id DESC LIMIT 1),0) END "
+            f"FROM {_REALIZED_ALLOCATION_TABLE} a WHERE a.paper_trade_id=paper_trade.id "
             "AND a.allocation_status='matched')"
         )
 
