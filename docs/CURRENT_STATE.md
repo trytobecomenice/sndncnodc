@@ -113,6 +113,15 @@ authority for fresh/current databases.
    per sweep records the attempted/successful/executable-bid denominator plus latency. New
    resolution closes snapshot source inventory at event time. Historical resolution closes without
    that evidence remain `UNKNOWN`; no retrospective intent is invented.
+10. **2026-08-09 local hardening, still not deployed:** every economic decision reader is now
+    readiness-gated to cumulative allocated PnL; reconciliation v3 covers real, rehab and
+    challenger strategies without cross-strategy matching. AWS Telegram alarms were traced
+    read-only to three permanently unreadable slugs (699/703 alarm-class rows in 24h), not a kill,
+    duplicate, 429 or auth failure. Persistent quarantine now stops high-frequency retries after
+    three structural failures, sends one specific alert, retains the position in risk and the SLO
+    denominator, and leaves official resolution to the low-frequency sweep. Deployment is blocked
+    by disk preflight: free `8,537,518,080` bytes is below required `9,696,513,433`; another local
+    backup would project 88.61% utilization. No AWS mutation was attempted.
 
 ## 2026-08-05 repository separation
 

@@ -7,6 +7,7 @@
   "qualification": {
     "window_days": 7,
     "coverage_grace_seconds": 600,
+    "ttp_observation_schema_version": "ttp-sweep-observation-v2",
     "ttp_price_read_success_rate_min": 0.99,
     "ttp_executable_bid_rate_min": 0.99,
     "termination_unknown_rate_max": 0.01

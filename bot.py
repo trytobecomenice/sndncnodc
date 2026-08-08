@@ -1106,7 +1106,8 @@ def close_position_zombie_dump(key, trader, nickname, market_slug, outcome, posi
     check_circuit_breaker(trader, nickname, pnl_usd, cost_basis_closed, trader_performance, muted_traders)
 
 
-def sweep_zombie_positions(positions, trader_performance, muted_traders, tracked_by_lower):
+def sweep_zombie_positions(positions, trader_performance, muted_traders, tracked_by_lower,
+                           ttp_price_failure_states=None):
     """"Zombie position" dump-exit fallback (2026-07-27). Found live: a
     small subset of held markets never pass check_trailing_take_profit's
     staleness check — either genuinely dead (near-zero real order flow, so
@@ -1150,6 +1151,11 @@ def sweep_zombie_positions(positions, trader_performance, muted_traders, tracked
         if len(parts) != 3:
             continue
         trader, market_slug, outcome = parts
+        failure_state = (ttp_price_failure_states or {}).get((market_slug, outcome), {})
+        if failure_state.get("status") == "QUARANTINED_UNPRICEABLE":
+            # The hourly official-resolution sweep owns reconciliation for
+            # quarantined books. Do not create a second retry/alert stream.
+            continue
         nickname = nickname_for(trader, tracked_by_lower)
         age_hours = round(age / 3600, 1)
 
@@ -1187,7 +1193,8 @@ def sweep_zombie_positions(positions, trader_performance, muted_traders, tracked
 
 
 def check_trailing_take_profit(positions, trader_performance, muted_traders, tracked_by_lower,
-                                market_to_end_date=None, executor=None):
+                                market_to_end_date=None, executor=None,
+                                ttp_price_failure_states=None):
     """Trailing Take-Profit (TTP). For every active position: fetches a
     current price, updates the position's high-water-mark peak_profit_pct
     (persisted in state.json so it survives restarts), and once that peak
@@ -1241,6 +1248,10 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
     equity via db.realized_pnl_total() instead, so nothing double-counts.
     """
     market_to_end_date = market_to_end_date if market_to_end_date is not None else {}
+    persistent_quarantine = ttp_price_failure_states is not None
+    ttp_price_failure_states = (
+        ttp_price_failure_states if ttp_price_failure_states is not None else {}
+    )
     prices_by_key = {}
 
     # Phase 1 (cheap, no I/O): collect every position actually eligible for
@@ -1278,8 +1289,16 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
         return (*result, (time.monotonic_ns() - started_ns) / 1_000_000)
 
     price_results = {}
+    quarantined_keys = {
+        item[0] for item in eligible
+        if ttp_price_failure_states.get((item[2], item[3]), {}).get("status")
+        == "QUARANTINED_UNPRICEABLE"
+    }
+    fetchable = [item for item in eligible if item[0] not in quarantined_keys]
+    for key in quarantined_keys:
+        price_results[key] = (None, None, "QUARANTINED_UNPRICEABLE", None)
     if executor is not None:
-        futures = {executor.submit(_fetch_price, item): item for item in eligible}
+        futures = {executor.submit(_fetch_price, item): item for item in fetchable}
         for future in as_completed(futures):
             key = futures[future][0]
             try:
@@ -1287,7 +1306,7 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
             except Exception as e:
                 price_results[key] = (None, None, str(e), None)
     else:
-        for item in eligible:
+        for item in fetchable:
             price_results[item[0]] = _fetch_price(item)
 
     # One append-only qualification record per sweep, not one DB write per
@@ -1306,11 +1325,12 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
         "successful_price_reads": successful_prices,
         "executable_bid_reads": executable_bids,
         "failed_price_reads": len(eligible) - successful_prices,
+        "quarantined_positions": len(quarantined_keys),
         "price_read_success_rate": successful_prices / len(eligible),
         "executable_bid_rate": executable_bids / len(eligible),
         "latency_p50_ms": latencies_ms[len(latencies_ms) // 2] if latencies_ms else None,
         "latency_max_ms": latencies_ms[-1] if latencies_ms else None,
-        "qualification_schema_version": "ttp-sweep-observation-v1",
+        "qualification_schema_version": "ttp-sweep-observation-v2",
         "termination_classifier_version": "termination-cause-v1",
     })
 
@@ -1360,6 +1380,10 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
             key, (None, None, "no price result", None)
         )
         if indicative_price is None:
+            if key in quarantined_keys:
+                # Counts against the qualification denominator above, but
+                # generates no network call or repeated operator alarm.
+                continue
             # Competing-risk evidence: once the trail is armed, a failed
             # price read can be the reason this lot later drifts to
             # resolution. Persist via save_state(); never reconstruct it
@@ -1368,10 +1392,32 @@ def check_trailing_take_profit(positions, trader_performance, muted_traders, tra
                 pos["ttp_eligible_pricing_failure_count"] = (
                     int(pos.get("ttp_eligible_pricing_failure_count", 0)) + 1
                 )
-            append_log({"timestamp": now_iso(), "event_type": "error",
-                        "trader_address": trader, "market_slug": market_slug,
-                        "outcome": outcome, "error": f"trailing_tp price check: {err}"})
+            if persistent_quarantine and _is_permanent_ttp_price_failure(err):
+                state = record_ttp_permanent_price_failure(
+                    market_slug, outcome, err, threshold=3
+                )
+                ttp_price_failure_states[(market_slug, outcome)] = state
+                append_log({
+                    "timestamp": now_iso(),
+                    "event_type": ("ttp_market_quarantined" if state["newly_quarantined"]
+                                   else "ttp_permanent_price_failure_observed"),
+                    "trader_address": trader, "market_slug": market_slug,
+                    "outcome": outcome, "consecutive_failures": state["consecutive_failures"],
+                    "quarantine_status": state["status"],
+                    "error": f"trailing_tp price check: {err}",
+                })
+            else:
+                append_log({"timestamp": now_iso(), "event_type": "error",
+                            "trader_address": trader, "market_slug": market_slug,
+                            "outcome": outcome, "error": f"trailing_tp price check: {err}"})
             continue
+        if persistent_quarantine and (market_slug, outcome) in ttp_price_failure_states:
+            if clear_ttp_price_failure_state(market_slug, outcome):
+                ttp_price_failure_states.pop((market_slug, outcome), None)
+                append_log({"timestamp": now_iso(), "event_type": "ttp_market_quarantine_cleared",
+                            "trader_address": trader, "market_slug": market_slug,
+                            "outcome": outcome,
+                            "reason": "successful executable market-data read"})
         prices_by_key[key] = indicative_price
         # Zombie-position detection (2026-07-27) piggybacks on this existing
         # sweep's successful price reads rather than its own network call —
@@ -1510,8 +1556,16 @@ def _market_already_resolved(market_slug, risk_state):
 _closeout_fetch_failures = {}
 
 
+def _is_permanent_ttp_price_failure(error):
+    text = str(error or "").lower()
+    return (
+        "no market found for slug" in text
+        or "no orderbook exists for the requested token id" in text
+    )
+
+
 def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_lower,
-                       source_positions=None):
+                       source_positions=None, ttp_price_failure_states=None):
     """Resolved-market sweep (hourly, see CLOSEOUT_INTERVAL_SECONDS).
 
     Source traders redeem resolved positions rather than selling them, and
@@ -1551,7 +1605,11 @@ def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_
             except Exception as e:
                 failures = _closeout_fetch_failures.get(market_slug, 0) + 1
                 _closeout_fetch_failures[market_slug] = failures
-                if failures == 1 or failures % 24 == 0:
+                market_quarantined = any(
+                    slug == market_slug and state.get("status") == "QUARANTINED_UNPRICEABLE"
+                    for (slug, _outcome), state in (ttp_price_failure_states or {}).items()
+                )
+                if not market_quarantined and (failures == 1 or failures % 24 == 0):
                     append_log({"timestamp": now_iso(), "event_type": "error",
                                 "market_slug": market_slug,
                                 "consecutive_failures": failures,
@@ -1588,6 +1646,9 @@ def run_closeout_sweep(positions, trader_performance, muted_traders, tracked_by_
         else:
             termination_cause = "UNKNOWN"
         del positions[key]
+        if ttp_price_failure_states is not None:
+            if clear_ttp_price_failure_state(market_slug, outcome):
+                ttp_price_failure_states.pop((market_slug, outcome), None)
 
         append_log({"timestamp": now_iso(), "event_type": "position_resolved",
                     "trader_address": trader, "trader_nickname": nickname,
@@ -2351,6 +2412,7 @@ from db import (  # noqa: E402
     load_state, save_state, append_log, get_tracked_traders, get_monitored_noncopying_traders,
     get_wallet_composite_scores,
     get_wallet_realized_ev_stats,
+    get_realized_ledger_reader_status,
     get_risk_value, set_risk_value, clear_risk_value, load_market_events, save_market_event,
     load_market_categories, save_market_category, get_active_rule_set_version,
     realized_pnl_total, realized_pnl_since, get_or_create_evaluation_epoch,
@@ -2366,6 +2428,8 @@ from db import (  # noqa: E402
     update_shadow_patient_exit_price, close_shadow_patient_exit,
     load_market_end_dates, save_market_end_date,
     load_shadow_positions, save_shadow_positions, get_shadow_rehab_returns,
+    load_ttp_price_failure_states, record_ttp_permanent_price_failure,
+    clear_ttp_price_failure_state,
     has_snapshot_for_today, record_daily_snapshot, realized_pnl_today,
 )
 import risk_manager  # noqa: E402
@@ -4037,6 +4101,10 @@ def main():
     # mechanism — see risk_manager.wallet_exposure_cap_usd()). Same fetch-
     # once-at-startup convention as wallet_scores above.
     wallet_ev_stats = get_wallet_realized_ev_stats()
+    append_log({
+        "timestamp": now_iso(), "event_type": "realized_ledger_reader_status",
+        **get_realized_ledger_reader_status(),
+    })
 
     # ONE long-lived executor for the whole process (2026-07-22 cutover, Rule
     # 14) — created once here, passed into every fetch_direct_feed() call
@@ -4092,6 +4160,10 @@ def main():
         # incorrectly) offered as a buy signal, which is the rare case this
         # guard exists for in the first place.
         "resolved_markets": set(),
+        # Permanent market-data failures are persisted so restarts cannot
+        # resurrect five-minute retries/Telegram spam. They remain in the
+        # pricing-SLO denominator and risk book until a factual exit.
+        "ttp_price_failure_states": load_ttp_price_failure_states(),
     }
     current_monotonic_ms = time.monotonic_ns() // 1_000_000
     risk_state["_entry_interlock_state"] = entry_interlock_state_from_risk_value(
@@ -4473,7 +4545,8 @@ def main():
                     prices_by_key = check_trailing_take_profit(
                         positions, trader_performance, muted_traders, tracked_by_lower,
                         market_to_end_date=risk_state["market_to_end_date"],
-                        executor=direct_feed_executor)
+                        executor=direct_feed_executor,
+                        ttp_price_failure_states=risk_state["ttp_price_failure_states"])
                 except Exception as e:
                     prices_by_key = None
                     append_log({"timestamp": now_iso(), "event_type": "error",
@@ -4540,6 +4613,7 @@ def main():
                     run_closeout_sweep(
                         positions, trader_performance, muted_traders, all_by_lower,
                         source_positions=source_positions,
+                        ttp_price_failure_states=risk_state["ttp_price_failure_states"],
                     )
                     run_shadow_closeout_sweep(shadow_positions, "rehab")
                     run_shadow_closeout_sweep(challenger_positions, "challenger")
@@ -4556,7 +4630,10 @@ def main():
             if not SHUTDOWN_REQUESTED and now - last_zombie_sweep >= config.ZOMBIE_SWEEP_INTERVAL_SECONDS:
                 last_zombie_sweep = now
                 try:
-                    sweep_zombie_positions(positions, trader_performance, muted_traders, tracked_by_lower)
+                    sweep_zombie_positions(
+                        positions, trader_performance, muted_traders, tracked_by_lower,
+                        ttp_price_failure_states=risk_state["ttp_price_failure_states"],
+                    )
                 except Exception as e:
                     append_log({"timestamp": now_iso(), "event_type": "error",
                                 "error": f"zombie position sweep failed: {e}"})

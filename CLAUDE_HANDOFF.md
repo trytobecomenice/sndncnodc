@@ -929,3 +929,24 @@ priorities until the forensic and feedback-isolation gates pass.
    Live. Migration alone cannot switch the equity reader; only a complete atomic backfill can.
 5. Verification: 825 tests passed, 2 skipped; compile and diff checks passed. No AWS migration,
    backfill, restart, epoch, roster/size change, `.env`, key, or credential action was performed.
+
+### 2026-08-09 — Reader cutover, shadow accounting and Telegram quarantine (local only)
+
+1. External review correctly found that the readiness key was not connected to wallet EV/mute/
+   rehab/challenger/replacement readers. All economic readers now use one readiness-gated SQL
+   expression: cumulative allocations only after promotion, legacy otherwise. Startup writes a
+   `realized_ledger_reader_status` proof event.
+2. Reconciliation v3 includes `bot_filtered`, `shadow_rehab` and `shadow_challenger`; strategy is
+   part of the allocation key and completeness universe, so identical real/shadow lots cannot
+   cross-match and omitted shadow closes block atomic promotion.
+3. Read-only AWS alarm audit found 699/703 last-24h alarm events came from three dead slugs. The
+   local fix persists `QUARANTINED_UNPRICEABLE` after three structural failures, emits one specific
+   Telegram alert, stops five-minute network/error churn, retains the failed position in both risk
+   and qualification denominators, and delegates factual resolution to the hourly sweep.
+4. Added a controlled deployment runbook and online-backup tool with projected-utilization and
+   reserve checks. AWS preflight failed safely: 8.54GB free versus 9.70GB required; a new same-volume
+   backup would reach 88.61%. Do not deploy until a verified recovery point is moved off-volume or
+   another volume is used.
+5. Protocol UNKNOWN now counts only in-window live final-lot terminations; historical backfill and
+   partial sells are excluded. Active unpriceable quarantine blocks qualification. Full suite:
+   832 passed, 2 skipped. No AWS migration, restart, backfill, reader switch or epoch occurred.

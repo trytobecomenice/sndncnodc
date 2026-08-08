@@ -3523,6 +3523,55 @@ class TestCheckTrailingTakeProfitParallelFetch(unittest.TestCase):
         mock_submit.assert_not_called()
 
 
+class TestTtpPersistentQuarantine(unittest.TestCase):
+    def _position(self):
+        return {"shares": 10.0, "cost_basis_usd": 5.0, "avg_entry_price": 0.5,
+                "buy_count": 1, "peak_profit_pct": 0.0}
+
+    def test_quarantined_position_skips_network_but_remains_in_slo_denominator(self):
+        positions = {"0xA|dead-market|Yes": self._position()}
+        states = {("dead-market", "Yes"): {"status": "QUARANTINED_UNPRICEABLE"}}
+        with patch.object(config, "ENABLE_THETA_DECAY_TP_ACTIVATION", False), \
+             patch.object(config, "ENABLE_TIME_DECAY_LOSS_CUT", False), \
+             patch("bot.get_market_prices") as mock_prices, \
+             patch("bot.append_log") as mock_log:
+            result = bot.check_trailing_take_profit(
+                positions, {}, {}, {}, ttp_price_failure_states=states
+            )
+        self.assertEqual(result, {})
+        mock_prices.assert_not_called()
+        observation = next(
+            call.args[0] for call in mock_log.call_args_list
+            if call.args[0]["event_type"] == "ttp_sweep_observation"
+        )
+        self.assertEqual(observation["attempted_positions"], 1)
+        self.assertEqual(observation["failed_price_reads"], 1)
+        self.assertEqual(observation["quarantined_positions"], 1)
+        self.assertFalse(any(call.args[0]["event_type"] == "error"
+                             for call in mock_log.call_args_list))
+
+    def test_third_permanent_failure_transitions_once_without_generic_error(self):
+        positions = {"0xA|dead-market|Yes": self._position()}
+        states = {("dead-market", "Yes"): {
+            "status": "OBSERVING", "consecutive_failures": 2,
+        }}
+        promoted = {"status": "QUARANTINED_UNPRICEABLE", "consecutive_failures": 3,
+                    "newly_quarantined": True}
+        with patch.object(config, "ENABLE_THETA_DECAY_TP_ACTIVATION", False), \
+             patch.object(config, "ENABLE_TIME_DECAY_LOSS_CUT", False), \
+             patch("bot.get_market_prices", return_value=(
+                 None, None, "no market found for slug 'dead-market'"
+             )), \
+             patch("bot.record_ttp_permanent_price_failure", return_value=promoted), \
+             patch("bot.append_log") as mock_log:
+            bot.check_trailing_take_profit(
+                positions, {}, {}, {}, ttp_price_failure_states=states
+            )
+        event_types = [call.args[0]["event_type"] for call in mock_log.call_args_list]
+        self.assertIn("ttp_market_quarantined", event_types)
+        self.assertNotIn("error", event_types)
+
+
 class TestSweepZombiePositions(unittest.TestCase):
     """Zombie-position dump-exit fallback (2026-07-27) — see
     bot.sweep_zombie_positions/close_position_zombie_dump docstrings and

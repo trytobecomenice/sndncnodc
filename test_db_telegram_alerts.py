@@ -79,6 +79,16 @@ class TestKillSwitchTelegramAlert(_TempDbTestCase):
         self.assertIn("equity $100 below floor $200", mock_send.call_args.args[0])
         self.assertIn("Kill switch", mock_send.call_args.args[0])
 
+    def test_ttp_quarantine_sends_one_specific_operator_alert(self):
+        with patch("db.telegram_alerts.send_telegram_alert") as mock_send:
+            db.append_log({
+                "timestamp": "t", "event_type": "ttp_market_quarantined",
+                "market_slug": "dead-market", "outcome": "Yes", "consecutive_failures": 3,
+            })
+        mock_send.assert_called_once()
+        self.assertIn("quarantined", mock_send.call_args.args[0])
+        self.assertIn("position remains unpriceable", mock_send.call_args.args[0])
+
 
 class TestThrottledErrorAlert(_TempDbTestCase):
     def setUp(self):

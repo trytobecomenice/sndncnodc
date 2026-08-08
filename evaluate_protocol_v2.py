@@ -22,6 +22,7 @@ from db import (
     _REALIZED_ALLOCATOR_VERSION,
     _REALIZED_LEDGER_READY_KEY,
     _TERMINATION_CLASSIFIER_VERSION,
+    _TTP_PRICE_QUARANTINE_KEY,
 )
 
 
@@ -83,6 +84,15 @@ def evaluate_preconditions(conn, protocol, now_ts):
     if unresolved is None or unresolved > 0:
         reasons.append("realized_event_allocation_not_complete")
 
+    quarantine = _risk_value(conn, _TTP_PRICE_QUARANTINE_KEY) or {}
+    active_quarantines = sum(
+        isinstance(item, dict) and item.get("status") == "QUARANTINED_UNPRICEABLE"
+        for item in (quarantine.get("entries") or {}).values()
+    )
+    checks["active_unpriceable_quarantines"] = active_quarantines
+    if active_quarantines:
+        reasons.append("active_unpriceable_market_quarantine")
+
     rows = conn.execute(
         "SELECT timestamp,payload_json FROM bot_event_log "
         "WHERE event_type='ttp_sweep_observation' AND timestamp>=? ORDER BY timestamp",
@@ -107,12 +117,17 @@ def evaluate_preconditions(conn, protocol, now_ts):
         json.loads(row["payload_json"]).get("termination_classifier_version")
         == _TERMINATION_CLASSIFIER_VERSION for row in rows
     )
+    ttp_schema_ok = bool(rows) and all(
+        json.loads(row["payload_json"]).get("qualification_schema_version")
+        == q["ttp_observation_schema_version"] for row in rows
+    )
     price_rate = successful / attempted if attempted else None
     bid_rate = executable / attempted if attempted else None
     checks["ttp"] = {"attempted": attempted, "successful": successful,
                      "executable_bid": executable, "price_rate": price_rate,
                      "executable_bid_rate": bid_rate, "full_window": ttp_span_ok,
                      "max_gap_seconds": max_gap_seconds,
+                     "schema_version_ok": ttp_schema_ok,
                      "termination_classifier_heartbeat": classifier_heartbeat_ok}
     if not ttp_span_ok:
         reasons.append("ttp_qualification_window_incomplete")
@@ -122,14 +137,18 @@ def evaluate_preconditions(conn, protocol, now_ts):
         reasons.append("ttp_executable_bid_slo_failed")
     if not classifier_heartbeat_ok:
         reasons.append("termination_classifier_qualification_window_incomplete")
+    if not ttp_schema_ok:
+        reasons.append("ttp_observation_schema_mismatch")
 
     if _table_exists(conn, _REALIZED_ALLOCATION_TABLE):
         term = conn.execute(
             f"SELECT MIN(event_timestamp) first_ts,MAX(event_timestamp) last_ts,COUNT(*) total,"
             "SUM(CASE WHEN termination_cause='UNKNOWN' THEN 1 ELSE 0 END) unknown "
-            f"FROM {_REALIZED_ALLOCATION_TABLE} WHERE allocation_source='live' "
-            "AND allocation_status='matched' AND termination_classifier_version=? "
-            "AND event_timestamp>=?",
+            f"FROM {_REALIZED_ALLOCATION_TABLE} a JOIN paper_trade p ON p.id=a.paper_trade_id "
+            "WHERE a.allocation_source='live' AND a.strategy='bot_filtered' "
+            "AND a.allocation_status='matched' AND a.termination_classifier_version=? "
+            "AND p.status='closed' AND a.event_timestamp=p.closed_at "
+            "AND a.event_timestamp>=?",
             (_TERMINATION_CLASSIFIER_VERSION, cutoff),
         ).fetchone()
         total = int(term["total"] or 0)

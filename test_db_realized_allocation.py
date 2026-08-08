@@ -118,6 +118,43 @@ class TestDurableRealizedAllocation(unittest.TestCase):
         conn.close()
         self.assertEqual(db.realized_pnl_total(), 3.0)
 
+    def test_readiness_key_switches_wallet_and_shadow_decision_readers(self):
+        conn = sqlite3.connect(self.path)
+        for trade_id, strategy, legacy, cumulative in (
+            ("real", "bot_filtered", -1.0, 4.0),
+            ("rehab", "shadow_rehab", -2.0, 3.0),
+            ("challenger", "shadow_challenger", -3.0, 2.0),
+        ):
+            conn.execute(
+                "INSERT INTO paper_trade(id,strategy,wallet_address,market_slug,outcome,status,"
+                "cost_basis_usd,realized_pnl_usd,cumulative_realized_pnl_usd,is_phantom) "
+                "VALUES(?,?,?,'m','Yes','closed',10,?,?,0)",
+                (trade_id, strategy, "0xabc", legacy, cumulative),
+            )
+        conn.commit()
+        conn.close()
+
+        # Migration without promotion must retain the legacy readers.
+        self.assertAlmostEqual(db.get_wallet_realized_ev_stats()["0xabc"]["ev_pct"], -0.1)
+        self.assertEqual(db.get_shadow_rehab_returns("0xabc"), [-0.2])
+        self.assertEqual(db.get_shadow_returns("0xabc", "shadow_challenger"), [-0.3])
+
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "INSERT INTO bot_risk_state VALUES(?,?,1)",
+            (db._REALIZED_LEDGER_READY_KEY, json.dumps({
+                "ready": True, "allocator_version": db._REALIZED_ALLOCATOR_VERSION,
+            })),
+        )
+        conn.commit()
+        conn.close()
+        self.assertAlmostEqual(db.get_wallet_realized_ev_stats()["0xabc"]["ev_pct"], 0.4)
+        self.assertEqual(db.get_shadow_rehab_returns("0xabc"), [0.3])
+        self.assertEqual(db.get_shadow_returns("0xabc", "shadow_challenger"), [0.2])
+        status = db.get_realized_ledger_reader_status()
+        self.assertTrue(status["ready"])
+        self.assertEqual(status["reader_column"], "cumulative_realized_pnl_usd")
+
     def test_rejection_capture_is_raw_pointer_and_analysis_stays_blocked(self):
         db.append_log({"timestamp": "t", "event_type": "skip_risk_entry_interlock",
                        "trader_address": "0xabc", "market_slug": "market", "outcome": "Yes",
@@ -132,6 +169,22 @@ class TestDurableRealizedAllocation(unittest.TestCase):
         self.assertEqual(row, ("skip_risk_entry_interlock", "trade-1",
                                "BLOCKED_UNTIL_LEDGER_V2", "bot_event_log",
                                "skip_risk_entry_interlock"))
+
+    def test_ttp_quarantine_is_persistent_idempotent_and_factually_cleared(self):
+        first = db.record_ttp_permanent_price_failure("dead-market", "Yes", "404", threshold=3, now=10)
+        second = db.record_ttp_permanent_price_failure("dead-market", "Yes", "404", threshold=3, now=20)
+        third = db.record_ttp_permanent_price_failure("dead-market", "Yes", "404", threshold=3, now=30)
+        fourth = db.record_ttp_permanent_price_failure("dead-market", "Yes", "404", threshold=3, now=40)
+        self.assertFalse(first["newly_quarantined"])
+        self.assertFalse(second["newly_quarantined"])
+        self.assertTrue(third["newly_quarantined"])
+        self.assertFalse(fourth["newly_quarantined"])
+        self.assertEqual(
+            db.load_ttp_price_failure_states()[("dead-market", "Yes")]["status"],
+            "QUARANTINED_UNPRICEABLE",
+        )
+        self.assertTrue(db.clear_ttp_price_failure_state("dead-market", "Yes", now=50))
+        self.assertEqual(db.load_ttp_price_failure_states(), {})
 
     def test_explicit_resolution_cause_and_source_snapshot_are_preserved(self):
         self.insert_trade()

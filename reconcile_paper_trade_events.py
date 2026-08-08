@@ -16,23 +16,27 @@ import sqlite3
 import time
 
 import config
-from db import _REALIZED_PNL_EVENT_TYPES, _termination_cause_for_event
+from db import (
+    _REALIZED_PNL_EVENT_TYPES,
+    _realized_strategy_for_event_type,
+    _termination_cause_for_event,
+)
 
 
-REPORT_VERSION = "paper-event-reconciliation-v2"
+REPORT_VERSION = "paper-event-reconciliation-v3"
 
 
 def allocate_events(trades, events):
     by_key = defaultdict(list)
     for trade in trades:
-        key = (trade["wallet_address"], trade["market_slug"], trade["outcome"])
+        key = (trade["strategy"], trade["wallet_address"], trade["market_slug"], trade["outcome"])
         by_key[key].append(trade)
 
     allocations = defaultdict(list)
     unmatched = []
     ambiguous = []
     for event in events:
-        key = (event["trader_address"], event["market_slug"], event["outcome"])
+        key = (event["strategy"], event["trader_address"], event["market_slug"], event["outcome"])
         candidates = [trade for trade in by_key.get(key, [])
                       if trade["opened_at"] <= event["timestamp"] <= trade["allocation_end_at"]]
         if len(candidates) == 1:
@@ -55,7 +59,7 @@ def reconcile(db_path):
             "SELECT id,strategy,lower(wallet_address) wallet_address,market_slug,outcome,"
             "status,opened_at,closed_at,close_reason,cost_basis_usd,realized_pnl_usd,"
             "COALESCE(is_phantom,0) is_phantom,phantom_classifier_version "
-            "FROM paper_trade WHERE strategy='bot_filtered' "
+            "FROM paper_trade WHERE strategy IN ('bot_filtered','shadow_rehab','shadow_challenger') "
             "AND is_demo_data=0 ORDER BY opened_at,id"
         )]
         lower = min(row["opened_at"] for row in trades)
@@ -73,6 +77,8 @@ def reconcile(db_path):
             f"AND event_type IN ({placeholders}) ORDER BY timestamp,id",
             (lower, upper, *_REALIZED_PNL_EVENT_TYPES),
         )]
+        for event in events:
+            event["strategy"] = _realized_strategy_for_event_type(event["event_type"])
     finally:
         conn.close()
 

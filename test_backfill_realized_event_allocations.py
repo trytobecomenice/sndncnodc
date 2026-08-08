@@ -86,6 +86,26 @@ class TestAllocationBackfill(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_report(report)
 
+    def test_unreported_shadow_realized_event_rolls_back_promotion(self):
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "INSERT INTO bot_event_log VALUES('shadow-e',13,'shadow_rehab_sell',"
+            "'w','m','Yes','SELL',?)",
+            (json.dumps({"pnl_usd": 1.0}),),
+        )
+        conn.commit()
+        conn.close()
+        with self.assertRaisesRegex(RuntimeError, "missing=1"):
+            apply_report(self.path, self.report(), "abc")
+        conn = sqlite3.connect(self.path)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM paper_trade_realized_allocation"
+        ).fetchone()[0], 0)
+        self.assertIsNone(conn.execute(
+            "SELECT 1 FROM bot_risk_state WHERE key=?", (db._REALIZED_LEDGER_READY_KEY,)
+        ).fetchone())
+        conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

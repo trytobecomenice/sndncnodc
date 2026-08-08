@@ -131,6 +131,8 @@ _REALIZED_ALLOCATOR_VERSION = "paper-realized-allocation-v1"
 _REALIZED_LEDGER_READY_KEY = "paper_realized_allocation_ledger_ready_v1"
 _TERMINATION_CLASSIFIER_VERSION = "termination-cause-v1"
 _EARLY_REJECTION_CAPTURE_VERSION = "early-rejection-raw-v1"
+_TTP_PRICE_QUARANTINE_KEY = "ttp_price_quarantine_v1"
+_TTP_PRICE_QUARANTINE_VERSION = "ttp-price-quarantine-v1"
 
 
 def _termination_cause_for_event(event):
@@ -155,7 +157,8 @@ def _realized_allocation_ledger_ready(conn):
     ledger.  The backfill tool sets this key in the same transaction that
     verifies complete event coverage and rebuilds cumulative lot PnL.
     """
-    if not _table_exists(conn, _REALIZED_ALLOCATION_TABLE):
+    if (not _table_exists(conn, _REALIZED_ALLOCATION_TABLE)
+            or not _table_exists(conn, "bot_risk_state")):
         return False
     row = conn.execute(
         "SELECT value_json FROM bot_risk_state WHERE key=?", (_REALIZED_LEDGER_READY_KEY,)
@@ -167,6 +170,48 @@ def _realized_allocation_ledger_ready(conn):
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
     return bool(value.get("ready")) and value.get("allocator_version") == _REALIZED_ALLOCATOR_VERSION
+
+
+def _realized_pnl_sql(conn, alias=None):
+    """Authoritative per-lot realized-PnL expression for decision readers.
+
+    Migration alone deliberately changes nothing.  Only the audited readiness
+    key switches readers to cumulative event allocations; deleting/corrupting
+    that key makes the same code fall back to the legacy final-close column.
+    """
+    prefix = f"{alias}." if alias else ""
+    if (_paper_trade_has_column(conn, "cumulative_realized_pnl_usd")
+            and _realized_allocation_ledger_ready(conn)):
+        return f"{prefix}cumulative_realized_pnl_usd"
+    return f"{prefix}realized_pnl_usd"
+
+
+def get_realized_ledger_reader_status():
+    """Operator-visible proof of which accounting source decision readers use."""
+    conn = _connect()
+    try:
+        ready = _realized_allocation_ledger_ready(conn)
+        status = {
+            "ready": ready,
+            "reader_column": (
+                "cumulative_realized_pnl_usd" if ready else "realized_pnl_usd"
+            ),
+            "allocator_version": _REALIZED_ALLOCATOR_VERSION,
+        }
+        if _table_exists(conn, _REALIZED_ALLOCATION_TABLE):
+            row = conn.execute(
+                f"SELECT COUNT(*) total,"
+                "SUM(CASE WHEN allocation_status='matched' AND paper_trade_id IS NOT NULL "
+                "THEN 0 ELSE 1 END) unresolved "
+                f"FROM {_REALIZED_ALLOCATION_TABLE}"
+            ).fetchone()
+            status.update({
+                "allocation_count": int(row["total"] or 0),
+                "unresolved_allocation_count": int(row["unresolved"] or 0),
+            })
+        return status
+    finally:
+        conn.close()
 
 
 def _clean_paper_trade_predicate(conn, alias=None):
@@ -377,12 +422,13 @@ def load_state():
             # Do not leave an all-phantom wallet's persisted rolling window
             # behind merely because it has zero clean rows to overwrite it.
             trader_performance = {}
+            pnl_sql = _realized_pnl_sql(conn)
             clean_rows = conn.execute(
-                "SELECT lower(wallet_address) AS wallet_address, realized_pnl_usd, "
+                f"SELECT lower(wallet_address) AS wallet_address, {pnl_sql} AS economic_pnl_usd, "
                 "cost_basis_usd FROM paper_trade "
                 "WHERE strategy = 'bot_filtered' AND status = 'closed' "
                 "AND is_demo_data = 0 AND COALESCE(is_phantom, 0) = 0 "
-                "AND realized_pnl_usd IS NOT NULL AND cost_basis_usd >= ? "
+                f"AND {pnl_sql} IS NOT NULL AND cost_basis_usd >= ? "
                 "ORDER BY closed_at ASC",
                 (config.MUTE_MIN_TRADE_COST_USD,),
             ).fetchall()
@@ -391,7 +437,7 @@ def load_state():
                 if not clean_row["cost_basis_usd"]:
                     continue
                 values = rebuilt.setdefault(clean_row["wallet_address"], [])
-                values.append(clean_row["realized_pnl_usd"] / clean_row["cost_basis_usd"])
+                values.append(clean_row["economic_pnl_usd"] / clean_row["cost_basis_usd"])
                 if len(values) > config.MUTE_EV_MIN_SAMPLES:
                     del values[:-config.MUTE_EV_MIN_SAMPLES]
             for wallet_address, recent_returns in rebuilt.items():
@@ -716,8 +762,9 @@ def get_shadow_rehab_returns(wallet_address, limit=None):
     """
     conn = _connect()
     try:
+        pnl_sql = _realized_pnl_sql(conn)
         query = (
-            "SELECT realized_pnl_usd, cost_basis_usd FROM paper_trade "
+            f"SELECT {pnl_sql} AS economic_pnl_usd, cost_basis_usd FROM paper_trade "
             "WHERE wallet_address = ? AND strategy = 'shadow_rehab' AND status = 'closed' "
             "AND is_demo_data = 0 ORDER BY closed_at DESC"
         )
@@ -727,8 +774,8 @@ def get_shadow_rehab_returns(wallet_address, limit=None):
             params.append(limit)
         rows = conn.execute(query, params).fetchall()
         return [
-            row["realized_pnl_usd"] / row["cost_basis_usd"]
-            for row in rows if row["cost_basis_usd"]
+            row["economic_pnl_usd"] / row["cost_basis_usd"]
+            for row in rows if row["cost_basis_usd"] and row["economic_pnl_usd"] is not None
         ]
     finally:
         conn.close()
@@ -744,8 +791,9 @@ def get_shadow_returns(wallet_address, strategy, limit=None, min_cost_basis_usd=
     strategy = _validate_shadow_strategy(strategy)
     conn = _connect()
     try:
+        pnl_sql = _realized_pnl_sql(conn)
         query = (
-            "SELECT realized_pnl_usd, cost_basis_usd FROM paper_trade "
+            f"SELECT {pnl_sql} AS economic_pnl_usd, cost_basis_usd FROM paper_trade "
             "WHERE lower(wallet_address) = ? AND strategy = ? AND status = 'closed' "
             "AND is_demo_data = 0 AND cost_basis_usd >= ? ORDER BY closed_at ASC"
         )
@@ -755,8 +803,8 @@ def get_shadow_returns(wallet_address, strategy, limit=None, min_cost_basis_usd=
             params.append(limit)
         rows = conn.execute(query, params).fetchall()
         return [
-            row["realized_pnl_usd"] / row["cost_basis_usd"]
-            for row in rows if row["cost_basis_usd"] and row["realized_pnl_usd"] is not None
+            row["economic_pnl_usd"] / row["cost_basis_usd"]
+            for row in rows if row["cost_basis_usd"] and row["economic_pnl_usd"] is not None
         ]
     finally:
         conn.close()
@@ -1035,6 +1083,13 @@ def append_log(event):
             f"Hard kill latched; {event.get('pending_entry_intents_invalidated', 0)} pending entry "
             f"intent(s) invalidated; exit orders preserved. Manual position/order reconciliation required."
         )
+    elif event_type == "ttp_market_quarantined":
+        telegram_alerts.send_telegram_alert(
+            f"⚠️ TTP market quarantined after {event.get('consecutive_failures', '?')} "
+            f"permanent price failures: {event.get('market_slug')} / {event.get('outcome')}. "
+            "High-frequency retries stopped; position remains unpriceable and in risk. "
+            "Official-resolution reconciliation continues at low frequency."
+        )
     elif event_type == "error":
         _maybe_send_throttled_error_alert(event)
 
@@ -1276,9 +1331,10 @@ def get_wallet_realized_ev_stats():
     try:
         clean_predicate = _clean_paper_trade_predicate(conn)
         non_demo_predicate = _non_demo_paper_trade_predicate(conn)
+        pnl_sql = _realized_pnl_sql(conn)
         cur = conn.execute(
             "SELECT wallet_address, "
-            "avg(realized_pnl_usd / nullif(cost_basis_usd, 0)) AS ev_pct, "
+            f"avg({pnl_sql} / nullif(cost_basis_usd, 0)) AS ev_pct, "
             "count(*) AS trade_count "
             "FROM paper_trade WHERE status = 'closed' AND strategy = 'bot_filtered' "
             f"AND {non_demo_predicate} AND {clean_predicate} "
@@ -1409,10 +1465,11 @@ def get_replacement_wallet_candidate():
     try:
         clean_predicate = _clean_paper_trade_predicate(conn, alias="pt")
         non_demo_predicate = _non_demo_paper_trade_predicate(conn, alias="pt")
+        pnl_sql = _realized_pnl_sql(conn, alias="pt")
         row = conn.execute(
             "SELECT wp.wallet_address, wp.nickname, count(pt.id) AS trade_count, "
-            "COALESCE(sum(pt.realized_pnl_usd), 0) AS realized_pnl_usd, "
-            "avg(pt.realized_pnl_usd / nullif(pt.cost_basis_usd, 0)) AS ev_pct "
+            f"COALESCE(sum({pnl_sql}), 0) AS realized_pnl_usd, "
+            f"avg({pnl_sql} / nullif(pt.cost_basis_usd, 0)) AS ev_pct "
             "FROM wallet_profile wp LEFT JOIN paper_trade pt "
             "ON lower(pt.wallet_address) = lower(wp.wallet_address) "
             "AND pt.strategy = 'bot_filtered' AND pt.status = 'closed' "
@@ -1519,6 +1576,114 @@ def clear_risk_value(key):
     try:
         conn.execute("DELETE FROM bot_risk_state WHERE key = ?", (key,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _ttp_price_state_id(market_slug, outcome):
+    return json.dumps([market_slug, outcome], separators=(",", ":"))
+
+
+def load_ttp_price_failure_states():
+    """Persistent price-failure/quarantine state keyed by (slug, outcome)."""
+    raw = get_risk_value(_TTP_PRICE_QUARANTINE_KEY) or {}
+    if raw.get("version") != _TTP_PRICE_QUARANTINE_VERSION:
+        return {}
+    result = {}
+    for value in (raw.get("entries") or {}).values():
+        if not isinstance(value, dict):
+            continue
+        slug, outcome = value.get("market_slug"), value.get("outcome")
+        if slug and outcome:
+            result[(slug, outcome)] = value
+    return result
+
+
+def record_ttp_permanent_price_failure(market_slug, outcome, error, threshold=3, now=None):
+    """Atomically count a structurally permanent book failure.
+
+    The first transition to QUARANTINED_UNPRICEABLE is returned to the caller
+    so it can emit exactly one high-signal operator alert.  The position is
+    never closed or assigned a guessed value here.
+    """
+    now = int(now or _now_ts())
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value_json FROM bot_risk_state WHERE key=?",
+            (_TTP_PRICE_QUARANTINE_KEY,),
+        ).fetchone()
+        try:
+            state = json.loads(row["value_json"]) if row else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            state = {}
+        if state.get("version") != _TTP_PRICE_QUARANTINE_VERSION:
+            state = {"version": _TTP_PRICE_QUARANTINE_VERSION, "entries": {}}
+        entries = state.setdefault("entries", {})
+        state_id = _ttp_price_state_id(market_slug, outcome)
+        item = entries.get(state_id) or {
+            "market_slug": market_slug, "outcome": outcome,
+            "consecutive_failures": 0, "status": "OBSERVING",
+            "first_failure_at": now,
+        }
+        was_quarantined = item.get("status") == "QUARANTINED_UNPRICEABLE"
+        item["consecutive_failures"] = int(item.get("consecutive_failures") or 0) + 1
+        item["last_failure_at"] = now
+        item["last_error"] = str(error)[:1000]
+        if item["consecutive_failures"] >= int(threshold):
+            item["status"] = "QUARANTINED_UNPRICEABLE"
+            item.setdefault("quarantined_at", now)
+        entries[state_id] = item
+        conn.execute(
+            "INSERT INTO bot_risk_state(key,value_json,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+            (_TTP_PRICE_QUARANTINE_KEY, json.dumps(state, sort_keys=True), now),
+        )
+        conn.commit()
+        return {**item, "newly_quarantined": (
+            not was_quarantined and item["status"] == "QUARANTINED_UNPRICEABLE"
+        )}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def clear_ttp_price_failure_state(market_slug, outcome, now=None):
+    """Clear state only after a factual successful read/resolution."""
+    now = int(now or _now_ts())
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value_json FROM bot_risk_state WHERE key=?",
+            (_TTP_PRICE_QUARANTINE_KEY,),
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return False
+        try:
+            state = json.loads(row["value_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            conn.rollback()
+            return False
+        removed = (state.get("entries") or {}).pop(
+            _ttp_price_state_id(market_slug, outcome), None
+        )
+        if removed is None:
+            conn.rollback()
+            return False
+        conn.execute(
+            "UPDATE bot_risk_state SET value_json=?,updated_at=? WHERE key=?",
+            (json.dumps(state, sort_keys=True), now, _TTP_PRICE_QUARANTINE_KEY),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1670,7 +1835,17 @@ _REALIZED_PNL_EVENT_TYPES = (
     "paper_sell", "live_sell", "paper_sell_trailing_tp", "live_sell_trailing_tp",
     "paper_sell_time_decay_loss_cut", "live_sell_time_decay_loss_cut",
     "paper_sell_zombie_dump", "live_sell_zombie_dump", "position_resolved",
+    "shadow_rehab_sell", "shadow_rehab_resolved",
+    "shadow_challenger_sell", "shadow_challenger_resolved",
 )
+
+
+def _realized_strategy_for_event_type(event_type):
+    if event_type in ("shadow_rehab_sell", "shadow_rehab_resolved"):
+        return "shadow_rehab"
+    if event_type in ("shadow_challenger_sell", "shadow_challenger_resolved"):
+        return "shadow_challenger"
+    return "bot_filtered"
 
 
 def _allocated_realized_pnl(conn, start_timestamp=None):
@@ -1787,9 +1962,10 @@ def get_closed_trade_stats_since(start_timestamp, strategy="bot_filtered"):
     conn = _connect()
     try:
         clean_predicate = _clean_paper_trade_predicate(conn)
+        pnl_sql = _realized_pnl_sql(conn)
         row = conn.execute(
             "SELECT count(*) AS closed_count, "
-            "sum(CASE WHEN realized_pnl_usd > 0 THEN 1 ELSE 0 END) AS wins "
+            f"sum(CASE WHEN {pnl_sql} > 0 THEN 1 ELSE 0 END) AS wins "
             "FROM paper_trade WHERE strategy = ? AND status = 'closed' "
             f"AND closed_at >= ? AND is_demo_data = 0 AND {clean_predicate}",
             (strategy, int(start_timestamp)),

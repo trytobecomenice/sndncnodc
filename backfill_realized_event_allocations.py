@@ -20,6 +20,7 @@ from db import (
     _REALIZED_ALLOCATION_TABLE,
     _REALIZED_ALLOCATOR_VERSION,
     _REALIZED_LEDGER_READY_KEY,
+    _REALIZED_PNL_EVENT_TYPES,
     _TERMINATION_CLASSIFIER_VERSION,
 )
 from reconcile_paper_trade_events import REPORT_VERSION
@@ -95,12 +96,11 @@ def apply_report(db_path, report, sha256):
             f"SELECT COUNT(*) n FROM {_REALIZED_ALLOCATION_TABLE} "
             "WHERE allocation_status!='matched' OR paper_trade_id IS NULL"
         ).fetchone()["n"]
+        placeholders = ",".join("?" for _ in _REALIZED_PNL_EVENT_TYPES)
         missing = conn.execute(
-            "SELECT COUNT(*) n FROM bot_event_log e WHERE e.event_type IN ("
-            "'paper_sell','live_sell','paper_sell_trailing_tp','live_sell_trailing_tp',"
-            "'paper_sell_time_decay_loss_cut','live_sell_time_decay_loss_cut',"
-            "'paper_sell_zombie_dump','live_sell_zombie_dump','position_resolved') "
-            f"AND NOT EXISTS (SELECT 1 FROM {_REALIZED_ALLOCATION_TABLE} a WHERE a.event_id=e.id)"
+            f"SELECT COUNT(*) n FROM bot_event_log e WHERE e.event_type IN ({placeholders}) "
+            f"AND NOT EXISTS (SELECT 1 FROM {_REALIZED_ALLOCATION_TABLE} a WHERE a.event_id=e.id)",
+            _REALIZED_PNL_EVENT_TYPES,
         ).fetchone()["n"]
         if unresolved or missing:
             raise RuntimeError(f"ledger incomplete: unresolved={unresolved}, missing={missing}")
