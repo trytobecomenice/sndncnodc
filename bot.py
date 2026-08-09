@@ -453,7 +453,7 @@ def compute_shortfall(side, source_price, executable_price, trade_usd=None, shar
 
 def measure_paper_shortfall(market_slug, outcome, side, preview_amount, source_price,
                              trade_usd=None, shares=None):
-    """Implementation-shortfall measurement, PAPER MODE ONLY. Simulates the
+    """Executable paper-fill evidence, PAPER MODE ONLY. Simulates the
     fill this copy could ACTUALLY execute at right now by walking
     Polymarket's own public order book directly (polymarket_simulator.py,
     2026-07-22 — replaced `bullpen polymarket preview` here specifically so
@@ -462,13 +462,14 @@ def measure_paper_shortfall(market_slug, outcome, side, preview_amount, source_p
     of extra fields to merge into the paper_buy/paper_sell event (they land
     in bot_event_log.payload_json via append_log — no schema change needed).
 
-    MEASUREMENT ONLY, by design: the returned fields never feed back into
-    the paper fill price, position ledger, or PnL — paper accounting stays
-    on the source trade's price exactly as before, so historical paper
-    stats remain comparable and the measurement can't perturb the thing it
-    measures. (Live mode doesn't call this at all: the live path already
-    previews for the spread check and records the true fill price, which IS
-    the executable price.)
+    ACCOUNTING CONTRACT (changed 2026-07-26): when ``shortfall_status`` is
+    ``ok``, the paper BUY and SELL call sites use ``executable_price`` plus
+    the returned trading/network fees in the position ledger and realized
+    PnL.  When the book cannot be measured they explicitly fall back to the
+    source price and preserve the non-ok status in the event.  The function
+    itself still performs no write and enforces no entry decision; callers
+    own those effects.  Live mode doesn't call this helper because its path
+    records the actual fill response.
 
     `would_have_passed_spread_gate` (added 2026-07-31, on every return path
     below): the SAME verdict check_spread_tolerance() would have made
