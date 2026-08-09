@@ -52,9 +52,12 @@ _EVENTS_TOTAL = Counter(
 
 # Durable, fingerprint-scoped generic error-alert state. Restarts must not
 # reset a noisy fault's backoff or let that fault mask an unrelated alert.
-_ERROR_ALERT_STATE_KEY = "telegram_error_alert_state_v2"
-_ERROR_ALERT_STATE_VERSION = "telegram-error-fingerprint-v2"
+_ERROR_ALERT_STATE_KEY = "telegram_error_alert_state_v3"
+_ERROR_ALERT_STATE_VERSION = "telegram-error-fingerprint-v3"
 _ERROR_ALERT_BACKOFF_SECONDS = (0, 900, 3600, 21600, 86400)
+_ERROR_ALERT_FLAP_WINDOW_SECONDS = 6 * 3600
+_ERROR_ALERT_FLAP_REOPEN_THRESHOLD = 3
+_ERROR_ALERT_RECOVERY_DAMPING_SECONDS = 6 * 3600
 
 # Named logger, no handlers attached HERE (2026-07-22, disk-exhaustion
 # hardening — replaces append_log()'s old print()). Deliberately relies on
@@ -1209,10 +1212,29 @@ def _maybe_send_throttled_error_alert(event):
             state = {"version": _ERROR_ALERT_STATE_VERSION, "entries": {}}
         entries = state.setdefault("entries", {})
         item = entries.get(fingerprint)
-        if not item or item.get("status") == "RECOVERED":
+        if item and item.get("status") == "RECOVERED":
+            recovered_at = int(item.get("recovered_at") or 0)
+            if recovered_at and now - recovered_at <= _ERROR_ALERT_FLAP_WINDOW_SECONDS:
+                reopen_times = [
+                    int(value) for value in (item.get("reopen_timestamps") or [])
+                    if now - int(value) <= _ERROR_ALERT_FLAP_WINDOW_SECONDS
+                ]
+                reopen_times.append(now)
+                item["reopen_timestamps"] = reopen_times
+                item["status"] = (
+                    "FLAPPING" if len(reopen_times) >= _ERROR_ALERT_FLAP_REOPEN_THRESHOLD
+                    else "OPEN"
+                )
+                item["reopened_at"] = now
+                # Deliberately retain last_alert_at and alert_count. A rapid
+                # recovery/reopen cycle cannot buy a fresh immediate-alert slot.
+            else:
+                item = None
+        if not item:
             item = {
-            "status": "OPEN", "first_seen_at": now, "last_alert_at": 0,
-            "alert_count": 0, "suppressed_count": 0,
+                "status": "OPEN", "first_seen_at": now, "last_alert_at": 0,
+                "alert_count": 0, "suppressed_count": 0,
+                "reopen_timestamps": [],
             }
         index = min(int(item.get("alert_count") or 0), len(_ERROR_ALERT_BACKOFF_SECONDS) - 1)
         delay = _ERROR_ALERT_BACKOFF_SECONDS[index]
@@ -1241,8 +1263,9 @@ def _maybe_send_throttled_error_alert(event):
         conn.close()
     if send:
         suffix = f" ({suppressed} same-fingerprint occurrence(s) suppressed)" if suppressed else ""
+        flap = " FLAPPING" if item.get("status") == "FLAPPING" else ""
         telegram_alerts.send_telegram_alert(
-            f"⚠️ copybot error [{fingerprint[:10]}]: {error}{suffix}"
+            f"⚠️ copybot error{flap} [{fingerprint[:10]}]: {error}{suffix}"
         )
 
 
@@ -1265,18 +1288,71 @@ def prune_event_log(retention_days=None):
         retention_days = config.EVENT_LOG_RETENTION_DAYS
     cutoff = _now_ts() - retention_days * 86400
     conn = _connect()
+    staged_manifest = final_manifest = None
+    committed = False
     try:
         conn.execute("BEGIN IMMEDIATE")
         # Once migration 0028 exists, destructive retention and its proof are
         # one atomic operation. A missing/unresolved/mismatched realized event
         # aborts the DELETE rather than silently erasing the authority layer.
         from ledger_integrity import seal_realized_events_before
-        seal_realized_events_before(conn, cutoff, _REALIZED_PNL_EVENT_TYPES)
+        from seal_chain_manifest import (
+            finalize_staged_manifest, latest_final_manifest, stage_manifest,
+            verify_state_against_manifest,
+        )
+        placeholders = ",".join("?" for _ in _REALIZED_PNL_EVENT_TYPES)
+        realized_to_prune = conn.execute(
+            "SELECT COUNT(*) FROM bot_event_log WHERE timestamp<? "
+            f"AND event_type IN ({placeholders})",
+            (cutoff, *_REALIZED_PNL_EVENT_TYPES),
+        ).fetchone()[0]
+        seal = seal_realized_events_before(conn, cutoff, _REALIZED_PNL_EVENT_TYPES)
+        if realized_to_prune and not seal:
+            raise RuntimeError(
+                "refusing to prune realized events without migration-0028 retention seal"
+            )
+        if seal:
+            if not config.LEDGER_SEAL_MANIFEST_DIR:
+                raise RuntimeError(
+                    "realized-event prune requires independent LEDGER_SEAL_MANIFEST_DIR"
+                )
+            # The previous external anchor must match the pre-seal state. The
+            # new seal is already visible in this transaction, so verify by
+            # comparing against a savepoint-free reconstruction: the latest
+            # finalized anchor must be the new seal's previous chain head and
+            # count exactly one less.
+            latest_path = latest_final_manifest(config.LEDGER_SEAL_MANIFEST_DIR)
+            anchor = json.loads(latest_path.read_text(encoding="utf-8"))
+            previous_row = conn.execute(
+                "SELECT range_end FROM paper_trade_event_seal WHERE id!=? "
+                "ORDER BY range_end DESC LIMIT 1", (seal["id"],),
+            ).fetchone()
+            current_seal_count = conn.execute(
+                "SELECT COUNT(*) FROM paper_trade_event_seal"
+            ).fetchone()[0]
+            expected_previous = {
+                "seal_table_present": True,
+                "chain_head_sha256": seal["previous_chain_sha256"],
+                "seal_count": current_seal_count - 1,
+                "latest_range_end": int(previous_row["range_end"]) if previous_row else None,
+            }
+            verify_state_against_manifest(expected_previous, anchor)
+            staged_manifest, final_manifest = stage_manifest(
+                conn, config.LEDGER_SEAL_MANIFEST_DIR, seal["id"], now=seal["sealed_at"]
+            )
         cur = conn.execute("DELETE FROM bot_event_log WHERE timestamp < ?", (cutoff,))
         conn.commit()
+        committed = True
+        if staged_manifest:
+            finalize_staged_manifest(staged_manifest, final_manifest)
         return cur.rowcount
     except Exception:
         conn.rollback()
+        if staged_manifest and not committed:
+            try:
+                staged_manifest.unlink()
+            except FileNotFoundError:
+                pass
         raise
     finally:
         conn.close()
@@ -1843,6 +1919,7 @@ def clear_ttp_price_failure_state(market_slug, outcome, now=None):
         # state transition. A later recurrence opens a fresh incident rather
         # than inheriting the previous incident's 24-hour backoff.
         recovery_count = 0
+        recovery_alert_count = 0
         alert_row = conn.execute(
             "SELECT value_json FROM bot_risk_state WHERE key=?",
             (_ERROR_ALERT_STATE_KEY,),
@@ -1854,8 +1931,17 @@ def clear_ttp_price_failure_state(market_slug, outcome, now=None):
                 alert_state = {}
             prefix = f"{market_slug}|{outcome}|"
             for item in (alert_state.get("entries") or {}).values():
-                if item.get("status") == "OPEN" and str(item.get("resource") or "").startswith(prefix):
+                if item.get("status") in {"OPEN", "FLAPPING"} and str(
+                        item.get("resource") or "").startswith(prefix):
+                    last_recovery_alert = int(item.get("last_recovery_alert_at") or 0)
+                    should_alert = (
+                        last_recovery_alert == 0
+                        or now - last_recovery_alert >= _ERROR_ALERT_RECOVERY_DAMPING_SECONDS
+                    )
                     item.update({"status": "RECOVERED", "recovered_at": now})
+                    if should_alert:
+                        item["last_recovery_alert_at"] = now
+                        recovery_alert_count += 1
                     recovery_count += 1
             if recovery_count:
                 conn.execute(
@@ -1863,7 +1949,7 @@ def clear_ttp_price_failure_state(market_slug, outcome, now=None):
                     (json.dumps(alert_state, sort_keys=True), now, _ERROR_ALERT_STATE_KEY),
                 )
         conn.commit()
-        if recovery_count:
+        if recovery_alert_count:
             telegram_alerts.send_telegram_alert(
                 f"✅ TTP pricing recovered: {market_slug} / {outcome}; "
                 f"closed {recovery_count} error fingerprint incident(s)."

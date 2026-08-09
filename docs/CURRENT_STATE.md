@@ -130,6 +130,15 @@ authority for fresh/current databases.
     automatic quarantine. Generic Telegram errors now use durable per-fingerprint exponential
     backoff and emit a recovery transition, so a dead market cannot mask an unrelated auth error.
     This release has not changed AWS, started qualification, reset HWM, or authorized Live.
+12. **2026-08-09 final pre-epoch boundary hardening, still not deployed:** perfect but tiny Gate-A
+    samples no longer pass (minimum 10,000 fetches and 1,800 sweeps); termination UNKNOWN needs
+    100 final lots and Gate-B equity ratios need the pre-existing USD 900 denominator. Structural
+    classification is prospective with a 24-hour operator SLA. Telegram fingerprints retain
+    backoff across rapid recovery/reopen cycles and enter `FLAPPING` on the third reopen in six
+    hours. Every realized-event prune now requires an exact independent-volume chain anchor,
+    stages the next manifest before DB commit and atomically finalizes afterward; valid-prefix
+    truncation and unresolved crash-pending anchors fail closed. The deployment candidate is the
+    v2 build freeze; non-completeness-blocking findings go to the v3 backlog.
 
 ## 2026-08-05 repository separation
 

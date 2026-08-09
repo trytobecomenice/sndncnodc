@@ -86,6 +86,32 @@ def _allocation_rows(conn, where="1=1", params=()):
     ).fetchall()
 
 
+def seal_chain_state(conn):
+    """Small externally anchorable state; detects valid-prefix truncation."""
+    if not _has_table(conn, SEAL_TABLE):
+        return {
+            "seal_table_present": False,
+            "chain_head_sha256": GENESIS_CHAIN_SHA256,
+            "seal_count": 0,
+            "latest_range_end": None,
+        }
+    row = conn.execute(
+        f"SELECT COUNT(*) seal_count,MAX(range_end) latest_range_end FROM {SEAL_TABLE}"
+    ).fetchone()
+    count = int(row["seal_count"] or 0)
+    latest = conn.execute(
+        f"SELECT chain_sha256,range_end FROM {SEAL_TABLE} ORDER BY range_end DESC LIMIT 1"
+    ).fetchone()
+    if bool(latest) != bool(count):
+        raise RuntimeError("inconsistent seal-chain cardinality")
+    return {
+        "seal_table_present": True,
+        "chain_head_sha256": latest["chain_sha256"] if latest else GENESIS_CHAIN_SHA256,
+        "seal_count": count,
+        "latest_range_end": int(latest["range_end"]) if latest else None,
+    }
+
+
 def seal_realized_events_before(conn, cutoff, realized_event_types):
     """Seal currently retained realized evidence before destructive pruning.
 
@@ -104,8 +130,10 @@ def seal_realized_events_before(conn, cutoff, realized_event_types):
     if not events:
         return None
     ids = [row["id"] for row in events]
-    id_placeholders = ",".join("?" for _ in ids)
-    allocations = _allocation_rows(conn, f"a.event_id IN ({id_placeholders})", ids)
+    # Avoid SQLite's bind-variable ceiling on the first large retention seal.
+    # The timestamp predicate bounds the scan; event IDs remain the authority
+    # for exact membership below.
+    allocations = _allocation_rows(conn, "a.event_timestamp<?", (cutoff,))
     by_id = {row["event_id"]: row for row in allocations}
     if len(by_id) != len(events):
         missing = sorted(set(ids) - set(by_id))

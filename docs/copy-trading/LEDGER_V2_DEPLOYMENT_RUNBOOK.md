@@ -31,8 +31,19 @@ does not authorize Live, a wallet change, an HWM reset, or larger sizing.
    `backup_sqlite_online.py`; retain its SHA-256 and require
    `PRAGMA integrity_check = ok`. Because the bot is stopped first, restoring
    this backup cannot discard post-backup bot trades.
+   Before changing the DB, run `seal_chain_manifest.py verify` against the
+   last off-volume manifest. Compare `chain_head_sha256`, `seal_count`,
+   `latest_range_end`, and seal-table presence. Missing/mismatched history
+   stops deployment; a valid shorter chain is still a failure, not a new
+   baseline. The initial migration may bootstrap an explicit genesis manifest
+   only when seal count is factually zero under the incident record.
 4. Pull the reviewed release and apply additive migrations 0024–0028. Do not
-   create the readiness key manually.
+   create the readiness key manually. On the first 0028 deployment only,
+   record the explicit genesis external anchor after the empty seal table
+   exists and before any bot/prune can run; its table-presence field must be
+   true and seal count zero. Use a canonical `seal-000000000000-genesis.json`
+   filename inside `LEDGER_SEAL_MANIFEST_DIR`. Later deployments must verify,
+   never re-bootstrap.
 5. Generate a fresh reconciliation-v3 report *after the stop*. It must include
    `bot_filtered`, `shadow_rehab`, and `shadow_challenger`, with strategy in the
    allocation key. Require zero unmatched and zero ambiguous events.
@@ -62,6 +73,16 @@ does not authorize Live, a wallet change, an HWM reset, or larger sizing.
    SQL—not merely the presence of a key.
 10. Unpause watchdog only after it identifies that same one PID. Keep
     autodeploy locked through the observation window.
+11. After post-restart integrity verification, verify the newest independent
+    anchor again. Every later destructive realized-event prune automatically
+    verifies the previous anchor, stages the next manifest before DB commit,
+    and atomically finalizes it afterward. That finalized file becomes the
+    required comparison input for the next prune/maintenance window; writing
+    it never substitutes for the comparison.
+    If a process crash leaves one `.pending.json`, keep pruning stopped and run
+    `seal_chain_manifest.py recover-pending`; it finalizes only when the pending
+    state exactly equals the committed DB and otherwise fails without rewriting
+    either side.
 
 ## Failure and rollback semantics
 
@@ -88,8 +109,19 @@ denominator; Gate B exposes them separately. Frozen legacy identities do not
 hide any quarantine created inside the qualification window: a new one resets
 the seven-day clock.
 
+Rate evidence requires at least 10,000 fetch attempts and 1,800 sweeps;
+termination UNKNOWN evidence requires at least 100 final lots. A structural
+suspect must be adjudicated within 24 hours and no suspect may remain when the
+window qualifies. Classification is prospective only: failed calls recorded
+before factual quarantine stay in Gate A even when that restarts the window.
+
 Quarantine is not accounting finality. It stops repeated syscalls and sends one
 operator alert, while the position stays unpriceable and remains in risk/SLO.
 Only an official resolved outcome or a real executable exit can close it.
 `SYSTEM_CENSORED` may label research evidence; it must never fabricate economic
 PnL or silently release capital.
+
+This release is the epoch-v2 build freeze. Once deployed, changes other than a
+documented completeness-blocking integrity/exit-safety fix go to
+`docs/research/EPOCH_V3_BACKLOG.md`. Every allowed code deployment resets the
+qualification clock.

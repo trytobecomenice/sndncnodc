@@ -1125,6 +1125,10 @@ LOG_BACKUP_COUNT = 5
 # growing with zero pruning before this).
 EVENT_LOG_RETENTION_DAYS = 180
 LEDGER_INTEGRITY_INTERVAL_SECONDS = 3600
+# Must be an independently mounted volume before migration 0028 is deployed.
+# Empty deliberately fails closed only when a realized-event prune needs a
+# cryptographic external anchor; ordinary non-economic event retention remains.
+LEDGER_SEAL_MANIFEST_DIR = os.getenv("LEDGER_SEAL_MANIFEST_DIR", "")
 PRUNE_INTERVAL_SECONDS = 86400  # once/day — cheap, no need to run more often
 
 # "static": get_tracked_traders() returns TRACKED_TRADERS above, unchanged

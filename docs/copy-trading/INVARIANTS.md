@@ -12,8 +12,8 @@ action is not an invariant.
 | A sums equal each lot L | live allocator/backfill | per-lot event count and integer-micro PnL equality | immediately latch Entry Interlock |
 | Acquired shares equal sold shares plus remaining shares | position persistence and allocation shares trail | `total_acquired_shares == SUM(shares_closed) + latest shares_remaining`; open DB shares equal remaining | immediately latch Entry Interlock; missing history is UNKNOWN |
 | Retention seals cannot be edited or removed by normal application SQL | migration 0028 SQLite triggers | adversarial UPDATE/DELETE tests | SQLite abort; chain head is exported with each verified backup because a same-owner DBA can drop a trigger |
-| Gate A measures the pricing pipeline, not dead inventory | TTP sweep schema v3 | denominator is `fetch_attempted_positions`; zero is UNKNOWN | fail qualification |
-| Gate B exposes structural unpriceable inventory | persisted quarantine state and open ledger | count, cost/equity ratio, age/reconciliation and new-in-window count | fail/reset qualification; never invent a price |
+| Gate A measures the pricing pipeline, not dead inventory | TTP sweep schema v3 | denominator is `fetch_attempted_positions`; <10,000 attempts or <1,800 sweeps is UNKNOWN | fail qualification |
+| Gate B exposes structural unpriceable inventory | persisted quarantine state and open ledger | count, cost/equity ratio with minimum USD 900 equity denominator, age/reconciliation and new-in-window count | fail/reset qualification; never invent a price |
 | Unknown permanent API wording cannot block invisibly | behavioural TTP failure state | continuous failure age becomes `SUSPECTED_STRUCTURAL` | one operator alert; remains in Gate A pending review |
 | One repeated error cannot suppress a different critical error | fingerprint alert state v2 | independent fingerprint OPEN/backoff/RECOVERED state | distinct alert; critical alerts bypass the generic manager |
 | Evaluator and preflight cannot disagree about a gate | `qualification_gates.py` | both import the same pure functions | test/build failure |

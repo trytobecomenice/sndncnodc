@@ -1,5 +1,5 @@
 {
-  "protocol_version": "copy-alpha-v2-draft-1",
+  "protocol_version": "copy-alpha-v2-draft-2",
   "freeze_state": "DRAFT_NOT_FROZEN",
   "paper_only": true,
   "pass_authority": "CALIBRATION_ONLY_NOT_LIVE",
@@ -10,10 +10,15 @@
     "ttp_observation_schema_version": "ttp-sweep-observation-v3",
     "ttp_price_read_success_rate_min": 0.99,
     "ttp_executable_bid_rate_min": 0.99,
+    "ttp_rate_minimum_fetch_attempts": 10000,
+    "ttp_minimum_sweeps": 1800,
+    "structural_suspect_sla_seconds": 86400,
     "legacy_quarantine_keys": [],
     "legacy_quarantine_count_max": 0,
     "quarantined_cost_basis_to_equity_max": 0.10,
-    "termination_unknown_rate_max": 0.01
+    "quarantined_ratio_minimum_equity_usd": 900.0,
+    "termination_unknown_rate_max": 0.01,
+    "termination_minimum_final_lots": 100
   },
   "evidence": {
     "minimum_independent_entities": 30,
@@ -30,6 +35,11 @@
     "w_consecutive_breaches": 2,
     "latency_ks_alpha": 0.01,
     "latency_consecutive_breaches": 2
+  },
+  "alerting": {
+    "error_fingerprint_flap_window_seconds": 21600,
+    "error_fingerprint_flapping_reopen_count": 3,
+    "recovery_notification_damping_seconds": 21600
   },
   "termination_causes": [
     "INTENDED_SOURCE_RESOLUTION",
@@ -62,5 +72,11 @@
     "rejected_action": "stop copy-direction promotion; write post-mortem within 7 days",
     "budget_scope": "epoch",
     "budget_loss_limit_usd": 100.0
+  },
+  "build_freeze": {
+    "activation": "epoch_v2_deployment_candidate",
+    "mid_epoch_code_change_rule": "completeness_blocking_integrity_or_exit_safety_only",
+    "allowed_change_resets_window": true,
+    "all_other_findings": "docs/research/EPOCH_V3_BACKLOG.md"
   }
 }

@@ -25,7 +25,7 @@ class TestProtocolV2Preconditions(unittest.TestCase):
           shares_closed REAL,shares_remaining REAL);
         CREATE TABLE paper_trade_event_seal(id TEXT PRIMARY KEY,range_start INTEGER,range_end INTEGER,
           event_count INTEGER,pnl_micros INTEGER,shares_micros INTEGER,canonical_sha256 TEXT,
-          sealer_version TEXT,sealed_at INTEGER);
+          previous_chain_sha256 TEXT,chain_sha256 TEXT,sealer_version TEXT,sealed_at INTEGER);
         CREATE TABLE pnl_snapshot(captured_at INTEGER,scope TEXT,realized_pnl_usd REAL,
           unrealized_pnl_usd REAL);
         """)
@@ -37,10 +37,15 @@ class TestProtocolV2Preconditions(unittest.TestCase):
                 "ttp_observation_schema_version": "ttp-sweep-observation-v3",
                 "ttp_price_read_success_rate_min": 0.99,
                 "ttp_executable_bid_rate_min": 0.99,
+                "ttp_rate_minimum_fetch_attempts": 2,
+                "ttp_minimum_sweeps": 2,
+                "structural_suspect_sla_seconds": 86400,
                 "legacy_quarantine_keys": [],
                 "legacy_quarantine_count_max": 0,
                 "quarantined_cost_basis_to_equity_max": 0.10,
+                "quarantined_ratio_minimum_equity_usd": 900,
                 "termination_unknown_rate_max": 0.01,
+                "termination_minimum_final_lots": 1,
             },
         }
         self.conn.execute(
@@ -118,6 +123,13 @@ class TestProtocolV2Preconditions(unittest.TestCase):
         checks, reasons = evaluate_preconditions(self.conn, self.protocol, 10000)
         self.assertEqual(checks["active_unpriceable_quarantines"], 1)
         self.assertIn("structural_unpriceable_count", reasons)
+
+    def test_preconditions_refuse_perfect_but_underpowered_rate_denominator(self):
+        self.protocol["qualification"]["ttp_rate_minimum_fetch_attempts"] = 3
+        checks, reasons = evaluate_preconditions(self.conn, self.protocol, 10000)
+        by_name = {gate["name"]: gate for gate in checks["qualification_gates"]}
+        self.assertEqual(by_name["ttp_pipeline_price_read"]["status"], "UNKNOWN")
+        self.assertIn("ttp_pipeline_price_read", reasons)
 
 
 if __name__ == "__main__":

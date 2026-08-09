@@ -44,12 +44,14 @@ The epoch cannot start until all are true for a continuous seven-day window:
 1. durable event-to-tax-lot PnL ledger is authoritative with zero unresolved
    allocations;
 2. Gate A pricing-pipeline price-read success and executable-bid rates are
-   each at least 99%, using actual fetch attempts as the denominator; zero
-   attempts are `UNKNOWN`, never a vacuous PASS;
+   each at least 99%, using actual fetch attempts as the denominator. Evidence
+   requires at least 10,000 fetch attempts across at least 1,800 distinct
+   five-minute sweeps; any smaller denominator is `UNKNOWN`, including 2/2;
 3. event-time termination classifier is deployed and `UNKNOWN <= 1%` among
    final `bot_filtered` lot terminations whose allocation source is `live`
-   and whose event time falls inside the qualification window. Historical
-   backfill and partial reductions are excluded from this denominator;
+   and whose event time falls inside the qualification window. At least 100
+   final lots are required so the 1% boundary has event-level resolution.
+   Historical backfill and partial reductions are excluded from this denominator;
 4. Gate B reports `QUARANTINED_UNPRICEABLE` separately by frozen legacy
    identity/count, cost basis divided by conservative equity, age and hourly
    official-reconciliation freshness. Any new quarantine in the seven-day
@@ -62,6 +64,23 @@ The epoch cannot start until all are true for a continuous seven-day window:
 7. hourly E/A/L integrity observations pass, every pruned realized-event
    range has an append-only canonical SHA-256 seal, and acquired/sold/remaining
    shares conserve. Missing quantity evidence is `UNKNOWN`, never zero.
+8. no `SUSPECTED_STRUCTURAL` market-data failure remains unadjudicated. The
+   operator SLA is 24 hours from suspicion. Classification is prospective:
+   observations accumulated before a market is factually quarantined remain
+   in Gate A forever and cannot be retrospectively cleaned. A resulting window
+   restart is expected evidence cost, not permission to rewrite the denominator.
+
+Gate A's observed error budget is always printed as
+`floor(fetch_attempts * (1 - required_rate))`. At the expected 102,816 calls,
+the 99% budget is about 1,028 failures and one continuously failing position
+consumes roughly 288 per day. Operationally, the qualification condition is
+therefore seven continuous days without an unresolved structural failure—not
+merely seven calendar days since deployment.
+
+Gate B's unpriceable-cost/equity ratio is only defined when conservative equity
+is at least the pre-existing USD 900 hard equity floor. Below that denominator
+the ratio is `UNKNOWN`; it cannot manufacture a stable-looking percentage while
+the account is already at its separate risk boundary.
 
 ## Statistical units and controls
 
@@ -105,3 +124,19 @@ Terminal states are `SYSTEM_INTEGRITY_KILL`, `PRECONDITION_FAILED`,
 `INSUFFICIENT_EVIDENCE`, `INCONCLUSIVE`, `REJECTED`, `PASS`, and
 `INSTRUMENT_INSUFFICIENT`. After REJECTED, copy-direction promotion stops and
 a post-mortem is due within seven days.
+
+## Engineering build freeze
+
+The deployment candidate that starts epoch v2 is the build freeze. During the
+epoch, only a completeness-blocking integrity defect may change code: loss,
+corruption or systematic omission of evidence needed to reconstruct the
+estimand/accounting state, or a safety defect that can prevent exits or violate
+the entry interlock. Parameter refinements, dashboards, performance tuning,
+additional gates and non-blocking operational improvements go to
+`EPOCH_V3_BACKLOG.md` without deployment.
+
+Any permitted code change still invalidates the active qualification/epoch
+window and restarts its clock from zero. The label “integrity” is not sufficient;
+the incident record must identify the specific missing/corrupt evidence or
+safety invariant. This rule prevents both silent corruption and endless
+pre-evidence architecture work.

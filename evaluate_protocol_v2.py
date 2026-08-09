@@ -12,6 +12,7 @@ authorize Live.
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 import json
 from pathlib import Path
 import sqlite3
@@ -19,9 +20,7 @@ import sqlite3
 import config
 import db
 from ledger_integrity import audit_ledger
-from qualification_gates import evaluate_ttp_gates, gate_failures
-from ledger_integrity import audit_ledger
-from qualification_gates import evaluate_ttp_gates, gate_failures
+from qualification_gates import evaluate_ttp_gates, gate_failures, maximum_rate_gate
 from db import (
     _REALIZED_ALLOCATION_TABLE,
     _REALIZED_ALLOCATOR_VERSION,
@@ -59,6 +58,10 @@ def _continuous_coverage_ok(first_ts, last_ts, cutoff, now_ts, grace_seconds):
         and first_ts <= cutoff + grace_seconds
         and last_ts >= now_ts - grace_seconds
     )
+
+
+def _rate_error_budget(denominator, minimum_rate):
+    return int(Decimal(int(denominator)) * (Decimal("1") - Decimal(str(minimum_rate))))
 
 
 def evaluate_preconditions(conn, protocol, now_ts):
@@ -100,6 +103,14 @@ def evaluate_preconditions(conn, protocol, now_ts):
         if isinstance(item, dict) and item.get("status") == "QUARANTINED_UNPRICEABLE"
     }
     active_quarantines = len(quarantine_entries)
+    suspected_entries = [
+        item for item in (quarantine.get("entries") or {}).values()
+        if isinstance(item, dict) and item.get("status") == "SUSPECTED_STRUCTURAL"
+    ]
+    suspected_ages = [
+        max(0, now_ts - int(item.get("suspected_at") or item.get("first_failure_at") or now_ts))
+        for item in suspected_entries
+    ]
     checks["active_unpriceable_quarantines"] = active_quarantines
 
     rows = conn.execute(
@@ -159,8 +170,11 @@ def evaluate_preconditions(conn, protocol, now_ts):
         for item in quarantine_entries.values()
     )
     gates = evaluate_ttp_gates(
-        fetch_attempted=attempted, successful=successful, executable=executable,
+        sweep_count=len(rows), fetch_attempted=attempted,
+        successful=successful, executable=executable,
         quarantined_count=active_quarantines,
+        suspected_count=len(suspected_entries),
+        oldest_suspected_age_seconds=max(suspected_ages, default=None),
         quarantined_cost_basis_usd=quarantined_cost,
         conservative_equity_usd=marked_equity, new_quarantines=new_quarantines,
         policy=q,
@@ -168,8 +182,14 @@ def evaluate_preconditions(conn, protocol, now_ts):
     price_rate = successful / attempted if attempted else None
     bid_rate = executable / attempted if attempted else None
     checks["ttp"] = {"attempted": attempted, "successful": successful,
+                     "sweep_count": len(rows),
                      "executable_bid": executable, "price_rate": price_rate,
                      "executable_bid_rate": bid_rate, "full_window": ttp_span_ok,
+                     "failed_price_reads": attempted - successful,
+                     "price_read_error_budget": _rate_error_budget(
+                         attempted, q["ttp_price_read_success_rate_min"]),
+                     "executable_bid_error_budget": _rate_error_budget(
+                         attempted, q["ttp_executable_bid_rate_min"]),
                      "max_gap_seconds": max_gap_seconds,
                      "schema_version_ok": ttp_schema_ok,
                      "termination_classifier_heartbeat": classifier_heartbeat_ok}
@@ -178,6 +198,8 @@ def evaluate_preconditions(conn, protocol, now_ts):
         "cost_basis_usd": quarantined_cost,
         "conservative_equity_usd": marked_equity,
         "new_in_window": new_quarantines,
+        "suspected_count": len(suspected_entries),
+        "oldest_suspected_age_seconds": max(suspected_ages, default=None),
         "legacy_keys_frozen": sorted(q.get("legacy_quarantine_keys", [])),
     }
     checks["qualification_gates"] = [gate.to_dict() for gate in gates]
@@ -205,12 +227,18 @@ def evaluate_preconditions(conn, protocol, now_ts):
     else:
         total = unknown = 0
     unknown_rate = unknown / total if total else None
+    termination_gate = maximum_rate_gate(
+        "termination_unknown_rate", unknown, total,
+        q["termination_unknown_rate_max"], q["termination_minimum_final_lots"],
+    )
+    gates.append(termination_gate)
+    checks["qualification_gates"] = [gate.to_dict() for gate in gates]
     checks["termination_capture"] = {
         "total": total, "unknown": unknown, "unknown_rate": unknown_rate,
         "classifier_full_window": ttp_span_ok and classifier_heartbeat_ok,
     }
-    if unknown_rate is None or unknown_rate > q["termination_unknown_rate_max"]:
-        reasons.append("termination_unknown_rate_exceeded")
+    if termination_gate.status != "PASS":
+        reasons.append(termination_gate.name)
 
     if protocol.get("freeze_state") != "FROZEN":
         reasons.append("protocol_not_frozen")

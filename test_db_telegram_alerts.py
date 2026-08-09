@@ -137,17 +137,41 @@ class TestThrottledErrorAlert(_TempDbTestCase):
                            "error": "auth failure: token expired"})
         self.assertEqual(mock_send.call_count, 2)
 
-    def test_recovered_fingerprint_reopens_as_a_fresh_incident(self):
+    def test_rapid_reopen_retains_previous_backoff_stage(self):
         error = {"timestamp": "t", "event_type": "error",
                  "error": "trailing_tp price check: timeout",
                  "market_slug": "m", "outcome": "Yes"}
-        with patch("db.telegram_alerts.send_telegram_alert") as mock_send:
+        with patch("db.telegram_alerts.send_telegram_alert") as mock_send, \
+             patch("db.time.time", return_value=100):
             db.append_log(error)
-            db.record_ttp_price_failure("m", "Yes", "timeout", now=10)
-            self.assertTrue(db.clear_ttp_price_failure_state("m", "Yes", now=20))
+            db.record_ttp_price_failure("m", "Yes", "timeout", now=100)
+            self.assertTrue(db.clear_ttp_price_failure_state("m", "Yes", now=100))
             db.append_log(error)
-        self.assertEqual(mock_send.call_count, 3)
+        # Reopen inside the flap window retains the previous 15-minute stage,
+        # so it does not immediately page a third time.
+        self.assertEqual(mock_send.call_count, 2)
         self.assertIn("recovered", mock_send.call_args_list[1].args[0].lower())
+
+    def test_third_rapid_reopen_is_marked_flapping_without_alert_reset(self):
+        error = {"timestamp": "t", "event_type": "error", "error": "ttp: timeout",
+                 "market_slug": "m", "outcome": "Yes"}
+        with patch("db.telegram_alerts.send_telegram_alert") as mock_send, \
+             patch("db.time.time") as mock_time:
+            mock_time.return_value = 100
+            db.append_log(error)
+            for now in (200, 300, 400):
+                db.record_ttp_price_failure("m", "Yes", "timeout", now=now)
+                db.clear_ttp_price_failure_state("m", "Yes", now=now)
+                mock_time.return_value = now
+                db.append_log(error)
+        # Initial OPEN + first RECOVERED only. Rapid cycles are damped.
+        self.assertEqual(mock_send.call_count, 2)
+        conn = sqlite3.connect(self.tmp_path)
+        row = conn.execute("SELECT value_json FROM bot_risk_state WHERE key=?",
+                           (db._ERROR_ALERT_STATE_KEY,)).fetchone()
+        state = __import__("json").loads(row[0])
+        self.assertEqual(next(iter(state["entries"].values()))["status"], "FLAPPING")
+        conn.close()
 
 
 if __name__ == "__main__":
