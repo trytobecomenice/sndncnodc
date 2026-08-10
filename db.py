@@ -173,7 +173,14 @@ def _realized_allocation_ledger_ready(conn):
         value = json.loads(row["value_json"])
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
-    return bool(value.get("ready")) and value.get("allocator_version") == _REALIZED_ALLOCATOR_VERSION
+    return (
+        bool(value.get("ready"))
+        and value.get("allocator_version") == _REALIZED_ALLOCATOR_VERSION
+        # Numerator and denominator are one accounting version.  Never allow
+        # a readiness key written by an older migration to switch only PnL.
+        and _paper_trade_has_column(conn, "cumulative_realized_pnl_usd")
+        and _paper_trade_has_column(conn, "cumulative_realized_cost_basis_usd")
+    )
 
 
 def _realized_pnl_sql(conn, alias=None):
@@ -190,6 +197,21 @@ def _realized_pnl_sql(conn, alias=None):
     return f"{prefix}realized_pnl_usd"
 
 
+def _realized_cost_basis_sql(conn, alias=None):
+    """Denominator paired atomically with :func:`_realized_pnl_sql`.
+
+    ``paper_trade.cost_basis_usd`` is mutable remaining inventory basis.  Once
+    a lot has more than one partial realization it is not the denominator for
+    cumulative event PnL.  The readiness key may switch the numerator only
+    when the cumulative realized basis column is present too.
+    """
+    prefix = f"{alias}." if alias else ""
+    if (_paper_trade_has_column(conn, "cumulative_realized_cost_basis_usd")
+            and _realized_allocation_ledger_ready(conn)):
+        return f"{prefix}cumulative_realized_cost_basis_usd"
+    return f"{prefix}cost_basis_usd"
+
+
 def get_realized_ledger_reader_status():
     """Operator-visible proof of which accounting source decision readers use."""
     conn = _connect()
@@ -199,6 +221,9 @@ def get_realized_ledger_reader_status():
             "ready": ready,
             "reader_column": (
                 "cumulative_realized_pnl_usd" if ready else "realized_pnl_usd"
+            ),
+            "reader_cost_basis_column": (
+                "cumulative_realized_cost_basis_usd" if ready else "cost_basis_usd"
             ),
             "allocator_version": _REALIZED_ALLOCATOR_VERSION,
         }
@@ -441,21 +466,24 @@ def load_state():
             # behind merely because it has zero clean rows to overwrite it.
             trader_performance = {}
             pnl_sql = _realized_pnl_sql(conn)
+            basis_sql = _realized_cost_basis_sql(conn)
             clean_rows = conn.execute(
                 f"SELECT lower(wallet_address) AS wallet_address, {pnl_sql} AS economic_pnl_usd, "
-                "cost_basis_usd FROM paper_trade "
+                f"{basis_sql} AS economic_cost_basis_usd FROM paper_trade "
                 "WHERE strategy = 'bot_filtered' AND status = 'closed' "
                 "AND is_demo_data = 0 AND COALESCE(is_phantom, 0) = 0 "
-                f"AND {pnl_sql} IS NOT NULL AND cost_basis_usd >= ? "
+                f"AND {pnl_sql} IS NOT NULL AND {basis_sql} >= ? "
                 "ORDER BY closed_at ASC",
                 (config.MUTE_MIN_TRADE_COST_USD,),
             ).fetchall()
             rebuilt = {}
             for clean_row in clean_rows:
-                if not clean_row["cost_basis_usd"]:
+                if not clean_row["economic_cost_basis_usd"]:
                     continue
                 values = rebuilt.setdefault(clean_row["wallet_address"], [])
-                values.append(clean_row["economic_pnl_usd"] / clean_row["cost_basis_usd"])
+                values.append(
+                    clean_row["economic_pnl_usd"] / clean_row["economic_cost_basis_usd"]
+                )
                 if len(values) > config.MUTE_EV_MIN_SAMPLES:
                     del values[:-config.MUTE_EV_MIN_SAMPLES]
             for wallet_address, recent_returns in rebuilt.items():
@@ -824,8 +852,10 @@ def get_shadow_rehab_returns(wallet_address, limit=None):
     conn = _connect()
     try:
         pnl_sql = _realized_pnl_sql(conn)
+        basis_sql = _realized_cost_basis_sql(conn)
         query = (
-            f"SELECT {pnl_sql} AS economic_pnl_usd, cost_basis_usd FROM paper_trade "
+            f"SELECT {pnl_sql} AS economic_pnl_usd, "
+            f"{basis_sql} AS economic_cost_basis_usd FROM paper_trade "
             "WHERE wallet_address = ? AND strategy = 'shadow_rehab' AND status = 'closed' "
             "AND is_demo_data = 0 ORDER BY closed_at DESC"
         )
@@ -835,8 +865,9 @@ def get_shadow_rehab_returns(wallet_address, limit=None):
             params.append(limit)
         rows = conn.execute(query, params).fetchall()
         return [
-            row["economic_pnl_usd"] / row["cost_basis_usd"]
-            for row in rows if row["cost_basis_usd"] and row["economic_pnl_usd"] is not None
+            row["economic_pnl_usd"] / row["economic_cost_basis_usd"]
+            for row in rows
+            if row["economic_cost_basis_usd"] and row["economic_pnl_usd"] is not None
         ]
     finally:
         conn.close()
@@ -853,10 +884,12 @@ def get_shadow_returns(wallet_address, strategy, limit=None, min_cost_basis_usd=
     conn = _connect()
     try:
         pnl_sql = _realized_pnl_sql(conn)
+        basis_sql = _realized_cost_basis_sql(conn)
         query = (
-            f"SELECT {pnl_sql} AS economic_pnl_usd, cost_basis_usd FROM paper_trade "
+            f"SELECT {pnl_sql} AS economic_pnl_usd, "
+            f"{basis_sql} AS economic_cost_basis_usd FROM paper_trade "
             "WHERE lower(wallet_address) = ? AND strategy = ? AND status = 'closed' "
-            "AND is_demo_data = 0 AND cost_basis_usd >= ? ORDER BY closed_at ASC"
+            f"AND is_demo_data = 0 AND {basis_sql} >= ? ORDER BY closed_at ASC"
         )
         params = [wallet_address.lower(), strategy, min_cost_basis_usd]
         if limit:
@@ -864,8 +897,9 @@ def get_shadow_returns(wallet_address, strategy, limit=None, min_cost_basis_usd=
             params.append(limit)
         rows = conn.execute(query, params).fetchall()
         return [
-            row["economic_pnl_usd"] / row["cost_basis_usd"]
-            for row in rows if row["cost_basis_usd"] and row["economic_pnl_usd"] is not None
+            row["economic_pnl_usd"] / row["economic_cost_basis_usd"]
+            for row in rows
+            if row["economic_cost_basis_usd"] and row["economic_pnl_usd"] is not None
         ]
     finally:
         conn.close()
@@ -1010,8 +1044,14 @@ def _allocate_realized_event(conn, event_id, event, strategy, event_timestamp):
         conn.execute(
             "UPDATE paper_trade SET cumulative_realized_pnl_usd="
             "COALESCE(cumulative_realized_pnl_usd,0)+?, realized_event_count="
-            "COALESCE(realized_event_count,0)+1 WHERE id=?",
-            (pnl_usd, paper_trade_id),
+            "COALESCE(realized_event_count,0)+1"
+            + (", cumulative_realized_cost_basis_usd="
+               "COALESCE(cumulative_realized_cost_basis_usd,0)+?"
+               if _paper_trade_has_column(conn, "cumulative_realized_cost_basis_usd") else "")
+            + " WHERE id=?",
+            ((pnl_usd, float(cost_basis_usd or 0), paper_trade_id)
+             if _paper_trade_has_column(conn, "cumulative_realized_cost_basis_usd")
+             else (pnl_usd, paper_trade_id)),
         )
     return paper_trade_id
 
@@ -1548,9 +1588,10 @@ def get_wallet_realized_ev_stats():
         clean_predicate = _clean_paper_trade_predicate(conn)
         non_demo_predicate = _non_demo_paper_trade_predicate(conn)
         pnl_sql = _realized_pnl_sql(conn)
+        basis_sql = _realized_cost_basis_sql(conn)
         cur = conn.execute(
             "SELECT wallet_address, "
-            f"avg({pnl_sql} / nullif(cost_basis_usd, 0)) AS ev_pct, "
+            f"avg({pnl_sql} / nullif({basis_sql}, 0)) AS ev_pct, "
             "count(*) AS trade_count "
             "FROM paper_trade WHERE status = 'closed' AND strategy = 'bot_filtered' "
             f"AND {non_demo_predicate} AND {clean_predicate} "
@@ -1682,10 +1723,11 @@ def get_replacement_wallet_candidate():
         clean_predicate = _clean_paper_trade_predicate(conn, alias="pt")
         non_demo_predicate = _non_demo_paper_trade_predicate(conn, alias="pt")
         pnl_sql = _realized_pnl_sql(conn, alias="pt")
+        basis_sql = _realized_cost_basis_sql(conn, alias="pt")
         row = conn.execute(
             "SELECT wp.wallet_address, wp.nickname, count(pt.id) AS trade_count, "
             f"COALESCE(sum({pnl_sql}), 0) AS realized_pnl_usd, "
-            f"avg({pnl_sql} / nullif(pt.cost_basis_usd, 0)) AS ev_pct "
+            f"avg({pnl_sql} / nullif({basis_sql}, 0)) AS ev_pct "
             "FROM wallet_profile wp LEFT JOIN paper_trade pt "
             "ON lower(pt.wallet_address) = lower(wp.wallet_address) "
             "AND pt.strategy = 'bot_filtered' AND pt.status = 'closed' "

@@ -270,6 +270,10 @@ export const paperTrade = sqliteTable(
     // rebuilt from paper_trade_realized_allocation and incremented
     // transactionally for every new matched realized event.
     cumulativeRealizedPnlUsd: real("cumulative_realized_pnl_usd").notNull().default(0),
+    // Denominator paired with cumulativeRealizedPnlUsd.  costBasisUsd is the
+    // currently remaining (or final pre-close) inventory basis and therefore
+    // cannot price a return spanning several partial realized events.
+    cumulativeRealizedCostBasisUsd: real("cumulative_realized_cost_basis_usd").notNull().default(0),
     realizedEventCount: integer("realized_event_count").notNull().default(0),
     peakProfitPct: real("peak_profit_pct").notNull().default(0),
     // Unix seconds of this position's last SUCCESSFUL price read (bot.py's

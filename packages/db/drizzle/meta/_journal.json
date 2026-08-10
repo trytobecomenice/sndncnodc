@@ -204,6 +204,13 @@
       "when": 1786255200000,
       "tag": "0028_ledger_seals",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "6",
+      "when": 1786389725589,
+      "tag": "0029_fearless_roxanne_simpson",
+      "breakpoints": true
     }
   ]
 }

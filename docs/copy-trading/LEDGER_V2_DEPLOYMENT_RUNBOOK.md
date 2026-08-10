@@ -49,16 +49,23 @@ does not authorize Live, a wallet change, an HWM reset, or larger sizing.
    allocation key. Require zero unmatched and zero ambiguous events.
 6. Record the exact report SHA-256. Run the backfill without `--apply`, then
    apply that same byte-for-byte report with its exact expected SHA.
-7. The apply transaction must upsert allocations, rebuild cumulative lot PnL,
-   prove zero unresolved/missing events across all three strategies, and write
-   the readiness key last. Any exception rolls the entire transaction back.
+7. The apply transaction must upsert allocations, rebuild both cumulative lot
+   PnL and its paired cumulative realized cost basis, prove zero
+   unresolved/missing events across all three strategies, run the E/A/L
+   integrity audit inside the uncommitted transaction, and write the readiness
+   key last. Any invariant failure or exception rolls the entire transaction
+   back. A cumulative numerator must never be divided by the mutable remaining
+   `paper_trade.cost_basis_usd` field.
 8. Before restart, independently verify:
    - readiness allocator/report versions and SHA;
    - zero unresolved/missing allocation events;
    - cumulative totals by strategy and phantom status;
    - no mutation of immutable event PnL, legacy final-row PnL, or phantom flags;
-   - all decision-reader queries select `cumulative_realized_pnl_usd` when the
-     key is present and legacy PnL when it is absent.
+   - all decision-reader queries select the paired
+     `cumulative_realized_pnl_usd` and
+     `cumulative_realized_cost_basis_usd` when the key is present, and paired
+     legacy PnL/basis when it is absent. A readiness key without either
+     cumulative column is not ready.
    - `preflight_protocol_v2.py` reports the exact Gate A/B numerator,
      denominator, threshold and reason for every gate;
    - E/A/L money and shares invariants pass, and every already-pruned realized
@@ -67,8 +74,9 @@ does not authorize Live, a wallet change, an HWM reset, or larger sizing.
      externally stored recovery manifest. In-database triggers do not protect
      against a same-owner process dropping the trigger and rewriting history.
 9. Start exactly one Paper bot. Its first `realized_ledger_reader_status` event
-   must say `reader_column=cumulative_realized_pnl_usd`, readiness true and
-   unresolved zero. Verify wallet EV, rolling mute rebuild, rehab, challenger,
+   must say `reader_column=cumulative_realized_pnl_usd`,
+   `reader_cost_basis_column=cumulative_realized_cost_basis_usd`, readiness
+   true and unresolved zero. Verify wallet EV, rolling mute rebuild, rehab, challenger,
    replacement ranking, portfolio realized and clean stats against independent
    SQL—not merely the presence of a key.
 10. Unpause watchdog only after it identifies that same one PID. Keep

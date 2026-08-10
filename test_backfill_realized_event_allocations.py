@@ -21,6 +21,7 @@ class TestAllocationBackfill(unittest.TestCase):
                 "packages/db/drizzle/0024_small_xavin.sql",
                 "packages/db/drizzle/0025_smart_rocket_racer.sql",
                 "packages/db/drizzle/0028_ledger_seals.sql",
+                "packages/db/drizzle/0029_fearless_roxanne_simpson.sql",
             )
         ).replace("--> statement-breakpoint", "")
         conn.executescript("""
@@ -37,11 +38,14 @@ class TestAllocationBackfill(unittest.TestCase):
             "VALUES('clean','bot_filtered','w','m','Yes','closed',0),"
             "('phantom','bot_filtered','w','x','Yes','closed',1)"
         )
-        for event_id, ts, market, pnl in (("e1", 10, "m", 2.0), ("e2", 11, "m", -0.5),
-                                          ("e3", 12, "x", 9.0)):
+        for event_id, ts, market, pnl, basis in (
+                ("e1", 10, "m", 2.0, 4.0), ("e2", 11, "m", -0.5, 1.0),
+                ("e3", 12, "x", 9.0, 1.0)):
             conn.execute(
                 "INSERT INTO bot_event_log VALUES(?,?, 'paper_sell','w',?,'Yes','SELL',?)",
-                (event_id, ts, market, json.dumps({"pnl_usd": pnl})),
+                (event_id, ts, market, json.dumps({
+                    "pnl_usd": pnl, "cost_basis_usd": basis,
+                })),
             )
         conn.commit()
         conn.close()
@@ -67,17 +71,21 @@ class TestAllocationBackfill(unittest.TestCase):
 
     def test_apply_is_atomic_and_rebuilds_cumulative_pnl(self):
         summary = apply_report(self.path, self.report(), "abc")
-        self.assertEqual(summary, {"event_count": 3, "unresolved": 0, "missing": 0})
+        self.assertEqual(summary["event_count"], 3)
+        self.assertEqual(summary["unresolved"], 0)
+        self.assertEqual(summary["missing"], 0)
+        self.assertEqual(summary["integrity"]["failures"], [])
         conn = sqlite3.connect(self.path)
         rows = conn.execute(
-            "SELECT id,cumulative_realized_pnl_usd,realized_event_count FROM paper_trade ORDER BY id"
+            "SELECT id,cumulative_realized_pnl_usd,cumulative_realized_cost_basis_usd,"
+            "realized_event_count FROM paper_trade ORDER BY id"
         ).fetchall()
         ready = json.loads(conn.execute(
             "SELECT value_json FROM bot_risk_state WHERE key=?",
             (db._REALIZED_LEDGER_READY_KEY,),
         ).fetchone()[0])
         conn.close()
-        self.assertEqual(rows, [("clean", 1.5, 2), ("phantom", 9.0, 1)])
+        self.assertEqual(rows, [("clean", 1.5, 5.0, 2), ("phantom", 9.0, 1.0, 1)])
         self.assertTrue(ready["ready"])
         self.assertEqual(ready["report_sha256"], "abc")
 
@@ -98,6 +106,20 @@ class TestAllocationBackfill(unittest.TestCase):
         conn.close()
         with self.assertRaisesRegex(RuntimeError, "missing=1"):
             apply_report(self.path, self.report(), "abc")
+        conn = sqlite3.connect(self.path)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM paper_trade_realized_allocation"
+        ).fetchone()[0], 0)
+        self.assertIsNone(conn.execute(
+            "SELECT 1 FROM bot_risk_state WHERE key=?", (db._REALIZED_LEDGER_READY_KEY,)
+        ).fetchone())
+        conn.close()
+
+    def test_event_economics_mismatch_rolls_back_before_readiness(self):
+        report = self.report()
+        report["event_allocations"][0]["cost_basis_usd"] = 400.0
+        with self.assertRaisesRegex(RuntimeError, "retained_event_economic_mismatch"):
+            apply_report(self.path, report, "abc")
         conn = sqlite3.connect(self.path)
         self.assertEqual(conn.execute(
             "SELECT COUNT(*) FROM paper_trade_realized_allocation"

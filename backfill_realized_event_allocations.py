@@ -24,6 +24,7 @@ from db import (
     _TERMINATION_CLASSIFIER_VERSION,
 )
 from reconcile_paper_trade_events import REPORT_VERSION
+from ledger_integrity import audit_ledger
 
 
 def report_sha256(path):
@@ -90,6 +91,9 @@ def apply_report(db_path, report, sha256):
             "UPDATE paper_trade SET cumulative_realized_pnl_usd=COALESCE(("
             f"SELECT SUM(a.pnl_usd) FROM {_REALIZED_ALLOCATION_TABLE} a "
             "WHERE a.paper_trade_id=paper_trade.id AND a.allocation_status='matched'"
+            "),0), cumulative_realized_cost_basis_usd=COALESCE(("
+            f"SELECT SUM(a.cost_basis_usd) FROM {_REALIZED_ALLOCATION_TABLE} a "
+            "WHERE a.paper_trade_id=paper_trade.id AND a.allocation_status='matched'"
             "),0), realized_event_count=(SELECT COUNT(*) FROM "
             f"{_REALIZED_ALLOCATION_TABLE} a WHERE a.paper_trade_id=paper_trade.id "
             "AND a.allocation_status='matched')"
@@ -118,12 +122,26 @@ def apply_report(db_path, report, sha256):
         if unresolved or missing:
             raise RuntimeError(f"ledger incomplete: unresolved={unresolved}, missing={missing}")
 
+        # Promotion is the trust boundary, not a promise to audit later.  Run
+        # every available E/A/L, event-economics, seal and quantity invariant
+        # against the uncommitted transaction and refuse readiness on any
+        # failure. UNKNOWN quantity evidence remains explicit in warnings and
+        # cannot be mistaken for PASS by protocol preflight.
+        integrity = audit_ledger(conn, _REALIZED_PNL_EVENT_TYPES)
+        if integrity.get("failures"):
+            raise RuntimeError(
+                "ledger integrity failed before readiness: "
+                + ",".join(integrity["failures"])
+            )
+
         ready_value = json.dumps({
             "ready": True,
             "allocator_version": _REALIZED_ALLOCATOR_VERSION,
             "report_version": report["report_version"],
             "report_sha256": sha256,
             "event_count": len(allocations),
+            "integrity_status": integrity.get("status"),
+            "integrity_warnings": integrity.get("warnings", []),
             "promoted_at": now,
         }, sort_keys=True)
         conn.execute(
@@ -132,7 +150,10 @@ def apply_report(db_path, report, sha256):
             (_REALIZED_LEDGER_READY_KEY, ready_value, now),
         )
         conn.commit()
-        return {"event_count": len(allocations), "unresolved": unresolved, "missing": missing}
+        return {
+            "event_count": len(allocations), "unresolved": unresolved,
+            "missing": missing, "integrity": integrity,
+        }
     except Exception:
         conn.rollback()
         raise

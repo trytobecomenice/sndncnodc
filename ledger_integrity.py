@@ -212,15 +212,21 @@ def audit_ledger(conn, realized_event_types):
     ).fetchone()[0]
     economic_mismatch = 0
     retained = conn.execute(
-        "SELECT a.event_id,a.pnl_usd,a.shares_closed,e.payload_json "
+        "SELECT a.event_id,a.pnl_usd,a.cost_basis_usd,a.shares_closed,e.payload_json "
         "FROM paper_trade_realized_allocation a JOIN bot_event_log e ON e.id=a.event_id"
         if "shares_closed" in _allocation_columns(conn) else
-        "SELECT a.event_id,a.pnl_usd,NULL shares_closed,e.payload_json "
+        "SELECT a.event_id,a.pnl_usd,a.cost_basis_usd,NULL shares_closed,e.payload_json "
         "FROM paper_trade_realized_allocation a JOIN bot_event_log e ON e.id=a.event_id"
     ).fetchall()
     for row in retained:
         payload = json.loads(row["payload_json"])
         if _micros(payload.get("pnl_usd")) != _micros(row["pnl_usd"]):
+            economic_mismatch += 1
+        payload_basis = payload.get("cost_basis_usd")
+        if (isinstance(payload_basis, bool)
+                or not isinstance(payload_basis, (int, float))
+                or row["cost_basis_usd"] is None
+                or _micros(payload_basis) != _micros(row["cost_basis_usd"])):
             economic_mismatch += 1
         if (row["shares_closed"] is not None
                 and _micros(payload.get("our_shares_closed")) != _micros(row["shares_closed"])):
@@ -244,16 +250,26 @@ def audit_ledger(conn, realized_event_types):
 
     # A -> L count and integer-micro PnL equality, per lot.
     lot_mismatches = []
+    paper_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_trade)").fetchall()}
+    has_cumulative_basis = "cumulative_realized_cost_basis_usd" in paper_columns
+    cumulative_basis_select = (
+        "p.cumulative_realized_cost_basis_usd" if has_cumulative_basis else "NULL"
+    )
     rows = conn.execute(
         "SELECT p.id,p.realized_event_count,p.cumulative_realized_pnl_usd,"
-        "COUNT(a.event_id) allocation_count,COALESCE(SUM(a.pnl_usd),0) allocation_pnl "
+        f"{cumulative_basis_select} cumulative_realized_cost_basis_usd,"
+        "COUNT(a.event_id) allocation_count,COALESCE(SUM(a.pnl_usd),0) allocation_pnl,"
+        "COALESCE(SUM(a.cost_basis_usd),0) allocation_cost_basis "
         "FROM paper_trade p LEFT JOIN paper_trade_realized_allocation a "
         "ON a.paper_trade_id=p.id AND a.allocation_status='matched' GROUP BY p.id"
     ).fetchall()
     for row in rows:
         if (int(row["realized_event_count"] or 0) != int(row["allocation_count"] or 0)
                 or _micros(row["cumulative_realized_pnl_usd"])
-                != _micros(row["allocation_pnl"])):
+                != _micros(row["allocation_pnl"])
+                or (has_cumulative_basis
+                    and _micros(row["cumulative_realized_cost_basis_usd"])
+                    != _micros(row["allocation_cost_basis"]))):
             lot_mismatches.append(row["id"])
     result["lot_ledger_mismatch_count"] = len(lot_mismatches)
     if lot_mismatches:
@@ -290,7 +306,6 @@ def audit_ledger(conn, realized_event_types):
     # authority; allocations carry every reduction and its post-event balance.
     columns = _allocation_columns(conn)
     quantity_unknown = quantity_mismatch = 0
-    paper_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_trade)").fetchall()}
     if (not {"shares_closed", "shares_remaining"}.issubset(columns)
             or not {"total_acquired_shares", "our_shares", "status"}.issubset(paper_columns)):
         quantity_unknown = 1

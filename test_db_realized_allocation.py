@@ -23,6 +23,7 @@ CREATE TABLE paper_trade (id TEXT PRIMARY KEY, strategy TEXT NOT NULL, wallet_ad
   avg_entry_price REAL NOT NULL DEFAULT 0, buy_count INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL, opened_at INTEGER, closed_at INTEGER, close_reason TEXT,
   realized_pnl_usd REAL, cumulative_realized_pnl_usd REAL NOT NULL DEFAULT 0,
+  cumulative_realized_cost_basis_usd REAL NOT NULL DEFAULT 0,
   realized_event_count INTEGER NOT NULL DEFAULT 0, peak_profit_pct REAL NOT NULL DEFAULT 0,
   last_priced_at INTEGER, is_demo_data INTEGER NOT NULL DEFAULT 0,
   is_phantom INTEGER NOT NULL DEFAULT 0);
@@ -76,7 +77,8 @@ class TestDurableRealizedAllocation(unittest.TestCase):
         db.append_log(self.sell_event(-0.5, 0.0))
         conn = sqlite3.connect(self.path)
         row = conn.execute(
-            "SELECT status,realized_pnl_usd,cumulative_realized_pnl_usd,realized_event_count "
+            "SELECT status,realized_pnl_usd,cumulative_realized_pnl_usd,"
+            "cumulative_realized_cost_basis_usd,realized_event_count "
             "FROM paper_trade WHERE id='lot'"
         ).fetchone()
         allocations = conn.execute(
@@ -84,7 +86,7 @@ class TestDurableRealizedAllocation(unittest.TestCase):
             "paper_trade_realized_allocation ORDER BY allocated_at,event_id"
         ).fetchall()
         conn.close()
-        self.assertEqual(row, ("closed", -0.5, 0.75, 2))
+        self.assertEqual(row, ("closed", -0.5, 0.75, 4.0, 2))
         self.assertEqual(len(allocations), 2)
         self.assertTrue(all(item[0] == "matched" and item[1] == "lot" for item in allocations))
 
@@ -120,16 +122,17 @@ class TestDurableRealizedAllocation(unittest.TestCase):
 
     def test_readiness_key_switches_wallet_and_shadow_decision_readers(self):
         conn = sqlite3.connect(self.path)
-        for trade_id, strategy, legacy, cumulative in (
-            ("real", "bot_filtered", -1.0, 4.0),
-            ("rehab", "shadow_rehab", -2.0, 3.0),
-            ("challenger", "shadow_challenger", -3.0, 2.0),
+        for trade_id, strategy, legacy, cumulative, cumulative_basis in (
+            ("real", "bot_filtered", -1.0, 4.0, 20.0),
+            ("rehab", "shadow_rehab", -2.0, 3.0, 15.0),
+            ("challenger", "shadow_challenger", -3.0, 2.0, 10.0),
         ):
             conn.execute(
                 "INSERT INTO paper_trade(id,strategy,wallet_address,market_slug,outcome,status,"
-                "cost_basis_usd,realized_pnl_usd,cumulative_realized_pnl_usd,is_phantom) "
-                "VALUES(?,?,?,'m','Yes','closed',10,?,?,0)",
-                (trade_id, strategy, "0xabc", legacy, cumulative),
+                "cost_basis_usd,realized_pnl_usd,cumulative_realized_pnl_usd,"
+                "cumulative_realized_cost_basis_usd,is_phantom) "
+                "VALUES(?,?,?,'m','Yes','closed',10,?,?,?,0)",
+                (trade_id, strategy, "0xabc", legacy, cumulative, cumulative_basis),
             )
         conn.commit()
         conn.close()
@@ -148,12 +151,15 @@ class TestDurableRealizedAllocation(unittest.TestCase):
         )
         conn.commit()
         conn.close()
-        self.assertAlmostEqual(db.get_wallet_realized_ev_stats()["0xabc"]["ev_pct"], 0.4)
-        self.assertEqual(db.get_shadow_rehab_returns("0xabc"), [0.3])
+        self.assertAlmostEqual(db.get_wallet_realized_ev_stats()["0xabc"]["ev_pct"], 0.2)
+        self.assertEqual(db.get_shadow_rehab_returns("0xabc"), [0.2])
         self.assertEqual(db.get_shadow_returns("0xabc", "shadow_challenger"), [0.2])
         status = db.get_realized_ledger_reader_status()
         self.assertTrue(status["ready"])
         self.assertEqual(status["reader_column"], "cumulative_realized_pnl_usd")
+        self.assertEqual(
+            status["reader_cost_basis_column"], "cumulative_realized_cost_basis_usd"
+        )
 
     def test_rejection_capture_is_raw_pointer_and_analysis_stays_blocked(self):
         db.append_log({"timestamp": "t", "event_type": "skip_risk_entry_interlock",

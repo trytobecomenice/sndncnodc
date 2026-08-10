@@ -17,6 +17,7 @@ class TestProtocolV2Preconditions(unittest.TestCase):
         CREATE TABLE paper_trade(id TEXT PRIMARY KEY,status TEXT,closed_at INTEGER,
           market_slug TEXT,outcome TEXT,cost_basis_usd REAL,
           cumulative_realized_pnl_usd REAL DEFAULT 0,realized_event_count INTEGER DEFAULT 0,
+          cumulative_realized_cost_basis_usd REAL DEFAULT 0,
           total_acquired_shares REAL,our_shares REAL);
         CREATE TABLE paper_trade_realized_allocation(
           event_id TEXT PRIMARY KEY,paper_trade_id TEXT,event_timestamp INTEGER,event_type TEXT,
@@ -68,13 +69,14 @@ class TestProtocolV2Preconditions(unittest.TestCase):
             )
         self.conn.execute(
             "INSERT INTO paper_trade(id,status,closed_at,market_slug,outcome,cost_basis_usd,"
-            "cumulative_realized_pnl_usd,realized_event_count,total_acquired_shares,our_shares) "
-            "VALUES('lot','closed',9500,'m','Yes',1,1,1,1,0)"
+            "cumulative_realized_pnl_usd,realized_event_count,"
+            "cumulative_realized_cost_basis_usd,total_acquired_shares,our_shares) "
+            "VALUES('lot','closed',9500,'m','Yes',1,1,1,1,1,0)"
         )
         self.conn.execute("INSERT INTO pnl_snapshot VALUES(10000,'portfolio',0,0)")
         self.conn.execute(
             "INSERT INTO bot_event_log VALUES('live',9500,'paper_sell',?)",
-            (json.dumps({"pnl_usd": 1, "our_shares_closed": 1,
+            (json.dumps({"pnl_usd": 1, "cost_basis_usd": 1, "our_shares_closed": 1,
                          "our_shares_remaining": 0}),),
         )
         self.conn.execute(
@@ -93,7 +95,7 @@ class TestProtocolV2Preconditions(unittest.TestCase):
     def test_historical_unknown_is_excluded_from_live_final_lot_rate(self):
         self.conn.execute(
             "INSERT INTO bot_event_log VALUES('historical',9400,'paper_sell',?)",
-            (json.dumps({"pnl_usd": 0, "our_shares_closed": 0,
+            (json.dumps({"pnl_usd": 0, "cost_basis_usd": 0, "our_shares_closed": 0,
                          "our_shares_remaining": 1}),),
         )
         self.conn.execute(
