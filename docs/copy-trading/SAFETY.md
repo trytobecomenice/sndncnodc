@@ -1059,6 +1059,20 @@ session, then calls `bullpen --read-only portfolio`. The authenticated read is r
 run under Bullpen's read-only interlock, write no DB state and cannot open/cancel an order. Canary
 health is operational evidence only and can never unlock selection or sizing.
 
+Temporary paper-only exception (expires `2026-08-23T00:00:00Z`): a missing AWS login returns
+`state=suppressed_paper_mode`, `execution_ready=false` and exit 0 so an intentionally dormant
+execution layer does not become a permanent ignored red light. The binary/status check still runs.
+The exception is impossible when `LIVE_MODE=True` and becomes a hard failure at the deadline. Any
+live-readiness review requires `bullpen login` on AWS plus a passing authenticated portfolio read.
+
+The 2026-08-16 forward-test preflight also caught Phase-0's service producing only disconnect rows:
+its 384 MB `RLIMIT_AS` ceiling constrained virtual address space (about 393 MB) even though real RSS
+was only about 78 MB, causing repeated SSL `MemoryError`. The production unit now passes
+`--memory-limit-mb 0` and relies on systemd's retained `MemoryMax=512M` hard resident-memory cgroup
+limit. Evidence health requires usable events in the recent journal tail, not merely a fresh mtime.
+The operational gates and stop rules are frozen in
+`PAPER_FORWARD_24H_CHECKLIST_2026-08-16.md`.
+
 ## 20. Per-wallet exposure cap (Rule 26 technical detail)
 
 **What it does:** technical companion to `docs/copy-trading/RISK_MANAGEMENT.md` Rule 26. **Built
