@@ -2546,7 +2546,8 @@ def enforce_realized_ledger_integrity(risk_state):
     if not current or not current.get("active"):
         interlock = {
             "active": True, "status": "interlocked", "reasons": reasons,
-            "triggered_at": now_iso(), "requires_manual_clear": True,
+            "triggered_at": now_iso(),
+            "recovery_mode": "automatic_healthy_window",
         }
         risk_state["entry_interlock"] = interlock
         set_risk_value("entry_interlock", interlock)
