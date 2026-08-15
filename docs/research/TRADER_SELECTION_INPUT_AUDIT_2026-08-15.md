@@ -76,8 +76,9 @@ testing against clean Ledger-v2 copyable net PnL.
   old or unknown-provenance Bullpen values remain visible for audit but return no decision signal.
 - Official raw category scoring marks only its category evidence ready; that does not implicitly
   bless a legacy global composite score.
-- Bullpen has a separate read-only daily `status` canary. It writes JSON logs only and cannot touch
-  the DB or submit/cancel an order.
+- Bullpen has a separate daily canary: passive `--read-only status` must report a logged-in session,
+  then authenticated `--read-only portfolio` exercises auth/backend reachability. It writes JSON logs
+  only and cannot touch the DB or submit/cancel an order.
 - Python and Go execution adapters consume one shared response-contract vector file.
 - Boundary tests fail if discovery/scoring imports Bullpen again or if the scorer's update set
   regains authority over roster columns.

@@ -1053,8 +1053,11 @@ tracker-feed function. Official category scoring may mint only
 `polymarket_official_raw_category`; the disabled legacy global scorer may write only
 `legacy_unverified` with readiness false.
 
-The daily Bullpen canary calls only `bullpen status`, writes no DB state and cannot open/cancel an
-order. Canary health is operational evidence only and can never unlock selection or sizing.
+The daily Bullpen canary first inspects passive `bullpen --read-only status`, requires an authenticated
+session, then calls `bullpen --read-only portfolio`. The authenticated read is required because
+`status` deliberately succeeds without contacting the backend, even when login is absent. Both calls
+run under Bullpen's read-only interlock, write no DB state and cannot open/cancel an order. Canary
+health is operational evidence only and can never unlock selection or sizing.
 
 ## 20. Per-wallet exposure cap (Rule 26 technical detail)
 

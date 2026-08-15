@@ -60,7 +60,10 @@ class TraderSelectionBoundaryTest(unittest.TestCase):
         source = (ROOT / "bullpen_execution_canary.py").read_text()
         self.assertNotIn("import db", source)
         self.assertNotIn('["polymarket",', source)
-        self.assertIn('["status"]', source)
+        self.assertIn('["--read-only", "status"]', source)
+        self.assertIn('["--read-only", "portfolio"]', source)
+        for mutating_command in ('"buy"', '"sell"', '"cancel"', '"closeout"'):
+            self.assertNotIn(mutating_command, source)
 
 
 if __name__ == "__main__":
