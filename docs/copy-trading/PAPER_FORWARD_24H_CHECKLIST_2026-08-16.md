@@ -48,6 +48,8 @@ The command prints one JSON object and exits non-zero on a stop condition.
      `delayed_book_observation`; a tail containing only `ws_disconnected` is not healthy evidence.
 5. Safety
    - Zero `live_*` events.
+   - No persisted `kill_switch` or active `entry_interlock`; a run blocked at the BUY gate is not
+     forward PnL evidence.
    - Bot continues writing evidence after the ten-minute startup grace.
    - Bullpen canary emits `state='suppressed_paper_mode'`, `execution_ready=false` until login; it
      must not claim healthy execution.
@@ -62,6 +64,7 @@ any of these occurs:
 - no new bot evidence after the ten-minute grace;
 - any `unprovenanced` size other than `$3`;
 - any `live_*` event while `LIVE_MODE=False`;
+- a latched portfolio kill switch or active/malformed entry interlock;
 - Phase-0 journal stale for more than 180 seconds, malformed, or its last 500 rows contain only
   disconnects;
 - SQLite integrity/locking errors, disk exhaustion, kill switch, panic protocol or duplicate-order

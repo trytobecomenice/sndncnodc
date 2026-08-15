@@ -71,6 +71,23 @@ def collect_health(db_path, phase0_path, since_epoch, now=None, grace_seconds=60
     if active_tracked < min_tracked:
         failures.append(f"active tracked roster {active_tracked} is below guard {min_tracked}")
 
+    risk_latches = {}
+    for key, value_json in conn.execute(
+        "SELECT key,value_json FROM bot_risk_state "
+        "WHERE key IN ('kill_switch','entry_interlock')"
+    ):
+        try:
+            value = json.loads(value_json)
+        except (TypeError, json.JSONDecodeError):
+            value = {"malformed": True}
+        risk_latches[key] = value
+    if risk_latches.get("kill_switch"):
+        failures.append("portfolio kill_switch is latched")
+    entry_interlock = risk_latches.get("entry_interlock")
+    if not isinstance(entry_interlock, dict) or entry_interlock.get("active") is not False:
+        if entry_interlock is not None:
+            failures.append("entry_interlock is active or malformed")
+
     event_count, latest_event = conn.execute(
         "SELECT count(*), max(timestamp) FROM bot_event_log WHERE timestamp >= ?",
         (since_epoch,),
@@ -130,6 +147,7 @@ def collect_health(db_path, phase0_path, since_epoch, now=None, grace_seconds=60
         "processes": {"bot": bot_pids, "phase0_recorder": recorder_pids},
         "active_tracked_wallets": active_tracked,
         "minimum_tracked_wallets": min_tracked,
+        "risk_latches": risk_latches,
         "bot_events_since_start": event_count,
         "latest_bot_event_epoch": latest_event,
         "sizing_tiers_since_start": dict(sizing_rows),
