@@ -4343,6 +4343,11 @@ evaluation against the existing HWM/floor, and only then an explicit reset if ne
 still holds. Entry interlock recovery remains hysteretic and automatic from healthy runtime
 samples; the persisted 2026-08-10 reason was ledger integrity, not a latency observation.
 
+The equity review preserves the distinction between price visibility and exitability. A stale
+book may contribute an indicative mark, but its bid is never counted in strict liquidation equity.
+Non-executable quotes are classified (`stale_book`, `fresh_no_bid`, or an explicit error), and a
+stale-quote total is emitted for diagnosis only. It is not a reset credential.
+
 The first 24 hours after restart qualify process stability, recorder coverage, sizing provenance
 and risk-gate behavior only. They do not establish strategy alpha; that needs weeks of delayed,
 executable, net-PnL evidence.

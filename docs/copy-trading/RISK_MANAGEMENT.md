@@ -4579,3 +4579,9 @@ Ledger-v4 separates three things that must not be collapsed into one number:
 The manual kill-switch reset is status-only by default. `--clear` requires the exact unchanged
 trigger timestamp, a ledger `PASS`, a fresh timestamped equity recomputation and zero current
 floor/drawdown triggers. A reset never supplies evidence that the trigger was false.
+
+The reset review reports executable liquidation separately from ordinary risk marks. Every open
+position is classified as `live_executable`, `stale_book`, `fresh_no_bid`, `price_error`, or
+`diagnostic_error`. Only a fresh positive best bid contributes to strict liquidation equity. A
+stale best bid is recorded in a separate diagnostic equity total solely to attribute a shortfall;
+it cannot authorize a reset or masquerade as executable proceeds.
