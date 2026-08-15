@@ -3,7 +3,12 @@
 // Mocks global fetch — no real network calls.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchWalletTrades } from "./polymarketDataApi";
+import {
+  fetchOfficialLeaderboard,
+  fetchOfficialLeaderboardPage,
+  OFFICIAL_LEADERBOARD_CATEGORIES,
+  fetchWalletTrades,
+} from "./polymarketDataApi";
 
 function jsonResponse(status: number, body: unknown): Response {
   return {
@@ -115,5 +120,47 @@ describe("fetchWalletTrades", () => {
     await vi.advanceTimersByTimeAsync(1000 + 2000 + 4000 + 8000 + 1000);
     await expectation;
     vi.useRealTimers();
+  });
+});
+
+describe("official leaderboard", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("freezes the documented category universe", () => {
+    expect(OFFICIAL_LEADERBOARD_CATEGORIES).toEqual([
+      "OVERALL", "POLITICS", "SPORTS", "CRYPTO", "CULTURE", "MENTIONS",
+      "WEATHER", "ECONOMICS", "TECH", "FINANCE",
+    ]);
+  });
+
+  it("uses the real timePeriod parameter and exact category", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, []));
+    await fetchOfficialLeaderboardPage({ category: "POLITICS", timePeriod: "MONTH", orderBy: "PNL" });
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("category=POLITICS");
+    expect(url).toContain("timePeriod=MONTH");
+    expect(url).not.toContain("window=");
+  });
+
+  it("paginates beyond the 50-row page instead of treating it as a total cap", async () => {
+    const full = Array.from({ length: 50 }, (_, rank) => ({ rank }));
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, full)).mockResolvedValueOnce(jsonResponse(200, [{ rank: 51 }]));
+    const rows = await fetchOfficialLeaderboard({
+      category: "OVERALL", timePeriod: "MONTH", orderBy: "PNL", maxRows: 100,
+    });
+    expect(rows).toHaveLength(51);
+    expect(fetchMock.mock.calls[1][0]).toContain("offset=50");
+  });
+
+  it("rejects page sizes above the official maximum", async () => {
+    await expect(fetchOfficialLeaderboardPage({
+      category: "OVERALL", timePeriod: "MONTH", orderBy: "PNL", limit: 51,
+    })).rejects.toThrow(/\[1, 50\]/);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

@@ -4,10 +4,39 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestSharedExecutionContractVectors(t *testing.T) {
+	type vector struct {
+		Name         string         `json:"name"`
+		Response     map[string]any `json:"response"`
+		Filled       bool           `json:"filled"`
+		FillPrice    *float64       `json:"fill_price"`
+		FilledShares *float64       `json:"filled_shares"`
+		OrderID      *string        `json:"order_id"`
+		OrderStatus  *string        `json:"order_status"`
+	}
+	raw, err := os.ReadFile("../../testdata/bullpen_execution_contract_vectors.json")
+	if err != nil { t.Fatal(err) }
+	var vectors []vector
+	if err := json.Unmarshal(raw, &vectors); err != nil { t.Fatal(err) }
+	for _, v := range vectors {
+		t.Run(v.Name, func(t *testing.T) {
+			_, fillErr := RequireFilled(v.Response, v.Name)
+			if (fillErr == nil) != v.Filled { t.Fatalf("filled=%v err=%v, want %v", fillErr == nil, fillErr, v.Filled) }
+			assertFloatPtrEqual(t, ExtractFillPrice(v.Response), v.FillPrice)
+			assertFloatPtrEqual(t, ExtractFilledShares(v.Response), v.FilledShares)
+			wantID := ""; if v.OrderID != nil { wantID = *v.OrderID }
+			if got := ExtractOrderID(v.Response); got != wantID { t.Fatalf("order id=%q want %q", got, wantID) }
+			wantStatus := ""; if v.OrderStatus != nil { wantStatus = *v.OrderStatus }
+			if got := ExtractOrderStatus(v.Response); got != wantStatus { t.Fatalf("status=%q want %q", got, wantStatus) }
+		})
+	}
+}
 
 // fakeExec builds an execFunc that returns a canned result on every call,
 // or (if calls is non-empty) a different result per call in sequence --

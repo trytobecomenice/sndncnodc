@@ -157,14 +157,11 @@
 //              them even by accident.
 
 import { and, eq, gte, inArray, sql } from "drizzle-orm";
-import { runBullpenJson } from "@copybot/bullpen-client";
 import { botEventLog, botRiskState, db, leaderboardScan, ruleSet, walletProfile } from "@copybot/db";
 import { mapWithConcurrency } from "@copybot/shared";
 import { fetchOnePage } from "./polymarketDataApi";
 import { queueApprovalRequest } from "./walletApprovalQueue";
 
-const READ_RETRIES = 3;
-const READ_RETRY_DELAY_MS = 500;
 const PASS1_CONCURRENCY = 5; // how many wallets' cheap calls run at once
 const PASS2_CONCURRENCY = 5; // how many wallets' expensive calls run at once
 const RECENT_TRADES_SAMPLE_SIZE = 50; // matches propose_pool_refill.py's POOL_REFILL_ACTIVITY_SAMPLE_SIZE
@@ -657,16 +654,8 @@ interface ActivityBoundsData {
  * OUTPUT: the WalletStatsData object, or null if the call failed
  */
 async function fetchWalletStatsSummary(address: string): Promise<WalletStatsData | null> {
-  try {
-    const response = await runBullpenJson(["polymarket", "wallet-stats", address, "--section", "summary"], {
-      retries: READ_RETRIES,
-      retryDelayMs: READ_RETRY_DELAY_MS,
-    });
-    return response?.wallet_stats?.data ?? null;
-  } catch (err) {
-    console.warn(`  wallet-stats summary failed for ${address}: ${(err as Error).message}`);
-    return null;
-  }
+  console.warn(`  ${address}: legacy Bullpen summary scorer is disabled; no official equivalent is ready`);
+  return null;
 }
 
 /**
@@ -675,16 +664,8 @@ async function fetchWalletStatsSummary(address: string): Promise<WalletStatsData
  * OUTPUT: the TradeFlowData object, or null if the call failed
  */
 async function fetchTradeFlow(address: string): Promise<TradeFlowData | null> {
-  try {
-    const response = await runBullpenJson(["polymarket", "wallet-stats", address, "--section", "flow"], {
-      retries: READ_RETRIES,
-      retryDelayMs: READ_RETRY_DELAY_MS,
-    });
-    return response?.trade_flow?.data ?? null;
-  } catch (err) {
-    console.warn(`  wallet-stats flow failed for ${address}: ${(err as Error).message}`);
-    return null;
-  }
+  void address;
+  return null;
 }
 
 /**
@@ -694,16 +675,8 @@ async function fetchTradeFlow(address: string): Promise<TradeFlowData | null> {
  * OUTPUT: the BehaviorStatsData object, or null if the call failed
  */
 async function fetchBehaviorStats(address: string): Promise<BehaviorStatsData | null> {
-  try {
-    const response = await runBullpenJson(["polymarket", "wallet-stats", address, "--section", "behavior"], {
-      retries: READ_RETRIES,
-      retryDelayMs: READ_RETRY_DELAY_MS,
-    });
-    return response?.behavior_stats?.data ?? null;
-  } catch (err) {
-    console.warn(`  wallet-stats behavior failed for ${address}: ${(err as Error).message}`);
-    return null;
-  }
+  void address;
+  return null;
 }
 
 /**
@@ -713,16 +686,8 @@ async function fetchBehaviorStats(address: string): Promise<BehaviorStatsData | 
  * OUTPUT: the ActivityBoundsData object, or null if the call failed
  */
 async function fetchActivityBounds(address: string): Promise<ActivityBoundsData | null> {
-  try {
-    const response = await runBullpenJson(["polymarket", "wallet-stats", address, "--section", "activity"], {
-      retries: READ_RETRIES,
-      retryDelayMs: READ_RETRY_DELAY_MS,
-    });
-    return response?.activity_bounds?.data ?? null;
-  } catch (err) {
-    console.warn(`  wallet-stats activity failed for ${address}: ${(err as Error).message}`);
-    return null;
-  }
+  void address;
+  return null;
 }
 
 /**
@@ -824,16 +789,8 @@ export function computeLiquidityFarmingSignal(
  * OUTPUT: an array of {p, t} points (empty array if the call failed)
  */
 async function fetchPnlSeries(address: string): Promise<Array<{ p: number; t: number }>> {
-  try {
-    const response = await runBullpenJson(["polymarket", "pnl-series", "--address", address], {
-      retries: READ_RETRIES,
-      retryDelayMs: READ_RETRY_DELAY_MS,
-    });
-    return response?.pnl_series ?? [];
-  } catch (err) {
-    console.warn(`  pnl-series failed for ${address}: ${(err as Error).message}`);
-    return [];
-  }
+  void address;
+  return [];
 }
 
 // =============================================================================
@@ -1188,7 +1145,7 @@ export function decideStatus(
   compositeScore: number,
   tradesCount: number,
   rules: ScoringRules
-): { status: string; reason: string } {
+): { status: "track" | "watch" | "ignore"; reason: string } {
   if (tradesCount < rules.hardMinTrades) {
     return {
       status: "ignore",
@@ -1215,17 +1172,18 @@ export function decideStatus(
 
 /**
  * Telegram approval workflow (2026-08-01): decides whether a wallet's raw
- * decideStatus() 'track' verdict should be redirected into the Telegram
- * approval queue instead of written to wallet_profile.status directly. Only
- * a NEW promotion is redirected — a wallet that was ALREADY 'track' before
- * this run reconfirms automatically (priorStatus === 'track' is the one
- * false case for a 'track' decidedStatus). Extracted as its own pure
+ * recommendation should be redirected into the Telegram approval queue.
+ * Promotions AND demotions of an existing approved tier require approval;
+ * a brand-new non-track research candidate simply starts inert at watch.
+ * Extracted as its own pure
  * function purely for direct unit-testability, same "extract the pure
  * decision" pattern as decideStatus/checkToxicFlowGate/
  * computeDemotedAddresses above.
  */
 export function shouldRedirectToApprovalQueue(decidedStatus: string, priorStatus: string | null): boolean {
-  return decidedStatus === "track" && priorStatus !== "track";
+  if (priorStatus === decidedStatus) return false;
+  if (decidedStatus === "track") return true;
+  return priorStatus === "track" || priorStatus === "bench";
 }
 
 // =============================================================================
@@ -1279,16 +1237,21 @@ interface UpsertArgs {
  */
 async function upsertWalletProfile(args: UpsertArgs): Promise<void> {
   const now = new Date();
-  const tier = deriveTier(args.walletAddress, args.status, args.trackedAddresses);
+  const tier = deriveTier(args.walletAddress, "watch", args.trackedAddresses);
   const nextRescoreDueAt = computeNextRescoreDueAt(tier, args.rules, now);
 
   const scoredValues = {
     // Normalized again here, defensively, right at the write boundary — see
     // the normalizeAddress comment near the top of this file for why.
     walletAddress: normalizeAddress(args.walletAddress),
-    status: args.status,
-    statusReason: args.statusReason,
-    statusChangedAt: now,
+    recommendedStatus: args.status,
+    recommendationReason: args.statusReason,
+    recommendationSource: "legacy_scorer_disabled",
+    recommendationVersion: "disabled-v1",
+    recommendationAt: now,
+    derivedMetricsSource: "legacy_unverified",
+    derivedMetricsVersion: "disabled-v1",
+    derivedMetricsReady: false,
     volume30d: args.tradeFlow?.volume_30d ?? null,
     pnl7d: args.walletStats.pnl_7d,
     pnl30d: args.walletStats.pnl_30d,
@@ -1315,6 +1278,11 @@ async function upsertWalletProfile(args: UpsertArgs): Promise<void> {
     .insert(walletProfile)
     .values({
       ...scoredValues,
+      // New research candidates start inert. Only an approved resolver may
+      // move this field away from watch.
+      status: "watch",
+      statusReason: "research candidate; no roster approval",
+      statusChangedAt: now,
       // On a brand-new wallet we've never seen before, use whatever
       // display name we found (may be null — that's fine).
       nickname: args.displayName,
@@ -2030,8 +1998,8 @@ async function finalizeAndWrite(results: Pass2Result[], rules: ScoringRules, tra
       // instead of going dark).
       const { queued } = await queueApprovalRequest({
         walletAddress: r.address,
-        requestedTier: "track",
-        source: "global_pool",
+        requestedTier: decidedStatus,
+        source: decidedStatus === "track" ? "global_pool" : "global_pool_demotion",
         category: null,
         scoreSnapshot: {
           compositeScore: r.compositeScore,
@@ -2040,10 +2008,10 @@ async function finalizeAndWrite(results: Pass2Result[], rules: ScoringRules, tra
         },
         reason: decidedReason,
       });
-      finalStatus = isBenchPreserved ? "bench" : "watch";
-      const queuedNote = isBenchPreserved
-        ? "pending Telegram approval to promote from bench to track (stays 'bench' meanwhile)"
-        : "pending Telegram approval — queued for real-money tracking, not auto-promoted";
+      finalStatus = priorStatus ?? "watch";
+      const queuedNote = decidedStatus === "track"
+        ? `pending Telegram approval to promote (stays '${finalStatus}' meanwhile)`
+        : `pending Telegram approval to demote to ${decidedStatus} (stays '${finalStatus}' meanwhile)`;
       finalReason = queued
         ? `${decidedReason}; ${queuedNote}`
         : `${decidedReason}; already has a pending/recently-rejected Telegram approval request, not re-queued`;
@@ -2093,7 +2061,9 @@ async function finalizeAndWrite(results: Pass2Result[], rules: ScoringRules, tra
 // =============================================================================
 
 async function main() {
-  console.log("scan:wallets starting — scoring candidate wallets from leaderboard_scan (rolling-window mode)...");
+  console.log("scan:wallets safety stop — legacy Bullpen-derived global scorer is disabled.");
+  console.log("Official raw category scoring remains available via score:wallet-categories; no roster or sizing fields were changed.");
+  return;
 
   const rules = await getActiveRuleSet();
   console.log(

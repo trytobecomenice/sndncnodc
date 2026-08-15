@@ -46,7 +46,6 @@ from logging.handlers import RotatingFileHandler
 
 import config
 from bullpen_client import (
-    BullpenAuthError,
     BullpenTimeoutError,
     extract_fill_price,
     extract_filled_shares,
@@ -351,8 +350,10 @@ def compute_trade_size_usd(wallet_score_entry, market_price, category=None):
          compute_shrunk_win_rate() at all — appropriate, since relying on
          a much deeper sample is the right call when there's no category-
          specific evidence, not a bug.
-    Neither tier available (no win_rate anywhere) -> unchanged
-    config.BASE_TRADE_USD, exactly the original no-evidence behavior. (A
+    Neither tier available (no allow-listed win_rate anywhere) ->
+    config.UNPROVENANCED_TRADE_USD, deliberately equal to MIN_TRADE_USD.
+    Missing provenance is uncertainty, never permission to size a weak or
+    unknown wallet above the minimum. (A
     STRONGER statistical bar — should_skip_category() above — decides
     whether to skip the copy entirely before this function is even called;
     by the time this runs, that decision has already been made, and is
@@ -391,7 +392,7 @@ def compute_trade_size_usd(wallet_score_entry, market_price, category=None):
     unit-testable without a DB call.
     """
     if wallet_score_entry is None:
-        return config.BASE_TRADE_USD
+        return config.UNPROVENANCED_TRADE_USD
 
     win_rate = None
     trade_count = None
@@ -405,7 +406,7 @@ def compute_trade_size_usd(wallet_score_entry, market_price, category=None):
         trade_count = wallet_score_entry.get("composite_trade_count") or 0
 
     if win_rate is None:
-        return config.BASE_TRADE_USD
+        return config.UNPROVENANCED_TRADE_USD
 
     shrunk_win_rate = compute_shrunk_win_rate(win_rate, trade_count, market_price)
     kelly_fraction = compute_kelly_fraction(shrunk_win_rate, market_price)
@@ -3696,7 +3697,7 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
             snapshot_win_rate = composite_win_rate
             snapshot_trade_count = (wallet_score_entry.get("composite_trade_count") or 0) if wallet_score_entry else 0
         else:
-            sizing_tier = "base"
+            sizing_tier = "unprovenanced"
             snapshot_win_rate = None
             snapshot_trade_count = None
         shrunk_win_rate = None
@@ -3713,8 +3714,8 @@ def process_trade(trade, positions, source_positions, source_cost_basis, trader_
 
         # Non-positive Kelly edge (2026-07-28) — compute_trade_size_usd()
         # returns exactly 0.0 when the model itself sees zero/negative edge
-        # (never for sizing_tier="base", where trade_usd is always the
-        # positive BASE_TRADE_USD constant). A softer signal than
+        # (never for sizing_tier="unprovenanced", where trade_usd is the
+        # positive but minimum UNPROVENANCED_TRADE_USD constant). A softer signal than
         # should_skip_category() above (that one requires STATISTICALLY
         # SIGNIFICANT harm; this fires on any negative point estimate) —
         # see compute_trade_size_usd()'s own docstring for why flooring at
@@ -3965,107 +3966,6 @@ def fetch_direct_feed(executor, wallet_addresses, known_trade_ids=None):
         append_log({"timestamp": now_iso(), "event_type": "error",
                     "error": f"direct feed fetch failed for wallet {err['wallet_address']}: {err['error']}"})
     return {"trades": result["trades"]}
-
-
-# Consecutive auth-recheck failures while halted, used ONLY to throttle
-# repeated log lines (added 2026-07-21, same pattern as
-# _closeout_fetch_failures above). The first halt is always logged loudly;
-# if `bullpen login` isn't run for a while, a reminder (with the running
-# duration) logs every 30th recheck (~1 hour at AUTH_RECHECK_INTERVAL_SECONDS)
-# rather than spamming one row every 120s for however long the session stays
-# dead.
-_auth_halt_rechecks = 0
-
-
-def fetch_feed_with_auth_recovery():
-    """NOT CALLED BY THE MAIN LOOP AS OF THE 2026-07-22 CUTOVER — tracking now
-    uses fetch_direct_feed() above, which has no bullpen/auth dependency at
-    all. Left in place, still tested (test_bullpen_client.py): the halt-and-
-    recover pattern this implements remains valid and could still matter for
-    OTHER bullpen call sites in this file (execution, shortfall previews,
-    closeout sweeps) that still depend on a live bullpen session.
-
-    Wraps the tracker-feed fetch with auth-failure detection and a slow,
-    patient recovery loop — replaces the previous behavior where an expired
-    bullpen session was silently retried every POLL_INTERVAL_SECONDS (30s)
-    for as long as it stayed broken, which is exactly what produced 264
-    identical error rows over ~2 hours during the 2026-07-18 incident this
-    was built in response to.
-
-    On a BullpenAuthError: logs ONE clear "auth_halted" event, persists
-    bot_risk_state["auth_halt"] (mirrors the kill_switch pattern — visible
-    to any future status/dashboard check, not just this process's own log),
-    then waits at the much slower AUTH_RECHECK_INTERVAL_SECONDS cadence,
-    re-attempting only this same feed call as the recovery probe, until
-    either it succeeds (session restored — logs "auth_recovered", clears
-    the flag, returns the fresh feed) or shutdown is requested (returns
-    None — caller must treat that as "no work to do this cycle").
-
-    Deliberately does NOT attempt any non-interactive self-repair (e.g.
-    `bullpen fix --refresh`): live-checked against bullpen's own diagnostics
-    while a session was genuinely dead, and the CLI itself reported
-    `resolution_owner: "user"` / `next_action: "bullpen login"` — a real
-    login is the only thing that fixes this, so the bot's job is to notice
-    fast, stop wasting cycles, and resume the instant a human has fixed it.
-    """
-    global _auth_halt_rechecks
-    try:
-        return run_bullpen_json(
-            ["tracker", "feed", "--limit", str(config.FEED_LIMIT)],
-            retries=config.FEED_FETCH_RETRIES,
-            retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS,
-            timeout=config.FEED_POLL_TIMEOUT_SECONDS,
-        )
-    except BullpenAuthError as e:
-        halted_at = now_iso()
-        append_log({"timestamp": halted_at, "event_type": "auth_halted",
-                    "error": str(e)})
-        logger.error(f"BOT HALTED — bullpen session appears dead ({e}). "
-                     f"Run `bullpen login` to resume; rechecking every "
-                     f"{config.AUTH_RECHECK_INTERVAL_SECONDS}s in the meantime.")
-        set_risk_value("auth_halt", {"triggered_at": halted_at, "error": str(e)})
-        _auth_halt_rechecks = 0
-
-        while not SHUTDOWN_REQUESTED:
-            deadline = time.time() + config.AUTH_RECHECK_INTERVAL_SECONDS
-            while not SHUTDOWN_REQUESTED and time.time() < deadline:
-                time.sleep(1)
-            if SHUTDOWN_REQUESTED:
-                return None
-
-            try:
-                feed = run_bullpen_json(
-                    ["tracker", "feed", "--limit", str(config.FEED_LIMIT)],
-                    retries=config.FEED_FETCH_RETRIES,
-                    retry_delay=config.FEED_FETCH_RETRY_DELAY_SECONDS,
-                    timeout=config.FEED_POLL_TIMEOUT_SECONDS,
-                )
-            except BullpenAuthError as recheck_error:
-                _auth_halt_rechecks += 1
-                if _auth_halt_rechecks % 30 == 0:
-                    minutes = _auth_halt_rechecks * config.AUTH_RECHECK_INTERVAL_SECONDS // 60
-                    append_log({"timestamp": now_iso(), "event_type": "auth_halted",
-                                "consecutive_rechecks": _auth_halt_rechecks,
-                                "error": f"still halted after ~{minutes}min "
-                                         f"(repeats throttled): {recheck_error}"})
-                continue
-            except Exception as other_error:
-                # Not an auth failure — log and keep waiting at the slow
-                # cadence rather than falling back to hammering every 30s.
-                append_log({"timestamp": now_iso(), "event_type": "error",
-                            "error": f"auth recheck hit a non-auth error, "
-                                     f"still halted: {other_error}"})
-                continue
-
-            recovered_at = now_iso()
-            append_log({"timestamp": recovered_at, "event_type": "auth_recovered",
-                        "halted_at": halted_at,
-                        "consecutive_rechecks": _auth_halt_rechecks})
-            logger.info(f"Bullpen session restored — resuming normal polling.")
-            clear_risk_value("auth_halt")
-            _auth_halt_rechecks = 0
-            return feed
-        return None
 
 
 _UNKNOWN_WALLET_KEY = "__unknown__"

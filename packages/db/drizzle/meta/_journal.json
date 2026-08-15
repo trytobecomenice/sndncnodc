@@ -211,6 +211,20 @@
       "when": 1786389725589,
       "tag": "0029_fearless_roxanne_simpson",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1786392209436,
+      "tag": "0030_redundant_nebula",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1786799172967,
+      "tag": "0031_giant_wallflower",
+      "breakpoints": true
     }
   ]
 }

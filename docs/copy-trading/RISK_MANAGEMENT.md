@@ -3927,7 +3927,7 @@ get_wallet_composite_scores()`, extended to select the new column) and
 scales `MIN_TRADE_USD`/`MAX_TRADE_USD` by it before the existing clamped
 Kelly fraction gets mapped in — the Kelly math itself is byte-for-byte
 unchanged. Missing/`None` behaves identically to `1.0`. Deliberately does
-NOT scale `config.BASE_TRADE_USD` (the no-evidence fallback) — a
+NOT scale `config.UNPROVENANCED_TRADE_USD` (the provenance-gated minimum fallback) — a
 multiplier rewards proven edge; it must never inflate the default used
 when there's no win-rate evidence at all.
 
@@ -4103,8 +4103,9 @@ limit-order path — a new `skip_non_positive_kelly_edge` event, distinct
 from `should_skip_category`'s `skip_poor_category_performance` (that one
 fires on statistical significance; this one fires on any negative point
 estimate, a softer and more frequent trigger by design). `sizing_tier =
-"base"` (no win-rate evidence at all) is unaffected — that path returns
-`config.BASE_TRADE_USD` before Kelly is ever computed, unchanged.
+"unprovenanced"` (no allow-listed win-rate evidence at all) does not enter
+Kelly — that path returns `config.UNPROVENANCED_TRADE_USD`
+(`MIN_TRADE_USD`, $3) before Kelly is computed.
 
 **A real, intentional consequence, stated plainly**: this makes the bot
 strictly more selective, not more aggressive — some wallet/category
@@ -4473,6 +4474,39 @@ larger pending quant-control rollout. Commit `328a22d` passed 42 focused tests l
 the normal-workspace full suite passed 676 tests. The first live post-restart sweep refreshed all
 53/53 open marks; the second did the same 5m24s later. There were zero post-start errors across
 both sweeps.
+
+## 53. Rule 25/26 provenance fail-closed correction (2026-08-15)
+
+This section supersedes every earlier Rule 25 statement that says missing score/win-rate evidence
+falls back to `BASE_TRADE_USD`. Trader-derived sizing inputs are now usable only when
+`wallet_profile.derived_metrics_ready=1` and their source is explicitly allow-listed by the Python
+reader. Official raw category evidence remains eligible for category Half-Kelly; the retired
+Bullpen global scorer and all legacy/unversioned global values are not.
+
+When neither an allow-listed category nor global `(win_rate, trade_count)` pair exists,
+`compute_trade_size_usd()` returns `UNPROVENANCED_TRADE_USD`, defined as
+`MIN_TRADE_USD` ($3), and records `sizing_tier="unprovenanced"`. It must not return the historical
+`BASE_TRADE_USD` ($5): missing provenance is uncertainty, and uncertainty cannot increase a weak
+wallet's allocation. `capital_multiplier` is also unavailable unless the official-global gate is
+ready, so Rule 25's composite tier and rule-set-v7 multiplier remain intentionally dormant until an
+auditable global scorer is built.
+
+This is material, not theoretical. A read-only production measurement before the change found
+1,039 recorded decisions with a sizing tier: 995 `base` (95.77%) and 44
+`limit_order_frozen_at_signal_time`; all 1,039 carried a $5 recorded size, with no category or
+composite-tier decisions in that evidence window. Therefore the provenance cutover would otherwise
+have routed almost the entire measured surface to $5. The corrected rollout sends the corresponding
+unprovenanced path to $3.
+
+Rule 26's per-wallet exposure ceiling is unchanged. The interaction changes conservatively: an
+unprovenanced BUY now consumes $3 rather than $5 of the same wallet cap. Proven positive Kelly can
+still size above the minimum only through an allow-listed evidence tier; non-positive Kelly still
+returns zero and skips the trade.
+
+Bullpen is not a selection-data provider. Candidate discovery and category scoring use official
+Polymarket data; `propose_pool_refill.py` is provenance-gated and uses official `/activity`; the old
+uncalled `bullpen tracker feed` recovery function was removed. Bullpen remains only in signed
+execution paths plus a read-only, decision-isolated health canary.
 
 ## What is intentionally still simple
 

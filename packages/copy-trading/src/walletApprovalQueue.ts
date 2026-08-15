@@ -36,8 +36,8 @@ export interface ScoreSnapshot {
 
 export interface QueueApprovalRequestArgs {
   walletAddress: string;
-  requestedTier: "track" | "bench";
-  source: "global_pool" | "category_quota";
+  requestedTier: "track" | "bench" | "watch" | "ignore";
+  source: "global_pool" | "global_pool_demotion" | "category_quota";
   category: string | null;
   scoreSnapshot: ScoreSnapshot;
   reason: string;

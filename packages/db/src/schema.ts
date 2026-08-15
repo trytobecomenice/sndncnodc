@@ -53,12 +53,25 @@ export const walletProfile = sqliteTable(
     id: id(),
     walletAddress: text("wallet_address").notNull().unique(),
     nickname: text("nickname"),
-    // track | challenger | retiring | watch | ignore. Scorers write watch/
-    // ignore recommendations; the Python challenger/Telegram workflow owns
-    // challenger -> track -> retiring lifecycle transitions.
+    // Approved roster state only. Research scorers NEVER update these three
+    // columns; changes flow through wallet_approval_request and its human
+    // resolver (or the explicit challenger lifecycle).
     status: text("status").notNull().default("watch"),
     statusReason: text("status_reason"),
     statusChangedAt: integer("status_changed_at", { mode: "timestamp" }),
+    // Research recommendation is deliberately separate from approved state.
+    recommendedStatus: text("recommended_status"),
+    recommendationReason: text("recommendation_reason"),
+    recommendationSource: text("recommendation_source"),
+    recommendationVersion: text("recommendation_version"),
+    recommendationAt: integer("recommendation_at", { mode: "timestamp" }),
+    // Fail-closed provenance gate for every derived metric below. Legacy
+    // Bullpen values remain auditable but cannot size trades unless a scorer
+    // rewrites them from an allow-listed official source/version and marks
+    // the set ready only after validation.
+    derivedMetricsSource: text("derived_metrics_source"),
+    derivedMetricsVersion: text("derived_metrics_version"),
+    derivedMetricsReady: integer("derived_metrics_ready", { mode: "boolean" }).notNull().default(false),
     // Owned exclusively by bot.py's existing circuit-breaker logic. Deliberately
     // a separate field from `status` so the two writers never fight over one
     // column — bot.py's trading gate checks circuitBreakerMuted OR status != 'track'.
@@ -138,10 +151,11 @@ export const walletApprovalRequest = sqliteTable(
   {
     id: id(),
     walletAddress: text("wallet_address").notNull(),
-    // 'track' | 'bench' — the status this request would flip wallet_profile
-    // to on approval.
+    // Any approved roster transition, including safety demotions. A scorer
+    // proposes; only the resolver commits this tier to wallet_profile.
     requestedTier: text("requested_tier").notNull(),
-    // 'global_pool' | 'category_quota' | 'challenger_shadow' — which
+    // 'global_pool' | 'global_pool_demotion' | 'category_quota' |
+    // 'challenger_shadow' — which
     // pipeline proposed this candidate, for audit/debugging.
     source: text("source").notNull(),
     // Null for global_pool candidates (that system isn't category-scoped).
@@ -311,6 +325,10 @@ export const paperTradeRealizedAllocation = sqliteTable(
     eventId: text("event_id").primaryKey(),
     paperTradeId: text("paper_trade_id"),
     eventTimestamp: integer("event_timestamp", { mode: "timestamp" }).notNull(),
+    // Durable causal tie-breaker for multiple events in the same second.
+    // Historical backfill copies bot_event_log.rowid; live writes use the
+    // INSERT cursor's lastrowid. Random UUID event IDs are not an ordering.
+    eventSequence: integer("event_sequence").notNull().default(0),
     eventType: text("event_type").notNull(),
     strategy: text("strategy").notNull(),
     pnlUsd: real("pnl_usd").notNull(),
@@ -484,6 +502,11 @@ export const botEventLog = sqliteTable(
   "bot_event_log",
   {
     id: id(),
+    // Durable causal order.  This is real evidence, not SQLite's implicit
+    // rowid: rowid may be reassigned by a table rebuild or dump/reload.
+    // db.py allocates this from bot_event_sequence_counter in the same write
+    // transaction as the event insert.
+    eventSequence: integer("event_sequence").notNull().default(0),
     timestamp: integer("timestamp", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
     eventType: text("event_type").notNull(),
     traderAddress: text("trader_address"),
@@ -503,8 +526,21 @@ export const botEventLog = sqliteTable(
   // skips, kill-switch churn, etc.) -- every other significant table in this
   // schema already has an index on its own hot lookup column; this one simply
   // never got one.
-  (t) => [index("bot_event_log_timestamp_idx").on(t.timestamp)]
+  (t) => [
+    index("bot_event_log_timestamp_idx").on(t.timestamp),
+    uniqueIndex("bot_event_log_event_sequence_unique_idx").on(t.eventSequence),
+  ]
 );
+
+// One-row transactional allocator for bot_event_log.event_sequence.  A
+// MAX()+1 calculation in application code is race-prone, while an implicit
+// rowid is not stable evidence.  UPDATE of this singleton obtains SQLite's
+// write lock before the value is read, so independent writer connections
+// cannot allocate the same sequence.
+export const botEventSequenceCounter = sqliteTable("bot_event_sequence_counter", {
+  singleton: integer("singleton").primaryKey(),
+  nextValue: integer("next_value").notNull(),
+});
 
 export const botSeenTrade = sqliteTable("bot_seen_trade", {
   tradeId: text("trade_id").primaryKey(),

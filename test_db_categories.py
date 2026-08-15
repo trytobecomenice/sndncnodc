@@ -33,7 +33,8 @@ class _TempDbTestCase(unittest.TestCase):
         conn.execute(
             "CREATE TABLE wallet_profile (id TEXT PRIMARY KEY, wallet_address TEXT NOT NULL, "
             "composite_score REAL, win_rate REAL, trade_count_all_time INTEGER, "
-            "capital_multiplier REAL, category_scores_json TEXT)"
+            "capital_multiplier REAL, category_scores_json TEXT, derived_metrics_source TEXT, "
+            "derived_metrics_version TEXT, derived_metrics_ready INTEGER NOT NULL DEFAULT 0)"
         )
         conn.commit()
         conn.close()
@@ -135,8 +136,10 @@ class TestGetWalletCompositeScoresWithCategories(_TempDbTestCase):
         conn = self._raw_conn()
         conn.execute(
             "INSERT INTO wallet_profile (id, wallet_address, composite_score, win_rate, "
-            "trade_count_all_time, category_scores_json) VALUES (?, ?, ?, ?, ?, ?)",
-            (address, address, composite_score, win_rate, trade_count_all_time, category_scores_json),
+            "trade_count_all_time, category_scores_json, derived_metrics_source, "
+            "derived_metrics_version, derived_metrics_ready) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (address, address, composite_score, win_rate, trade_count_all_time, category_scores_json,
+             "polymarket_official_raw_global", "global-score-v1", 1),
         )
         conn.commit()
         conn.close()
@@ -202,6 +205,29 @@ class TestGetWalletCompositeScoresWithCategories(_TempDbTestCase):
         self._insert_wallet("0xDDDeeeFFF", 0.3)
         result = db.get_wallet_composite_scores()
         self.assertIn("0xdddeeefff", result)
+
+    def test_legacy_unprovenanced_metrics_fail_closed(self):
+        self._insert_wallet("0xLEGACY", 0.99)
+        conn = self._raw_conn()
+        conn.execute("UPDATE wallet_profile SET derived_metrics_ready=0 WHERE wallet_address='0xLEGACY'")
+        conn.commit()
+        conn.close()
+        result = db.get_wallet_composite_scores()["0xlegacy"]
+        self.assertIsNone(result["composite"])
+        self.assertEqual(result["categories"], {})
+
+    def test_unknown_version_cannot_unlock_official_source(self):
+        self._insert_wallet("0xWRONGVERSION", 0.99)
+        conn = self._raw_conn()
+        conn.execute(
+            "UPDATE wallet_profile SET derived_metrics_version='future-unreviewed' "
+            "WHERE wallet_address='0xWRONGVERSION'"
+        )
+        conn.commit()
+        conn.close()
+        result = db.get_wallet_composite_scores()["0xwrongversion"]
+        self.assertIsNone(result["composite"])
+        self.assertEqual(result["categories"], {})
 
 
 if __name__ == "__main__":

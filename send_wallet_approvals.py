@@ -38,8 +38,11 @@ def format_candidate_message(request):
     """
     snapshot = json.loads(request["score_snapshot_json"] or "{}")
     label = request["nickname"] or request["wallet_address"]
+    is_demotion = request.get("source") == "global_pool_demotion"
     lines = [
-        f"🆕 New {request['requested_tier']} candidate ({request['source'].replace('_', ' ')})",
+        (f"⚠️ Roster change: propose {request['requested_tier']} "
+         if is_demotion else f"🆕 New {request['requested_tier']} candidate ")
+        + f"({request['source'].replace('_', ' ')})",
         f"{label}",
         f"{request['wallet_address']}",
     ]

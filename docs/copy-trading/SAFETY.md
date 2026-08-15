@@ -1033,6 +1033,29 @@ evidence to prefer instead.
 
 ---
 
+### 19.1 Provenance cutover addendum (2026-08-15)
+
+The earlier no-evidence `$5 BASE_TRADE_USD` fallback is retired. Both a missing profile and a
+profile whose derived inputs fail source/version/readiness validation return
+`UNPROVENANCED_TRADE_USD == MIN_TRADE_USD == $3`, with the journal tier labelled
+`unprovenanced`. This prevents a fail-closed data gate from accidentally increasing a weak
+wallet's size from the old $3 Kelly floor to $5.
+
+Production evidence measured before this correction: 995/1,039 tier-labelled decisions (95.77%)
+were `base`; the other 44 were frozen limit-order sizes, and every recorded size was $5. This
+measurement is why the fallback was corrected before deployment rather than treated as a cosmetic
+rename.
+
+Structural guards now cover all decision-bearing TypeScript modules (discovery, global/category
+scoring, specialist discovery and approval queue), the Python refill proposer, every scorer upsert
+block, the allow-listed writers of `derived_metrics_source`, and the absence of the legacy Bullpen
+tracker-feed function. Official category scoring may mint only
+`polymarket_official_raw_category`; the disabled legacy global scorer may write only
+`legacy_unverified` with readiness false.
+
+The daily Bullpen canary calls only `bullpen status`, writes no DB state and cannot open/cancel an
+order. Canary health is operational evidence only and can never unlock selection or sizing.
+
 ## 20. Per-wallet exposure cap (Rule 26 technical detail)
 
 **What it does:** technical companion to `docs/copy-trading/RISK_MANAGEMENT.md` Rule 26. **Built
@@ -4236,7 +4259,8 @@ waiting for the next cron tick.
 **Daily scan cron** (EC2, `crontab -e`, `Etc/UTC` confirmed live via `timedatectl` — `20:00 UTC = 04:00
 HKT`):
 ```
-0 20 * * * cd /home/ubuntu/polymarket-copybot && /usr/bin/pnpm run scan:leaderboard && /usr/bin/pnpm run scan:wallets && /usr/bin/pnpm --filter @copybot/copy-trading discover:category-specialists -- --queue-approvals && /usr/bin/python3 send_wallet_approvals.py >> daily_scan.cron.log 2>&1
+0 20 * * * cd /home/ubuntu/polymarket-copybot && /usr/bin/pnpm run research:wallets-daily >> daily_scan.cron.log 2>&1
+15 20 * * * cd /home/ubuntu/polymarket-copybot && /usr/bin/pnpm run canary:bullpen-execution >> bullpen_canary.cron.log 2>&1
 ```
 Chosen off-peak given this box's tight 1.9GB/0-swap margin (the same constraint behind Sec.54's Docker
 incident) — the first several real runs should be watched manually (`tail daily_scan.cron.log`, `free -h`

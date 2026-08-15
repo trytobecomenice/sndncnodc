@@ -309,14 +309,17 @@ class TestComputeTradeSizeUsd(unittest.TestCase):
     def setUp(self):
         self._saved = (
             config.BASE_TRADE_USD, config.MIN_TRADE_USD, config.MAX_TRADE_USD,
+            config.UNPROVENANCED_TRADE_USD,
             config.KELLY_SHRINKAGE_PSEUDO_COUNT, config.KELLY_FRACTION_MULTIPLIER,
         )
         config.BASE_TRADE_USD, config.MIN_TRADE_USD, config.MAX_TRADE_USD = 5.0, 3.0, 10.0
+        config.UNPROVENANCED_TRADE_USD = config.MIN_TRADE_USD
         config.KELLY_SHRINKAGE_PSEUDO_COUNT = 25
         config.KELLY_FRACTION_MULTIPLIER = 0.5
 
     def tearDown(self):
         (config.BASE_TRADE_USD, config.MIN_TRADE_USD, config.MAX_TRADE_USD,
+         config.UNPROVENANCED_TRADE_USD,
          config.KELLY_SHRINKAGE_PSEUDO_COUNT, config.KELLY_FRACTION_MULTIPLIER) = self._saved
 
     @staticmethod
@@ -338,11 +341,11 @@ class TestComputeTradeSizeUsd(unittest.TestCase):
             "categories": wrapped,
         }
 
-    def test_no_wallet_row_at_all_gets_the_base_amount(self):
-        self.assertEqual(bot.compute_trade_size_usd(None, 0.5), 5.0)
+    def test_no_wallet_row_at_all_gets_the_unprovenanced_minimum(self):
+        self.assertEqual(bot.compute_trade_size_usd(None, 0.5), 3.0)
 
-    def test_unscored_wallet_gets_the_base_amount(self):
-        self.assertEqual(bot.compute_trade_size_usd(self._entry(), 0.5), 5.0)
+    def test_unscored_wallet_gets_the_unprovenanced_minimum(self):
+        self.assertEqual(bot.compute_trade_size_usd(self._entry(), 0.5), 3.0)
 
     def test_zero_track_record_composite_gets_skipped_not_a_guess(self):
         # composite_trade_count=0 -> shrunk win rate == price exactly ->
@@ -421,9 +424,9 @@ class TestComputeTradeSizeUsd(unittest.TestCase):
         trade_usd = bot.compute_trade_size_usd(entry, 0.5, category="politics")
         self.assertGreater(trade_usd, 3.0)
 
-    def test_neither_composite_nor_category_gets_base_amount(self):
+    def test_neither_composite_nor_category_gets_unprovenanced_minimum(self):
         entry = self._entry(composite=None, categories={})
-        self.assertEqual(bot.compute_trade_size_usd(entry, 0.5, category="crypto"), 5.0)
+        self.assertEqual(bot.compute_trade_size_usd(entry, 0.5, category="crypto"), 3.0)
 
     def test_missing_capital_multiplier_behaves_identically_to_1_0(self):
         # No capital_multiplier key at all (e.g. a wallet scored before v7)
@@ -444,13 +447,13 @@ class TestComputeTradeSizeUsd(unittest.TestCase):
         self.assertGreater(trade_usd, 6.0)
         self.assertLessEqual(trade_usd, 20.0)
 
-    def test_capital_multiplier_never_inflates_the_no_evidence_base_amount(self):
+    def test_capital_multiplier_never_inflates_the_unprovenanced_minimum(self):
         # A capital_multiplier present on an otherwise-unscored entry must
         # NOT inflate config.BASE_TRADE_USD -- the multiplier rewards
         # proven edge, it must never apply when there's no win-rate
         # evidence to size against at all.
         entry = self._entry(capital_multiplier=2.0)  # no win_rate anywhere
-        self.assertEqual(bot.compute_trade_size_usd(entry, 0.5), 5.0)
+        self.assertEqual(bot.compute_trade_size_usd(entry, 0.5), 3.0)
 
     def test_capital_multiplier_does_not_rescue_a_non_positive_kelly_edge(self):
         # A capital multiplier rewards proven edge; it must never turn a
@@ -1168,7 +1171,7 @@ class TestProcessTradeScoreSnapshot(unittest.TestCase):
 
         buy_calls = [c for c in mock_log.call_args_list if c.args[0].get("event_type") == "paper_buy"]
         breakdown = buy_calls[0].args[0]["score_breakdown"]
-        self.assertEqual(breakdown["sizing_tier"], "base")
+        self.assertEqual(breakdown["sizing_tier"], "unprovenanced")
         self.assertIsNone(breakdown["composite_score"])
         self.assertIsNone(breakdown["shrunk_win_rate"])
         self.assertIsNone(breakdown["kelly_fraction"])

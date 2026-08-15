@@ -22,6 +22,8 @@
     "update:rules": "pnpm --filter @copybot/copy-trading update:rules",
     "report:daily": "pnpm --filter @copybot/copy-trading report:daily",
     "reconcile:position-tracker": "pnpm --filter @copybot/copy-trading reconcile:position-tracker",
+    "research:wallets-daily": "bash scripts/run_daily_wallet_research.sh",
+    "canary:bullpen-execution": "python3 bullpen_execution_canary.py",
     "test": "pnpm -r test"
   }
 }

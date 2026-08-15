@@ -9,7 +9,7 @@ import unittest
 from research.wallet_archetype_evidence import build_profiles
 
 
-def _record(event_id, wallet, market, side, size, timestamp_ms, **extra):
+def _record(event_id, wallet, market, side, size, timestamp_ms, *, shares=None, **extra):
     record = {
         "event_type": "wallet_signal",
         "signal_event_id": event_id,
@@ -26,6 +26,8 @@ def _record(event_id, wallet, market, side, size, timestamp_ms, **extra):
             "size_usd": size,
         },
     }
+    if shares is not None:
+        record["raw_signal_payload"] = {"size": shares, "usdcSize": size}
     record.update(extra)
     return record
 
@@ -67,6 +69,22 @@ class TestWalletArchetypeEvidence(unittest.TestCase):
         evidence = artifact["profiles"][0]["timing_evidence"]
         self.assertEqual(evidence["cross_market_burst_signal_count"], 2)
         self.assertEqual(evidence["cross_market_interpretation"], "multi_leg_candidate_not_arbitrage_proof")
+
+    def test_large_share_fill_is_proxy_not_farmer_classification(self):
+        artifact = self._build([
+            _record("small", "0xA", "market-a", "BUY", 10, 1_000, shares=20),
+            _record("large", "0xA", "market-b", "BUY", 50, 2_000, shares=5_000),
+            _record("unknown", "0xA", "market-c", "SELL", 5, 3_000),
+        ])
+        evidence = artifact["profiles"][0]["share_size_evidence"]
+        self.assertEqual(evidence["known_share_count"], 2)
+        self.assertEqual(evidence["unknown_share_count"], 1)
+        self.assertEqual(evidence["large_fill_count"], 1)
+        self.assertEqual(evidence["large_fill_ratio_of_known"], 0.5)
+        self.assertEqual(
+            evidence["interpretation"],
+            "large_fill_proxy_only_not_liquidity_reward_or_maker_proof",
+        )
 
     def test_pnl_fields_cannot_change_profile(self):
         base = _record("a", "0xA", "market-a", "BUY", 10, 1_000)

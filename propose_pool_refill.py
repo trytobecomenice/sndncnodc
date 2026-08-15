@@ -28,7 +28,7 @@ profit comes from liquidity rewards, market-making rebates, or
 micro-arbitrage that copy-lag and taker fees make structurally
 unreplicable. `is_likely_bot` conflates "automated" with "unreplicable
 edge" and can be wrong in both directions. So this version pulls real
-`bullpen polymarket activity` for every candidate and reports concrete,
+Polymarket's official `/activity` feed for every candidate and reports concrete,
 checkable signals (price extremity, side bias, repeated same-market/
 same-price quotes) alongside the raw bot flag -- verified live on the
 first 4 candidates: both gloriafoster and Asperatus showed the exact
@@ -47,47 +47,22 @@ from collections import Counter
 from db import (
     get_risk_value, get_pool_refill_candidates, get_ever_tracked_wallets, get_muted_wallets,
 )
-from bullpen_client import run_bullpen_json
+from polymarket_data_api import fetch_wallet_trades
 import config
 
 
-def check_is_likely_bot(wallet_address):
-    """Returns True/False from a live `bullpen polymarket wallet-stats`
-    call, or None if the call fails or the field isn't present. One input
-    signal among several now, not a gate -- see the module docstring for
-    why this alone isn't disqualifying.
-    """
-    try:
-        # run_bullpen_json() already appends --output json itself --
-        # passing it again here causes "can only be provided once" (a
-        # real bug caught on this script's first live run).
-        response = run_bullpen_json(["polymarket", "wallet-stats", wallet_address], retries=2)
-    except Exception:
-        return None
-    behavior = response.get("behavior_stats") or {}
-    if behavior.get("status") != "ok":
-        return None
-    data = behavior.get("data") or {}
-    is_bot = data.get("is_likely_bot")
-    return is_bot if isinstance(is_bot, bool) else None
-
-
 def fetch_recent_trades(wallet_address, limit=None):
-    """Recent real TRADE activity for `wallet_address` via `bullpen
-    polymarket activity`, or None if the call fails. A quick-look sample
+    """Recent real TRADE activity from Polymarket's official Data API, or
+    None if the call fails. A quick-look sample
     (config.POOL_REFILL_ACTIVITY_SAMPLE_SIZE), not a full history --
     enough to see a repeated-quote pattern if one exists.
     """
     limit = limit or config.POOL_REFILL_ACTIVITY_SAMPLE_SIZE
     try:
-        response = run_bullpen_json(
-            ["polymarket", "activity", "--address", wallet_address, "--limit", str(limit)],
-            retries=2,
-        )
+        activities = fetch_wallet_trades(wallet_address, limit=limit, max_pages=1)
     except Exception:
         return None
-    activities = response.get("activities") or []
-    return [a for a in activities if a.get("type") == "TRADE"]
+    return activities
 
 
 def summarize_liquidity_farming_signal(trades):
@@ -151,7 +126,7 @@ def main():
         return
 
     print(f"\nActive pool is {gap} below target. Gathering evidence per candidate "
-          f"(a wallet-stats + activity call each, this takes a moment)...\n")
+          f"(official activity evidence only; provenance-gated candidates)...\n")
 
     ever_tracked = get_ever_tracked_wallets()
     # Exclude currently-tracked (any casing) AND every wallet ever tracked
@@ -178,15 +153,11 @@ def main():
         print(f"  composite_score={c['composite_score']:.3f}  win_rate={win_rate}  "
               f"trades_all_time={trades_all_time}  category={category}")
 
-        is_bot = check_is_likely_bot(c["wallet_address"])
-        is_bot_str = {True: "true", False: "false", None: "UNVERIFIED (call failed)"}[is_bot]
-        print(f"  is_likely_bot (bullpen): {is_bot_str}  [one signal, not a verdict -- see below]")
-
         recent_trades = fetch_recent_trades(c["wallet_address"])
         signal = summarize_liquidity_farming_signal(recent_trades)
         if signal is None:
             print("  activity sample: UNAVAILABLE (call failed or no trade history) -- "
-                  "check manually with `bullpen polymarket activity --address <addr>`")
+                  "do not promote without independently verified official evidence")
         else:
             warning = ""
             if signal["extreme_price_pct"] and signal["extreme_price_pct"] >= 50:

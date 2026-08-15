@@ -22,7 +22,8 @@ from pathlib import Path
 import statistics
 
 
-PROFILE_VERSION = "wallet-archetype-evidence-v1"
+PROFILE_VERSION = "wallet-archetype-evidence-v2"
+DEFAULT_LARGE_FILL_SHARES = 5_000
 
 
 def _number(value):
@@ -100,6 +101,7 @@ def _load_signals(paths):
             continue
         seen.add(identity)
         signal = record.get("signal") or {}
+        raw_signal = record.get("raw_signal_payload") or {}
         wallet = str(signal.get("user_address") or "").lower()
         side = str(signal.get("side") or "").upper()
         if not wallet or side not in {"BUY", "SELL"}:
@@ -111,6 +113,10 @@ def _load_signals(paths):
             "outcome": str(signal.get("outcome") or ""),
             "side": side,
             "size_usd": _number(signal.get("size_usd")),
+            # The Polymarket activity payload calls token quantity `size` and
+            # USDC notional `usdcSize`.  Prefer the recorded quantity instead
+            # of reconstructing it from rounded price/notional fields.
+            "source_shares": _number(raw_signal.get("size")),
             "source_price": _number(signal.get("price")),
             "source_reported_timestamp_ms": _integer(
                 record.get("source_reported_timestamp_ms")
@@ -155,7 +161,9 @@ def _cross_market_burst_participation(signals, window_ms):
     return participating
 
 
-def build_profiles(journal_paths, *, cross_market_window_ms=1_000):
+def build_profiles(
+        journal_paths, *, cross_market_window_ms=1_000,
+        large_fill_shares=DEFAULT_LARGE_FILL_SHARES):
     """Return JSON-safe evidence without reading or deriving wallet PnL."""
     signals, audit = _load_signals(journal_paths)
     burst_ids = _cross_market_burst_participation(signals, int(cross_market_window_ms))
@@ -168,6 +176,14 @@ def build_profiles(journal_paths, *, cross_market_window_ms=1_000):
         buys = [item for item in items if item["side"] == "BUY"]
         sells = [item for item in items if item["side"] == "SELL"]
         known_size = [item for item in items if item["size_usd"] is not None]
+        known_shares = [
+            item["source_shares"] for item in items
+            if item["source_shares"] is not None
+        ]
+        large_fills = [
+            shares for shares in known_shares
+            if shares >= float(large_fill_shares)
+        ]
         buy_notional = sum(item["size_usd"] for item in buys if item["size_usd"] is not None)
         sell_notional = sum(item["size_usd"] for item in sells if item["size_usd"] is not None)
         total_notional = buy_notional + sell_notional
@@ -201,6 +217,23 @@ def build_profiles(journal_paths, *, cross_market_window_ms=1_000):
                 "two_way_market_outcome_count": two_way,
                 "two_way_market_outcome_ratio": (
                     two_way / len(by_contract) if by_contract else None
+                ),
+            },
+            "share_size_evidence": {
+                "known_share_count": len(known_shares),
+                "unknown_share_count": len(items) - len(known_shares),
+                "large_fill_threshold_shares": float(large_fill_shares),
+                "large_fill_count": len(large_fills),
+                "large_fill_ratio_of_known": (
+                    len(large_fills) / len(known_shares) if known_shares else None
+                ),
+                "median_shares": (
+                    statistics.median(known_shares) if known_shares else None
+                ),
+                "p90_shares": _quantile(known_shares, 0.90),
+                "max_shares": max(known_shares) if known_shares else None,
+                "interpretation": (
+                    "large_fill_proxy_only_not_liquidity_reward_or_maker_proof"
                 ),
             },
             "timing_evidence": {
@@ -247,7 +280,10 @@ def build_profiles(journal_paths, *, cross_market_window_ms=1_000):
         "writes_bot_database": False,
         "changes_roster_or_risk": False,
         "inputs": [str(Path(item)) for item in journal_paths],
-        "parameters": {"cross_market_window_ms": int(cross_market_window_ms)},
+        "parameters": {
+            "cross_market_window_ms": int(cross_market_window_ms),
+            "large_fill_shares": float(large_fill_shares),
+        },
         "audit": {**audit, "unique_valid_signals": len(signals), "wallet_count": len(profiles)},
         "profiles": profiles,
     }
@@ -256,11 +292,17 @@ def build_profiles(journal_paths, *, cross_market_window_ms=1_000):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("journals", nargs="+", type=Path)
-    parser.add_argument("--output", type=Path, default=Path("trader_profile_v1.json"))
+    parser.add_argument("--output", type=Path, default=Path("trader_profile_v2.json"))
     parser.add_argument("--cross-market-window-ms", type=int, default=1_000)
+    parser.add_argument(
+        "--large-fill-shares", type=float, default=DEFAULT_LARGE_FILL_SHARES,
+        help="Observation-only large-fill threshold; not a farmer classifier",
+    )
     args = parser.parse_args()
     artifact = build_profiles(
-        args.journals, cross_market_window_ms=args.cross_market_window_ms
+        args.journals,
+        cross_market_window_ms=args.cross_market_window_ms,
+        large_fill_shares=args.large_fill_shares,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

@@ -43,7 +43,9 @@ class _TempDbTestCase(unittest.TestCase):
             "nickname TEXT, status TEXT NOT NULL DEFAULT 'watch', circuit_breaker_muted INTEGER "
             "NOT NULL DEFAULT 0, mute_reason TEXT, muted_at INTEGER, consecutive_losses INTEGER "
             "NOT NULL DEFAULT 0, recent_results_json TEXT, composite_score REAL, win_rate REAL, "
-            "trade_count_all_time INTEGER, category TEXT, created_at INTEGER, updated_at INTEGER)"
+            "trade_count_all_time INTEGER, category TEXT, derived_metrics_source TEXT, "
+            "derived_metrics_version TEXT, derived_metrics_ready INTEGER NOT NULL DEFAULT 0, "
+            "created_at INTEGER, updated_at INTEGER)"
         )
         conn.execute(
             "CREATE TABLE bot_event_log (id TEXT PRIMARY KEY, timestamp INTEGER, event_type TEXT, "
@@ -87,9 +89,11 @@ class _TempDbTestCase(unittest.TestCase):
         conn = sqlite3.connect(self.tmp_path)
         conn.execute(
             "INSERT INTO wallet_profile (id, wallet_address, composite_score, win_rate, "
-            "trade_count_all_time, category, circuit_breaker_muted) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "trade_count_all_time, category, circuit_breaker_muted, derived_metrics_source, "
+            "derived_metrics_version, derived_metrics_ready) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (f"wp-{wallet_address}", wallet_address, composite_score, win_rate,
-             trade_count_all_time, category, circuit_breaker_muted),
+             trade_count_all_time, category, circuit_breaker_muted,
+             "polymarket_official_raw_global", "global-score-v1", 1),
         )
         conn.commit()
         conn.close()

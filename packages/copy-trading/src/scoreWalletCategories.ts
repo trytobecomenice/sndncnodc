@@ -410,7 +410,12 @@ async function main() {
       // error, just a no-op UPDATE) until this normalization was added.
       await db
         .update(walletProfile)
-        .set({ categoryScoresJson: JSON.stringify(categoryScores) })
+        .set({
+          categoryScoresJson: JSON.stringify(categoryScores),
+          derivedMetricsSource: "polymarket_official_raw_category",
+          derivedMetricsVersion: "category-score-v1",
+          derivedMetricsReady: true,
+        })
         .where(eq(walletProfile.walletAddress, walletAddress.toLowerCase()));
       console.log(`  ${walletAddress}: ${JSON.stringify(categoryScores)}`);
     } catch (err) {

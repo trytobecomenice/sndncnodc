@@ -181,13 +181,15 @@ TRACKED_TRADERS = {
 #      bankroll-fraction Kelly would need to know total capital and would
 #      reshape how this interacts with the portfolio risk manager's own
 #      exposure ceiling (Rule 6) — a bigger, separate change, not made here.
-#   No track record at all (wallet never scored) -> BASE_TRADE_USD, unchanged
-#   from the original flat behavior.
+#   No allow-listed track record at all -> UNPROVENANCED_TRADE_USD. This is
+#   deliberately the minimum, not the historical flat/base amount: missing
+#   evidence must never increase a weak wallet's size.
 # Selling is proportional regardless: if the trader sells N% of their
 # (observed) position, we sell N% of ours.
 BASE_TRADE_USD = 5.0
 MIN_TRADE_USD = 3.0
 MAX_TRADE_USD = 10.0
+UNPROVENANCED_TRADE_USD = MIN_TRADE_USD
 
 # k in the shrinkage formula p_shrunk = (n*win_rate + k*price) / (n + k) — see
 # compute_shrunk_win_rate()'s docstring. Solved, not guessed: at n=200 (the

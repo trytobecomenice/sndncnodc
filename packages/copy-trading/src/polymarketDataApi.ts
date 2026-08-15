@@ -38,6 +38,93 @@ const REQUEST_HEADERS = {
   Accept: "application/json",
 };
 
+// Polymarket's documented leaderboard enum. Keep this frozen and tested:
+// guessing category strings silently falls back to OVERALL on the API.
+export const OFFICIAL_LEADERBOARD_CATEGORIES = [
+  "OVERALL",
+  "POLITICS",
+  "SPORTS",
+  "CRYPTO",
+  "CULTURE",
+  "MENTIONS",
+  "WEATHER",
+  "ECONOMICS",
+  "TECH",
+  "FINANCE",
+] as const;
+export type OfficialLeaderboardCategory = (typeof OFFICIAL_LEADERBOARD_CATEGORIES)[number];
+export type OfficialLeaderboardTimePeriod = "DAY" | "WEEK" | "MONTH" | "ALL";
+export type OfficialLeaderboardOrderBy = "PNL" | "VOL";
+
+export interface OfficialLeaderboardRow {
+  rank: number;
+  proxyWallet: string;
+  userName?: string | null;
+  vol: number;
+  pnl: number;
+  verifiedBadge?: boolean;
+  [key: string]: unknown;
+}
+
+export interface OfficialLeaderboardQuery {
+  category: OfficialLeaderboardCategory;
+  timePeriod: OfficialLeaderboardTimePeriod;
+  orderBy: OfficialLeaderboardOrderBy;
+  limit?: number;
+  offset?: number;
+}
+
+/** Fetch one official leaderboard page. The API maximum is 50 rows/page. */
+export async function fetchOfficialLeaderboardPage(
+  query: OfficialLeaderboardQuery
+): Promise<OfficialLeaderboardRow[]> {
+  const limit = query.limit ?? 50;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+    throw new Error(`official leaderboard limit must be an integer in [1, 50], got ${limit}`);
+  }
+  const offset = query.offset ?? 0;
+  const params = new URLSearchParams({
+    category: query.category,
+    timePeriod: query.timePeriod,
+    orderBy: query.orderBy,
+    limit: String(limit),
+    offset: String(offset),
+  });
+  const url = `${DATA_API_HOST}/v1/leaderboard?${params.toString()}`;
+
+  let attempt = 0;
+  while (true) {
+    const response = await fetch(url, { headers: REQUEST_HEADERS });
+    if (response.status === 200) return (await response.json()) as OfficialLeaderboardRow[];
+    if (RETRYABLE_STATUS.has(response.status) && attempt < MAX_RETRIES) {
+      await sleep(BACKOFF_BASE_MS * 2 ** attempt);
+      attempt += 1;
+      continue;
+    }
+    const body = await response.text();
+    throw new Error(`leaderboard HTTP ${response.status} after ${attempt} backoff retr(y/ies): ${body.slice(0, 200)}`);
+  }
+}
+
+/**
+ * Fetch a bounded, explicitly paginated leaderboard lens. Unlike the old
+ * Bullpen discovery call this does not mistake the 50-row page size for a
+ * total-universe cap.
+ */
+export async function fetchOfficialLeaderboard(
+  query: OfficialLeaderboardQuery & { maxRows?: number }
+): Promise<OfficialLeaderboardRow[]> {
+  const pageSize = query.limit ?? 50;
+  const maxRows = query.maxRows ?? 200;
+  const rows: OfficialLeaderboardRow[] = [];
+  for (let offset = query.offset ?? 0; rows.length < maxRows && offset <= 950; offset += pageSize) {
+    const page = await fetchOfficialLeaderboardPage({ ...query, limit: pageSize, offset });
+    rows.push(...page.slice(0, maxRows - rows.length));
+    if (page.length < pageSize) break;
+  }
+  return rows;
+}
+
 // Field names exactly as Polymarket's /activity endpoint returns them — see
 // polymarket_data_api.py's normalize_activity_record() for the same mapping,
 // confirmed live there against a real side-by-side bullpen call.

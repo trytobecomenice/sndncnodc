@@ -19,9 +19,10 @@ save_state()'s decision_journal_id/linked_paper_trade_id handling below.
 Ownership boundary (see docs/copy-trading/SAFETY.md): this module writes
 wallet_profile.circuit_breaker_muted/mute_reason/muted_at/consecutive_losses/
 recent_results_json (bot.py's own circuit-breaker fields) but NEVER
-wallet_profile.status — that column belongs to the TS leaderboard-scan/
-scoring layer (packages/copy-trading). Mixing writers on one column is how
-the two systems would silently fight each other.
+wallet_profile.status outside the explicit approval/challenger lifecycle.
+Research scorers write recommendation columns only; mixing research and
+approved-roster writers on one column is how the systems would silently
+fight each other.
 """
 
 import json
@@ -37,6 +38,11 @@ from prometheus_client import Counter
 
 import config
 import telegram_alerts
+
+OFFICIAL_GLOBAL_METRICS_SOURCE = "polymarket_official_raw_global"
+OFFICIAL_GLOBAL_METRICS_VERSION = "global-score-v1"
+OFFICIAL_CATEGORY_METRICS_SOURCE = "polymarket_official_raw_category"
+OFFICIAL_CATEGORY_METRICS_VERSION = "category-score-v1"
 
 # Phase 1 observability (2026-07-31) — one counter, labeled by event_type,
 # covers every event this codebase logs (paper_buy/paper_sell/every skip_*
@@ -1482,7 +1488,7 @@ def get_wallet_composite_scores():
     "pnl_t_stat": t_stat_or_None, "win_rate": win_rate_or_None,
     "trade_count": trade_count_or_None}}}} for every row in wallet_profile —
     used for half-Kelly position sizing (config.py's KELLY_*/MIN/MAX/
-    BASE_TRADE_USD, bot.compute_trade_size_usd()) AND the hard-skip decision
+    UNPROVENANCED_TRADE_USD, bot.compute_trade_size_usd()) AND the hard-skip decision
     (config.CATEGORY_SKIP_Z_CRITICAL, bot.should_skip_category()).
 
     "categories" (added 2026-07-22 for category-specific scoring, extended
@@ -1528,9 +1534,18 @@ def get_wallet_composite_scores():
     """
     conn = _connect()
     try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(wallet_profile)").fetchall()}
+        provenance_available = {
+            "derived_metrics_source", "derived_metrics_version", "derived_metrics_ready"
+        }.issubset(columns)
+        if not provenance_available:
+            # A pre-migration database must never make legacy unprovenanced
+            # scores available to live sizing. Empty is the safest fallback.
+            return {}
         cur = conn.execute(
             "SELECT wallet_address, composite_score, win_rate, trade_count_all_time, "
-            "capital_multiplier, category_scores_json FROM wallet_profile"
+            "capital_multiplier, category_scores_json, derived_metrics_source, "
+            "derived_metrics_version, derived_metrics_ready FROM wallet_profile"
         )
         rows = cur.fetchall()
     finally:
@@ -1538,8 +1553,19 @@ def get_wallet_composite_scores():
 
     result = {}
     for row in rows:
+        source = row["derived_metrics_source"]
+        version = row["derived_metrics_version"]
+        ready = row["derived_metrics_ready"] == 1
+        global_ready = (
+            ready and source == OFFICIAL_GLOBAL_METRICS_SOURCE
+            and version == OFFICIAL_GLOBAL_METRICS_VERSION
+        )
+        category_ready = global_ready or (
+            ready and source == OFFICIAL_CATEGORY_METRICS_SOURCE
+            and version == OFFICIAL_CATEGORY_METRICS_VERSION
+        )
         categories = {}
-        raw = row["category_scores_json"]
+        raw = row["category_scores_json"] if category_ready else None
         if raw:
             try:
                 parsed = json.loads(raw)
@@ -1555,10 +1581,10 @@ def get_wallet_composite_scores():
             except (json.JSONDecodeError, AttributeError):
                 categories = {}
         result[row["wallet_address"].lower()] = {
-            "composite": row["composite_score"],
-            "composite_win_rate": row["win_rate"],
-            "composite_trade_count": row["trade_count_all_time"],
-            "capital_multiplier": row["capital_multiplier"],
+            "composite": row["composite_score"] if global_ready else None,
+            "composite_win_rate": row["win_rate"] if global_ready else None,
+            "composite_trade_count": row["trade_count_all_time"] if global_ready else None,
+            "capital_multiplier": row["capital_multiplier"] if global_ready else None,
             "categories": categories,
         }
     return result
@@ -1662,12 +1688,22 @@ def get_pool_refill_candidates(exclude_addresses_lower, min_composite_score, lim
     """
     conn = _connect()
     try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(wallet_profile)").fetchall()}
+        if not {"derived_metrics_source", "derived_metrics_ready"}.issubset(columns):
+            # Pre-migration/legacy DB: fail closed instead of proposing from
+            # unprovenanced scores or crashing the daily approval job.
+            return []
         query = (
             "SELECT wallet_address, nickname, composite_score, win_rate, "
             "trade_count_all_time, category FROM wallet_profile "
-            "WHERE composite_score >= ? AND status = 'watch' ORDER BY composite_score DESC"
+            "WHERE composite_score >= ? AND status = 'watch' "
+            "AND derived_metrics_ready = 1 "
+            "AND derived_metrics_source = ? AND derived_metrics_version = ? "
+            "ORDER BY composite_score DESC"
         )
-        rows = conn.execute(query, (min_composite_score,)).fetchall()
+        rows = conn.execute(query, (
+            min_composite_score, OFFICIAL_GLOBAL_METRICS_SOURCE, OFFICIAL_GLOBAL_METRICS_VERSION,
+        )).fetchall()
     finally:
         conn.close()
 

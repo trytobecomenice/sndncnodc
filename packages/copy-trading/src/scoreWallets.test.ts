@@ -595,9 +595,15 @@ describe("shouldRedirectToApprovalQueue", () => {
     expect(shouldRedirectToApprovalQueue("track", "track")).toBe(false);
   });
 
-  it("does not redirect a 'watch' or 'ignore' decision regardless of prior status", () => {
+  it("does not redirect inert non-track research candidates", () => {
     expect(shouldRedirectToApprovalQueue("watch", null)).toBe(false);
     expect(shouldRedirectToApprovalQueue("ignore", "watch")).toBe(false);
+  });
+
+  it("redirects demotions of an approved track/bench tier", () => {
+    expect(shouldRedirectToApprovalQueue("watch", "track")).toBe(true);
+    expect(shouldRedirectToApprovalQueue("ignore", "track")).toBe(true);
+    expect(shouldRedirectToApprovalQueue("watch", "bench")).toBe(true);
   });
 
   it("DOES redirect a bench->track promotion signal — a bench wallet clearing the global track bar " +

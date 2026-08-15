@@ -1,0 +1,7 @@
+[
+  {"name":"matched_primary_fields","response":{"status":"matched","transaction_hashes":["0xabc"],"avg_price":0.55,"filled_shares":12.5,"order_id":"ord-1"},"filled":true,"fill_price":0.55,"filled_shares":12.5,"order_id":"ord-1","order_status":"MATCHED"},
+  {"name":"fallback_fields","response":{"state":"open","price":0.42,"size":0,"orderId":"ord-2"},"filled":false,"fill_price":0.42,"filled_shares":0,"order_id":"ord-2","order_status":"OPEN"},
+  {"name":"unmatched_not_fill","response":{"status":"UNMATCHED","transaction_hashes":["0xdef"]},"filled":false,"fill_price":null,"filled_shares":null,"order_id":null,"order_status":"UNMATCHED"},
+  {"name":"matched_without_hash_not_fill","response":{"status":"MATCHED","shares_filled":3},"filled":false,"fill_price":null,"filled_shares":3,"order_id":null,"order_status":"MATCHED"},
+  {"name":"invalid_numbers","response":{"avg_price":1.2,"filled_shares":-1},"filled":false,"fill_price":null,"filled_shares":null,"order_id":null,"order_status":null}
+]
