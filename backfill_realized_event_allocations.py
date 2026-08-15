@@ -44,6 +44,32 @@ def validate_report(report):
         raise ValueError("report contains duplicate event allocations")
     if len(allocations) != report.get("event_count_in_trade_time_range"):
         raise ValueError("allocation count does not equal audited event count")
+    sequences = [row.get("event_sequence") for row in allocations]
+    if any(not isinstance(value, int) or value <= 0 for value in sequences):
+        raise ValueError("report has invalid durable event sequence")
+    if len(sequences) != len(set(sequences)):
+        raise ValueError("report contains duplicate durable event sequences")
+    snapshot = report.get("source_snapshot")
+    if not isinstance(snapshot, dict) or snapshot.get("sequence_coherent") is not True:
+        raise ValueError("report lacks a coherent source snapshot")
+    if snapshot.get("realized_event_count") != len(allocations):
+        raise ValueError("source snapshot realized-event count disagrees with report")
+    for digest_key in ("trade_evidence_sha256", "realized_event_evidence_sha256"):
+        digest = snapshot.get(digest_key)
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError(f"report lacks {digest_key}")
+    quantity = report.get("quantity_conservation")
+    if not isinstance(quantity, dict) or quantity.get("mismatch_trade_count") != 0:
+        raise ValueError("report contains a proven quantity mismatch")
+    statuses = [row.get("allocation_status", "matched") for row in allocations]
+    if any(value not in {"matched", "historical_unreconstructable"} for value in statuses):
+        raise ValueError("report contains an unsupported allocation status")
+    historical_count = sum(value == "historical_unreconstructable" for value in statuses)
+    if historical_count != report.get("historical_unreconstructable_event_count"):
+        raise ValueError("historical-unreconstructable coverage disagrees with allocations")
+    if quantity.get("unknown_trade_count") != report.get(
+            "historical_unreconstructable_trade_count"):
+        raise ValueError("historical-unreconstructable lot coverage disagrees with quantity audit")
     return allocations
 
 
@@ -60,17 +86,46 @@ def apply_report(db_path, report, sha256):
         ).fetchone() is None:
             raise RuntimeError("allocation migration has not been applied")
 
+        placeholders = ",".join("?" for _ in _REALIZED_PNL_EVENT_TYPES)
+        source_row = conn.execute(
+            f"SELECT COUNT(*) n,MAX(event_sequence) max_sequence,MAX(timestamp) max_timestamp "
+            f"FROM bot_event_log WHERE event_type IN ({placeholders})",
+            _REALIZED_PNL_EVENT_TYPES,
+        ).fetchone()
+        snapshot = report["source_snapshot"]
+        observed_snapshot = (
+            int(source_row["n"]), int(source_row["max_sequence"] or 0),
+            int(source_row["max_timestamp"] or 0),
+        )
+        expected_snapshot = (
+            int(snapshot["realized_event_count"]),
+            int(snapshot["realized_event_max_sequence"] or 0),
+            int(snapshot["realized_event_max_timestamp"] or 0),
+        )
+        if observed_snapshot != expected_snapshot:
+            raise RuntimeError(
+                f"source DB changed after report: expected={expected_snapshot}, "
+                f"observed={observed_snapshot}"
+            )
+
         now = int(time.time())
         for row in allocations:
+            allocation_status = row.get("allocation_status", "matched")
+            allocation_source = (
+                "historical_backfill" if allocation_status == "matched"
+                else "historical_unreconstructable"
+            )
             conn.execute(
                 f"INSERT INTO {_REALIZED_ALLOCATION_TABLE} "
                 "(event_id,paper_trade_id,event_timestamp,event_type,strategy,pnl_usd,"
+                "event_sequence,"
                 "cost_basis_usd,allocation_status,candidate_count,allocator_version,"
                 "allocation_source,termination_cause,source_shares_at_termination,"
                 "shares_closed,shares_remaining,termination_classifier_version,allocated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(event_id) DO UPDATE SET "
                 "paper_trade_id=excluded.paper_trade_id,event_timestamp=excluded.event_timestamp,"
+                "event_sequence=excluded.event_sequence,"
                 "event_type=excluded.event_type,strategy=excluded.strategy,pnl_usd=excluded.pnl_usd,"
                 "cost_basis_usd=excluded.cost_basis_usd,allocation_status=excluded.allocation_status,"
                 "candidate_count=excluded.candidate_count,allocator_version=excluded.allocator_version,"
@@ -81,8 +136,10 @@ def apply_report(db_path, report, sha256):
                 "allocated_at=excluded.allocated_at",
                 (row["event_id"], row["paper_trade_id"], int(row["event_timestamp"]),
                  row["event_type"], row.get("strategy", "bot_filtered"), float(row["pnl_usd"]),
-                 row.get("cost_basis_usd"), "matched", 1, _REALIZED_ALLOCATOR_VERSION,
-                 "historical_backfill", row.get("termination_cause", "UNKNOWN"),
+                 int(row["event_sequence"]),
+                 row.get("cost_basis_usd"), allocation_status, 1,
+                 _REALIZED_ALLOCATOR_VERSION, allocation_source,
+                 row.get("termination_cause", "UNKNOWN"),
                  row.get("source_shares_at_termination"), row.get("shares_closed"),
                  row.get("shares_remaining"), _TERMINATION_CLASSIFIER_VERSION, now),
             )
@@ -104,16 +161,17 @@ def apply_report(db_path, report, sha256):
             "WHEN SUM(CASE WHEN a.shares_closed IS NULL OR a.shares_remaining IS NULL THEN 1 ELSE 0 END)>0 "
             "THEN NULL ELSE SUM(a.shares_closed)+COALESCE((SELECT a2.shares_remaining FROM "
             f"{_REALIZED_ALLOCATION_TABLE} a2 WHERE a2.paper_trade_id=paper_trade.id "
-            "AND a2.allocation_status='matched' ORDER BY a2.event_timestamp DESC,a2.event_id DESC LIMIT 1),0) END "
+            "AND a2.allocation_status='matched' ORDER BY a2.event_timestamp DESC,"
+            "a2.event_sequence DESC LIMIT 1),0) END "
             f"FROM {_REALIZED_ALLOCATION_TABLE} a WHERE a.paper_trade_id=paper_trade.id "
-            "AND a.allocation_status='matched')"
+            "AND a.allocation_status='matched') WHERE total_acquired_shares IS NULL"
         )
 
         unresolved = conn.execute(
             f"SELECT COUNT(*) n FROM {_REALIZED_ALLOCATION_TABLE} "
-            "WHERE allocation_status!='matched' OR paper_trade_id IS NULL"
+            "WHERE allocation_status NOT IN ('matched','historical_unreconstructable') "
+            "OR paper_trade_id IS NULL"
         ).fetchone()["n"]
-        placeholders = ",".join("?" for _ in _REALIZED_PNL_EVENT_TYPES)
         missing = conn.execute(
             f"SELECT COUNT(*) n FROM bot_event_log e WHERE e.event_type IN ({placeholders}) "
             f"AND NOT EXISTS (SELECT 1 FROM {_REALIZED_ALLOCATION_TABLE} a WHERE a.event_id=e.id)",

@@ -4563,3 +4563,19 @@ liquidity, and weak traders, rather than being a full multi-factor execution eng
 - Hard skip on statistically significant category harm — **done** (Rule 19, 2026-07-23): a
   one-sample t-test on category PnL (not an arbitrary score cutoff), `should_skip_category()`
   checked before sizing, skips a copy entirely once there's statistically strong evidence of harm.
+
+## Rule 27 addendum — ledger-v4 unknown-history risk treatment (2026-08-16)
+
+Ledger-v4 separates three things that must not be collapsed into one number:
+
+- matched, fact-clean `bot_filtered` allocations are authoritative strategy PnL;
+- `historical_unreconstructable` allocations retain exact event PnL/cost evidence but are excluded
+  from wallet EV, ranking, promotion and strategy claims because their old events lack a complete
+  share-conservation trail;
+- portfolio-risk equity includes losses from fact-clean historical-unreconstructable allocations,
+  while treating gains from that cohort as zero. This one-sided treatment prevents quarantine from
+  increasing risk capacity or clearing a kill switch by deleting inconvenient downside.
+
+The manual kill-switch reset is status-only by default. `--clear` requires the exact unchanged
+trigger timestamp, a ledger `PASS`, a fresh timestamped equity recomputation and zero current
+floor/drawdown triggers. A reset never supplies evidence that the trigger was false.

@@ -137,12 +137,51 @@ def _table_exists(conn, table_name):
 
 
 _REALIZED_ALLOCATION_TABLE = "paper_trade_realized_allocation"
+_EVENT_SEQUENCE_COUNTER_TABLE = "bot_event_sequence_counter"
 _REALIZED_ALLOCATOR_VERSION = "paper-realized-allocation-v1"
 _REALIZED_LEDGER_READY_KEY = "paper_realized_allocation_ledger_ready_v1"
 _TERMINATION_CLASSIFIER_VERSION = "termination-cause-v1"
 _EARLY_REJECTION_CAPTURE_VERSION = "early-rejection-raw-v1"
 _TTP_PRICE_QUARANTINE_KEY = "ttp_price_quarantine_v1"
 _TTP_PRICE_QUARANTINE_VERSION = "ttp-price-quarantine-v1"
+
+
+def _table_columns(conn, table_name):
+    return {
+        row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+
+
+def _durable_event_sequence_supported(conn):
+    source_column = (
+        _table_exists(conn, "bot_event_log")
+        and "event_sequence" in _table_columns(conn, "bot_event_log")
+    )
+    counter_table = _table_exists(conn, _EVENT_SEQUENCE_COUNTER_TABLE)
+    if source_column != counter_table:
+        raise RuntimeError("incomplete durable event-sequence migration")
+    return source_column and counter_table
+
+
+def _allocate_event_sequence(conn):
+    """Allocate stable causal order inside the caller's write transaction.
+
+    The singleton UPDATE is serialized by SQLite.  Neither implicit rowid nor
+    application-level MAX()+1 is accepted as durable evidence.
+    """
+    updated = conn.execute(
+        f"UPDATE {_EVENT_SEQUENCE_COUNTER_TABLE} "
+        "SET next_value=next_value+1 WHERE singleton=1"
+    )
+    if updated.rowcount != 1:
+        raise RuntimeError("durable event-sequence counter is missing or ambiguous")
+    row = conn.execute(
+        f"SELECT next_value-1 AS allocated FROM {_EVENT_SEQUENCE_COUNTER_TABLE} "
+        "WHERE singleton=1"
+    ).fetchone()
+    if not row or int(row["allocated"]) <= 0:
+        raise RuntimeError("durable event-sequence counter returned an invalid value")
+    return int(row["allocated"])
 
 
 def _termination_cause_for_event(event):
@@ -192,14 +231,15 @@ def _realized_allocation_ledger_ready(conn):
 def _realized_pnl_sql(conn, alias=None):
     """Authoritative per-lot realized-PnL expression for decision readers.
 
-    Migration alone deliberately changes nothing.  Only the audited readiness
-    key switches readers to cumulative event allocations; deleting/corrupting
-    that key makes the same code fall back to the legacy final-close column.
+    Once the cumulative schema exists, only the audited readiness key enables
+    a realized-PnL reader. A missing/corrupt key returns SQL NULL rather than
+    falling back to the known-contaminated legacy final-close column.
     """
     prefix = f"{alias}." if alias else ""
-    if (_paper_trade_has_column(conn, "cumulative_realized_pnl_usd")
-            and _realized_allocation_ledger_ready(conn)):
-        return f"{prefix}cumulative_realized_pnl_usd"
+    if _paper_trade_has_column(conn, "cumulative_realized_pnl_usd"):
+        if _realized_allocation_ledger_ready(conn):
+            return f"{prefix}cumulative_realized_pnl_usd"
+        return "NULL"
     return f"{prefix}realized_pnl_usd"
 
 
@@ -212,9 +252,10 @@ def _realized_cost_basis_sql(conn, alias=None):
     when the cumulative realized basis column is present too.
     """
     prefix = f"{alias}." if alias else ""
-    if (_paper_trade_has_column(conn, "cumulative_realized_cost_basis_usd")
-            and _realized_allocation_ledger_ready(conn)):
-        return f"{prefix}cumulative_realized_cost_basis_usd"
+    if _paper_trade_has_column(conn, "cumulative_realized_cost_basis_usd"):
+        if _realized_allocation_ledger_ready(conn):
+            return f"{prefix}cumulative_realized_cost_basis_usd"
+        return "NULL"
     return f"{prefix}cost_basis_usd"
 
 
@@ -236,13 +277,20 @@ def get_realized_ledger_reader_status():
         if _table_exists(conn, _REALIZED_ALLOCATION_TABLE):
             row = conn.execute(
                 f"SELECT COUNT(*) total,"
-                "SUM(CASE WHEN allocation_status='matched' AND paper_trade_id IS NOT NULL "
+                "SUM(CASE WHEN allocation_status IN "
+                "('matched','historical_unreconstructable') "
+                "AND paper_trade_id IS NOT NULL "
                 "THEN 0 ELSE 1 END) unresolved "
                 f"FROM {_REALIZED_ALLOCATION_TABLE}"
             ).fetchone()
+            historical = conn.execute(
+                f"SELECT COUNT(*) FROM {_REALIZED_ALLOCATION_TABLE} "
+                "WHERE allocation_status='historical_unreconstructable'"
+            ).fetchone()[0]
             status.update({
                 "allocation_count": int(row["total"] or 0),
                 "unresolved_allocation_count": int(row["unresolved"] or 0),
+                "historical_unreconstructable_allocation_count": int(historical or 0),
             })
         return status
     finally:
@@ -859,6 +907,8 @@ def get_shadow_rehab_returns(wallet_address, limit=None):
     try:
         pnl_sql = _realized_pnl_sql(conn)
         basis_sql = _realized_cost_basis_sql(conn)
+        if pnl_sql == "NULL" or basis_sql == "NULL":
+            return []
         query = (
             f"SELECT {pnl_sql} AS economic_pnl_usd, "
             f"{basis_sql} AS economic_cost_basis_usd FROM paper_trade "
@@ -994,7 +1044,8 @@ def _event_realized_values(event):
     return float(pnl), (float(cost) if cost is not None else None)
 
 
-def _allocate_realized_event(conn, event_id, event, strategy, event_timestamp):
+def _allocate_realized_event(conn, event_id, event, strategy, event_timestamp,
+                             event_sequence=None):
     """Persist one live event-to-lot allocation without guessing.
 
     Returns the unique paper_trade id, or None for an explicit unmatched /
@@ -1021,31 +1072,33 @@ def _allocate_realized_event(conn, event_id, event, strategy, event_timestamp):
             f"PRAGMA table_info({_REALIZED_ALLOCATION_TABLE})"
         ).fetchall()
     }
+    insert_columns = [
+        "event_id", "paper_trade_id", "event_timestamp", "event_type", "strategy",
+        "pnl_usd", "cost_basis_usd", "allocation_status", "candidate_count",
+        "allocator_version", "allocation_source", "termination_cause",
+        "source_shares_at_termination",
+    ]
+    insert_values = [
+        event_id, paper_trade_id, event_timestamp, event.get("event_type"), strategy,
+        pnl_usd, cost_basis_usd, status, len(candidates), _REALIZED_ALLOCATOR_VERSION,
+        "live", _termination_cause_for_event(event), event.get("source_shares_at_termination"),
+    ]
+    if "event_sequence" in allocation_columns:
+        if event_sequence is None:
+            raise RuntimeError("realized allocation missing durable event sequence")
+        insert_columns.append("event_sequence")
+        insert_values.append(int(event_sequence))
     if {"shares_closed", "shares_remaining"}.issubset(allocation_columns):
-        inserted = conn.execute(
-            f"INSERT OR IGNORE INTO {_REALIZED_ALLOCATION_TABLE} "
-            "(event_id,paper_trade_id,event_timestamp,event_type,strategy,pnl_usd,cost_basis_usd,"
-            "allocation_status,candidate_count,allocator_version,allocation_source,termination_cause,"
-            "source_shares_at_termination,shares_closed,shares_remaining,"
-            "termination_classifier_version,allocated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (event_id, paper_trade_id, event_timestamp, event.get("event_type"), strategy,
-             pnl_usd, cost_basis_usd, status, len(candidates), _REALIZED_ALLOCATOR_VERSION,
-             "live", _termination_cause_for_event(event), event.get("source_shares_at_termination"),
-             event.get("our_shares_closed"), event.get("our_shares_remaining"),
-             _TERMINATION_CLASSIFIER_VERSION, _now_ts()),
-        )
-    else:
-        inserted = conn.execute(
-            f"INSERT OR IGNORE INTO {_REALIZED_ALLOCATION_TABLE} "
-            "(event_id,paper_trade_id,event_timestamp,event_type,strategy,pnl_usd,cost_basis_usd,"
-            "allocation_status,candidate_count,allocator_version,allocation_source,termination_cause,"
-            "source_shares_at_termination,termination_classifier_version,allocated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (event_id, paper_trade_id, event_timestamp, event.get("event_type"), strategy,
-             pnl_usd, cost_basis_usd, status, len(candidates), _REALIZED_ALLOCATOR_VERSION,
-             "live", _termination_cause_for_event(event), event.get("source_shares_at_termination"),
-             _TERMINATION_CLASSIFIER_VERSION, _now_ts()),
-        )
+        insert_columns.extend(("shares_closed", "shares_remaining"))
+        insert_values.extend((event.get("our_shares_closed"), event.get("our_shares_remaining")))
+    insert_columns.extend(("termination_classifier_version", "allocated_at"))
+    insert_values.extend((_TERMINATION_CLASSIFIER_VERSION, _now_ts()))
+    placeholders = ",".join("?" for _ in insert_columns)
+    inserted = conn.execute(
+        f"INSERT OR IGNORE INTO {_REALIZED_ALLOCATION_TABLE} "
+        f"({','.join(insert_columns)}) VALUES ({placeholders})",
+        insert_values,
+    )
     if paper_trade_id and inserted.rowcount == 1:
         conn.execute(
             "UPDATE paper_trade SET cumulative_realized_pnl_usd="
@@ -1062,7 +1115,8 @@ def _allocate_realized_event(conn, event_id, event, strategy, event_timestamp):
     return paper_trade_id
 
 
-def _maybe_close_paper_trade(conn, event, event_id=None, event_timestamp=None):
+def _maybe_close_paper_trade(conn, event, event_id=None, event_timestamp=None,
+                             event_sequence=None):
     event_type = event.get("event_type")
     mapping = _CLOSE_REASON_BY_EVENT.get(event_type)
     if not mapping:
@@ -1076,7 +1130,8 @@ def _maybe_close_paper_trade(conn, event, event_id=None, event_timestamp=None):
     allocated_trade_id = None
     if event_id is not None:
         allocated_trade_id = _allocate_realized_event(
-            conn, event_id, event, strategy, event_timestamp or _now_ts()
+            conn, event_id, event, strategy, event_timestamp or _now_ts(),
+            event_sequence=event_sequence,
         )
     if not always_full:
         remaining = event.get("our_shares_remaining", 0.0) or 0.0
@@ -1126,15 +1181,30 @@ def append_log(event):
     try:
         event_id = _new_id()
         event_timestamp = _now_ts()
-        conn.execute(
-            "INSERT INTO bot_event_log (id, timestamp, event_type, trader_address, "
-            "market_slug, outcome, side, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                event_id, event_timestamp, event.get("event_type"), event.get("trader_address"),
-                event.get("market_slug"), event.get("outcome"), event.get("side"),
-                json.dumps(event),
-            ),
-        )
+        event_sequence = None
+        if _durable_event_sequence_supported(conn):
+            conn.execute("BEGIN IMMEDIATE")
+            event_sequence = _allocate_event_sequence(conn)
+            conn.execute(
+                "INSERT INTO bot_event_log (id,event_sequence,timestamp,event_type,trader_address,"
+                "market_slug,outcome,side,payload_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    event_id, event_sequence, event_timestamp, event.get("event_type"),
+                    event.get("trader_address"), event.get("market_slug"),
+                    event.get("outcome"), event.get("side"), json.dumps(event),
+                ),
+            )
+        else:
+            # Compatibility for focused tests and pre-0030 databases only.
+            conn.execute(
+                "INSERT INTO bot_event_log (id,timestamp,event_type,trader_address,"
+                "market_slug,outcome,side,payload_json) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    event_id, event_timestamp, event.get("event_type"),
+                    event.get("trader_address"), event.get("market_slug"),
+                    event.get("outcome"), event.get("side"), json.dumps(event),
+                ),
+            )
 
         decision_type = _decision_type_for_event(event.get("event_type"), event.get("side"))
         if decision_type and event.get("trader_address") and event.get("market_slug") and event.get("outcome"):
@@ -1166,7 +1236,10 @@ def append_log(event):
                  "bot_event_log", "BLOCKED_UNTIL_LEDGER_V2", _EARLY_REJECTION_CAPTURE_VERSION),
             )
 
-        _maybe_close_paper_trade(conn, event, event_id=event_id, event_timestamp=event_timestamp)
+        _maybe_close_paper_trade(
+            conn, event, event_id=event_id, event_timestamp=event_timestamp,
+            event_sequence=event_sequence,
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1615,12 +1688,20 @@ def get_wallet_realized_ev_stats():
         non_demo_predicate = _non_demo_paper_trade_predicate(conn)
         pnl_sql = _realized_pnl_sql(conn)
         basis_sql = _realized_cost_basis_sql(conn)
+        if pnl_sql == "NULL" or basis_sql == "NULL":
+            return {}
+        matched_evidence = (
+            f"EXISTS(SELECT 1 FROM {_REALIZED_ALLOCATION_TABLE} a "
+            "WHERE a.paper_trade_id=paper_trade.id AND a.allocation_status='matched')"
+            if _realized_allocation_ledger_ready(conn) else "1=1"
+        )
         cur = conn.execute(
             "SELECT wallet_address, "
             f"avg({pnl_sql} / nullif({basis_sql}, 0)) AS ev_pct, "
             "count(*) AS trade_count "
             "FROM paper_trade WHERE status = 'closed' AND strategy = 'bot_filtered' "
             f"AND {non_demo_predicate} AND {clean_predicate} "
+            f"AND {pnl_sql} IS NOT NULL AND {matched_evidence} "
             "GROUP BY wallet_address"
         )
         rows = cur.fetchall()
@@ -1760,6 +1841,13 @@ def get_replacement_wallet_candidate():
         non_demo_predicate = _non_demo_paper_trade_predicate(conn, alias="pt")
         pnl_sql = _realized_pnl_sql(conn, alias="pt")
         basis_sql = _realized_cost_basis_sql(conn, alias="pt")
+        if pnl_sql == "NULL" or basis_sql == "NULL":
+            return None
+        matched_evidence = (
+            f"EXISTS(SELECT 1 FROM {_REALIZED_ALLOCATION_TABLE} a "
+            "WHERE a.paper_trade_id=pt.id AND a.allocation_status='matched')"
+            if _realized_allocation_ledger_ready(conn) else "1=1"
+        )
         row = conn.execute(
             "SELECT wp.wallet_address, wp.nickname, count(pt.id) AS trade_count, "
             f"COALESCE(sum({pnl_sql}), 0) AS realized_pnl_usd, "
@@ -1768,6 +1856,7 @@ def get_replacement_wallet_candidate():
             "ON lower(pt.wallet_address) = lower(wp.wallet_address) "
             "AND pt.strategy = 'bot_filtered' AND pt.status = 'closed' "
             f"AND {non_demo_predicate} AND {clean_predicate} "
+            f"AND {pnl_sql} IS NOT NULL AND {matched_evidence} "
             "WHERE wp.status = 'track' AND wp.circuit_breaker_muted = 1 "
             "GROUP BY wp.wallet_address ORDER BY realized_pnl_usd ASC, ev_pct ASC LIMIT 1"
         ).fetchone()
@@ -2200,14 +2289,18 @@ def _realized_strategy_for_event_type(event_type):
     return "bot_filtered"
 
 
-def _allocated_realized_pnl(conn, start_timestamp=None):
+def _allocated_realized_pnl(conn, start_timestamp=None, conservative_unknown=True):
     query = (
-        f"SELECT COALESCE(SUM(a.pnl_usd),0) total FROM {_REALIZED_ALLOCATION_TABLE} a "
+        "SELECT COALESCE(SUM(CASE "
+        "WHEN a.allocation_status='matched' THEN a.pnl_usd "
+        "WHEN a.allocation_status='historical_unreconstructable' "
+        "AND a.pnl_usd<0 AND ? THEN a.pnl_usd ELSE 0 END),0) total "
+        f"FROM {_REALIZED_ALLOCATION_TABLE} a "
         "JOIN paper_trade p ON p.id=a.paper_trade_id "
-        "WHERE a.strategy='bot_filtered' AND a.allocation_status='matched' "
+        "WHERE a.strategy='bot_filtered' "
         "AND COALESCE(p.is_demo_data,0)=0 AND COALESCE(p.is_phantom,0)=0"
     )
-    params = []
+    params = [1 if conservative_unknown else 0]
     if start_timestamp is not None:
         query += " AND a.event_timestamp>=?"
         params.append(int(start_timestamp))

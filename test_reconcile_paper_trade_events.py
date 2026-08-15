@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
+import json
+import os
+import sqlite3
+import tempfile
 import unittest
 
-from reconcile_paper_trade_events import allocate_events
+from reconcile_paper_trade_events import allocate_events, reconcile
 
 
 class TestEventAllocation(unittest.TestCase):
@@ -62,6 +66,67 @@ class TestEventAllocation(unittest.TestCase):
         self.assertNotIn("real", allocated)
         self.assertFalse(unmatched)
         self.assertFalse(ambiguous)
+
+    def test_same_second_events_follow_durable_sequence_not_uuid_sort(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(path)
+            conn.executescript("""
+                CREATE TABLE paper_trade(
+                  id TEXT PRIMARY KEY,strategy TEXT,wallet_address TEXT,market_slug TEXT,
+                  outcome TEXT,status TEXT,opened_at INTEGER,closed_at INTEGER,close_reason TEXT,
+                  cost_basis_usd REAL,realized_pnl_usd REAL,is_phantom INTEGER DEFAULT 0,
+                  phantom_classifier_version TEXT,is_demo_data INTEGER DEFAULT 0,
+                  our_shares REAL,total_acquired_shares REAL,phantom_reason TEXT,
+                  phantom_classified_at INTEGER
+                );
+                CREATE TABLE bot_event_log(
+                  id TEXT PRIMARY KEY,event_sequence INTEGER NOT NULL UNIQUE,timestamp INTEGER,
+                  event_type TEXT,trader_address TEXT,market_slug TEXT,outcome TEXT,side TEXT,
+                  payload_json TEXT NOT NULL
+                );
+                CREATE TABLE bot_event_sequence_counter(
+                  singleton INTEGER PRIMARY KEY,next_value INTEGER NOT NULL
+                );
+                INSERT INTO bot_event_sequence_counter VALUES(1,103);
+                INSERT INTO paper_trade(
+                  id,strategy,wallet_address,market_slug,outcome,status,opened_at,closed_at,
+                  close_reason,cost_basis_usd,realized_pnl_usd,is_phantom,
+                  phantom_classifier_version,is_demo_data
+                ) VALUES('lot','bot_filtered','w','m','Yes','closed',10,20,
+                  'source_sell',10,2,0,NULL,0);
+            """)
+            # UUID lexical order is deliberately opposite causal insertion
+            # order.  Both events share the same second.
+            conn.execute(
+                "INSERT INTO bot_event_log VALUES(?,?,?,?,?,?,?,?,?)",
+                ("z-first", 101, 20, "paper_sell", "w", "m", "Yes", "SELL",
+                 json.dumps({"pnl_usd": 1, "cost_basis_usd": 4,
+                             "our_shares_closed": 4, "our_shares_remaining": 6})),
+            )
+            conn.execute(
+                "INSERT INTO bot_event_log VALUES(?,?,?,?,?,?,?,?,?)",
+                ("a-second", 102, 20, "paper_sell", "w", "m", "Yes", "SELL",
+                 json.dumps({"pnl_usd": 1, "cost_basis_usd": 6,
+                             "our_shares_closed": 6, "our_shares_remaining": 0})),
+            )
+            conn.commit()
+            conn.close()
+
+            report = reconcile(path)
+            self.assertEqual(
+                [(row["event_id"], row["event_sequence"])
+                 for row in report["event_allocations"]],
+                [("z-first", 101), ("a-second", 102)],
+            )
+            self.assertEqual(report["event_count_by_strategy"], {"bot_filtered": 2})
+            self.assertEqual(report["event_count_by_type"], {"paper_sell": 2})
+            self.assertTrue(report["source_snapshot"]["sequence_coherent"])
+            self.assertEqual(report["source_snapshot"]["realized_event_count"], 2)
+            self.assertEqual(report["historical_unreconstructable_event_count"], 0)
+        finally:
+            os.remove(path)
 
 
 if __name__ == "__main__":

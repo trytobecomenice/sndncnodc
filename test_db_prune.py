@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import config
 import db
-from ledger_integrity import audit_ledger
+from ledger_integrity import _micros, _sum_micros, audit_ledger
 from seal_chain_manifest import record_manifest
 
 
@@ -30,16 +30,20 @@ class TestPruneEventLog(unittest.TestCase):
         os.close(fd)
         conn = sqlite3.connect(self.tmp_path)
         conn.execute(
-            "CREATE TABLE bot_event_log (id TEXT PRIMARY KEY, timestamp INTEGER, "
+            "CREATE TABLE bot_event_log (id TEXT PRIMARY KEY, event_sequence INTEGER UNIQUE, "
+            "timestamp INTEGER, "
             "event_type TEXT, trader_address TEXT, market_slug TEXT, outcome TEXT, "
             "side TEXT, payload_json TEXT NOT NULL)"
         )
         conn.executescript("""
+        CREATE TABLE bot_event_sequence_counter(singleton INTEGER PRIMARY KEY,next_value INTEGER);
+        INSERT INTO bot_event_sequence_counter VALUES(1,1);
         CREATE TABLE paper_trade(id TEXT PRIMARY KEY,cumulative_realized_pnl_usd REAL DEFAULT 0,
           realized_event_count INTEGER DEFAULT 0,total_acquired_shares REAL,our_shares REAL,
           status TEXT);
         CREATE TABLE paper_trade_realized_allocation(
-          event_id TEXT PRIMARY KEY,paper_trade_id TEXT,event_timestamp INTEGER,event_type TEXT,
+          event_id TEXT PRIMARY KEY,paper_trade_id TEXT,event_timestamp INTEGER,event_sequence INTEGER,
+          event_type TEXT,
           strategy TEXT,pnl_usd REAL,cost_basis_usd REAL,allocation_status TEXT,
           termination_cause TEXT,termination_classifier_version TEXT,
           shares_closed REAL,shares_remaining REAL);
@@ -79,10 +83,16 @@ class TestPruneEventLog(unittest.TestCase):
     def _insert_row(self, row_id, age_days):
         conn = sqlite3.connect(self.tmp_path)
         ts = int(time.time() - age_days * 86400)
+        sequence = conn.execute(
+            "SELECT next_value FROM bot_event_sequence_counter WHERE singleton=1"
+        ).fetchone()[0]
         conn.execute(
-            "INSERT INTO bot_event_log (id, timestamp, event_type, payload_json) "
-            "VALUES (?, ?, 'error', '{}')",
-            (row_id, ts),
+            "UPDATE bot_event_sequence_counter SET next_value=next_value+1 WHERE singleton=1"
+        )
+        conn.execute(
+            "INSERT INTO bot_event_log (id,event_sequence,timestamp,event_type,payload_json) "
+            "VALUES (?, ?, ?, 'error', '{}')",
+            (row_id, sequence, ts),
         )
         conn.commit()
         conn.close()
@@ -120,16 +130,23 @@ class TestPruneEventLog(unittest.TestCase):
     def _insert_realized_evidence(self, allocation_pnl=1.25):
         ts = int(time.time() - 200 * 86400)
         conn = sqlite3.connect(self.tmp_path)
+        sequence = conn.execute(
+            "SELECT next_value FROM bot_event_sequence_counter WHERE singleton=1"
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE bot_event_sequence_counter SET next_value=next_value+1 WHERE singleton=1"
+        )
         conn.execute("INSERT INTO paper_trade VALUES('lot',?,1,2,0,'closed')", (allocation_pnl,))
         conn.execute(
-            "INSERT INTO bot_event_log(id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
-            ("sell-1", ts, "paper_sell", json.dumps({
+            "INSERT INTO bot_event_log(id,event_sequence,timestamp,event_type,payload_json) "
+            "VALUES(?,?,?,?,?)",
+            ("sell-1", sequence, ts, "paper_sell", json.dumps({
                 "pnl_usd": 1.25, "our_shares_closed": 2, "our_shares_remaining": 0,
             })),
         )
         conn.execute(
-            "INSERT INTO paper_trade_realized_allocation VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            ("sell-1", "lot", ts, "paper_sell", "bot_filtered", allocation_pnl, 1,
+            "INSERT INTO paper_trade_realized_allocation VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("sell-1", "lot", ts, sequence, "paper_sell", "bot_filtered", allocation_pnl, 1,
              "matched", "SOURCE_EXIT", db._TERMINATION_CLASSIFIER_VERSION, 2, 0),
         )
         conn.commit()
@@ -190,6 +207,12 @@ class TestPruneEventLog(unittest.TestCase):
         self.assertEqual(result["status"], "FAIL")
         self.assertEqual(result["quantity_mismatch_lots"], 1)
         conn.close()
+
+    def test_partial_fill_conservation_quantizes_only_after_sum(self):
+        acquired = 7.097458333766858
+        reductions = (6.972629815412295, 0.12482851835456277)
+        self.assertNotEqual(sum(_micros(value) for value in reductions), _micros(acquired))
+        self.assertEqual(_sum_micros(reductions), _micros(acquired))
 
 
 if __name__ == "__main__":

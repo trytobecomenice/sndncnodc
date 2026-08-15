@@ -6,6 +6,11 @@ the immediate operating decisions that follow from it. It does not silently rewr
 rows, authorize a production database mutation, or assert that an external calculation is already
 verified production truth.
 
+The versioned reconstruction/tie-out and explicit forensic stopping boundary
+are maintained in `docs/research/LEDGER_V2_FORENSIC_STOP_RULE_2026-08-11.md`.
+Earlier point estimates below remain incident evidence and must not be mistaken
+for the pending durable-sequence reconciliation-v4 result.
+
 Read with:
 
 - `CLAUDE_HANDOFF.md` for the current operator boundary;

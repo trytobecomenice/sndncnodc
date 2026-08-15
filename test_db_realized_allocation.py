@@ -12,8 +12,11 @@ import db
 
 SCHEMA = """
 CREATE TABLE bot_risk_state (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at INTEGER);
-CREATE TABLE bot_event_log (id TEXT PRIMARY KEY, timestamp INTEGER, event_type TEXT,
+CREATE TABLE bot_event_log (id TEXT PRIMARY KEY, event_sequence INTEGER NOT NULL UNIQUE,
+  timestamp INTEGER, event_type TEXT,
   trader_address TEXT, market_slug TEXT, outcome TEXT, side TEXT, payload_json TEXT NOT NULL);
+CREATE TABLE bot_event_sequence_counter(singleton INTEGER PRIMARY KEY,next_value INTEGER NOT NULL);
+INSERT INTO bot_event_sequence_counter VALUES(1,1);
 CREATE TABLE decision_journal (id TEXT PRIMARY KEY,created_at INTEGER,wallet_address TEXT,
   market_slug TEXT,outcome TEXT,side TEXT,decision_type TEXT,decision_reason TEXT,
   score_breakdown_json TEXT,rule_set_version INTEGER,source TEXT);
@@ -29,6 +32,7 @@ CREATE TABLE paper_trade (id TEXT PRIMARY KEY, strategy TEXT NOT NULL, wallet_ad
   is_phantom INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE paper_trade_realized_allocation (
   event_id TEXT PRIMARY KEY, paper_trade_id TEXT, event_timestamp INTEGER NOT NULL,
+  event_sequence INTEGER NOT NULL DEFAULT 0,
   event_type TEXT NOT NULL, strategy TEXT NOT NULL, pnl_usd REAL NOT NULL,
   cost_basis_usd REAL, allocation_status TEXT NOT NULL, candidate_count INTEGER NOT NULL,
   allocator_version TEXT NOT NULL, allocation_source TEXT NOT NULL,
@@ -90,6 +94,58 @@ class TestDurableRealizedAllocation(unittest.TestCase):
         self.assertEqual(len(allocations), 2)
         self.assertTrue(all(item[0] == "matched" and item[1] == "lot" for item in allocations))
 
+    def test_event_sequence_survives_dump_reload_and_allocator_continues(self):
+        db.append_log({"timestamp": "t", "event_type": "observation"})
+        db.append_log({"timestamp": "t", "event_type": "observation"})
+        source = sqlite3.connect(self.path)
+        before = source.execute(
+            "SELECT id,event_sequence FROM bot_event_log ORDER BY event_sequence"
+        ).fetchall()
+        dump = "\n".join(source.iterdump())
+        source.close()
+
+        restored_fd, restored_path = tempfile.mkstemp(suffix=".db")
+        os.close(restored_fd)
+        try:
+            restored = sqlite3.connect(restored_path)
+            restored.executescript(dump)
+            self.assertEqual(
+                restored.execute(
+                    "SELECT id,event_sequence FROM bot_event_log ORDER BY event_sequence"
+                ).fetchall(),
+                before,
+            )
+            restored.close()
+            with patch.object(config, "SQLITE_PATH", restored_path):
+                db.append_log({"timestamp": "t", "event_type": "observation"})
+            restored = sqlite3.connect(restored_path)
+            self.assertEqual(
+                restored.execute(
+                    "SELECT event_sequence FROM bot_event_log ORDER BY event_sequence"
+                ).fetchall(),
+                [(1,), (2,), (3,)],
+            )
+            self.assertEqual(
+                restored.execute(
+                    "SELECT next_value FROM bot_event_sequence_counter WHERE singleton=1"
+                ).fetchone()[0],
+                4,
+            )
+            restored.close()
+        finally:
+            os.remove(restored_path)
+
+    def test_partial_sequence_migration_fails_closed(self):
+        conn = sqlite3.connect(self.path)
+        conn.execute("DROP TABLE bot_event_sequence_counter")
+        conn.commit()
+        conn.close()
+        with self.assertRaisesRegex(RuntimeError, "incomplete durable event-sequence migration"):
+            db.append_log({"timestamp": "t", "event_type": "observation"})
+        conn = sqlite3.connect(self.path)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM bot_event_log").fetchone()[0], 0)
+        conn.close()
+
     def test_ambiguous_event_is_persisted_and_never_cross_closes(self):
         self.insert_trade("a")
         self.insert_trade("b")
@@ -120,6 +176,30 @@ class TestDurableRealizedAllocation(unittest.TestCase):
         conn.close()
         self.assertEqual(db.realized_pnl_total(), 3.0)
 
+    def test_equity_reader_keeps_unknown_downside_but_never_unknown_gain(self):
+        self.insert_trade("unknown", phantom=0)
+        db.append_log(self.sell_event(-3.0, 0.0))
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "UPDATE paper_trade_realized_allocation SET "
+            "allocation_status='historical_unreconstructable'"
+        )
+        conn.execute(
+            "INSERT INTO bot_risk_state VALUES(?,?,1)",
+            (db._REALIZED_LEDGER_READY_KEY, json.dumps({
+                "ready": True, "allocator_version": db._REALIZED_ALLOCATOR_VERSION,
+            })),
+        )
+        conn.commit()
+        conn.close()
+        self.assertEqual(db.realized_pnl_total(), -3.0)
+
+        conn = sqlite3.connect(self.path)
+        conn.execute("UPDATE paper_trade_realized_allocation SET pnl_usd=3.0")
+        conn.commit()
+        conn.close()
+        self.assertEqual(db.realized_pnl_total(), 0.0)
+
     def test_readiness_key_switches_wallet_and_shadow_decision_readers(self):
         conn = sqlite3.connect(self.path)
         for trade_id, strategy, legacy, cumulative, cumulative_basis in (
@@ -134,13 +214,23 @@ class TestDurableRealizedAllocation(unittest.TestCase):
                 "VALUES(?,?,?,'m','Yes','closed',10,?,?,?,0)",
                 (trade_id, strategy, "0xabc", legacy, cumulative, cumulative_basis),
             )
+        conn.execute(
+            "INSERT INTO paper_trade_realized_allocation("
+            "event_id,paper_trade_id,event_timestamp,event_sequence,event_type,strategy,"
+            "pnl_usd,cost_basis_usd,allocation_status,candidate_count,allocator_version,"
+            "allocation_source,termination_cause,termination_classifier_version,allocated_at) "
+            "VALUES('real-event','real',1,1,'paper_sell','bot_filtered',4,20,'matched',1,"
+            "?,'historical_backfill','SOURCE_EXIT',?,1)",
+            (db._REALIZED_ALLOCATOR_VERSION, db._TERMINATION_CLASSIFIER_VERSION),
+        )
         conn.commit()
         conn.close()
 
-        # Migration without promotion must retain the legacy readers.
-        self.assertAlmostEqual(db.get_wallet_realized_ev_stats()["0xabc"]["ev_pct"], -0.1)
-        self.assertEqual(db.get_shadow_rehab_returns("0xabc"), [-0.2])
-        self.assertEqual(db.get_shadow_returns("0xabc", "shadow_challenger"), [-0.3])
+        # Once the ledger schema exists, missing readiness fails closed; it
+        # never falls back to the known-contaminated final-row columns.
+        self.assertEqual(db.get_wallet_realized_ev_stats(), {})
+        self.assertEqual(db.get_shadow_rehab_returns("0xabc"), [])
+        self.assertEqual(db.get_shadow_returns("0xabc", "shadow_challenger"), [])
 
         conn = sqlite3.connect(self.path)
         conn.execute(

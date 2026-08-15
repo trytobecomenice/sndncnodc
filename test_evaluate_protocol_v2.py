@@ -13,14 +13,18 @@ class TestProtocolV2Preconditions(unittest.TestCase):
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript("""
         CREATE TABLE bot_risk_state(key TEXT PRIMARY KEY,value_json TEXT,updated_at INTEGER);
-        CREATE TABLE bot_event_log(id TEXT PRIMARY KEY,timestamp INTEGER,event_type TEXT,payload_json TEXT);
+        CREATE TABLE bot_event_log(id TEXT PRIMARY KEY,event_sequence INTEGER UNIQUE,
+          timestamp INTEGER,event_type TEXT,payload_json TEXT);
+        CREATE TABLE bot_event_sequence_counter(singleton INTEGER PRIMARY KEY,next_value INTEGER);
+        INSERT INTO bot_event_sequence_counter VALUES(1,4);
         CREATE TABLE paper_trade(id TEXT PRIMARY KEY,status TEXT,closed_at INTEGER,
           market_slug TEXT,outcome TEXT,cost_basis_usd REAL,
           cumulative_realized_pnl_usd REAL DEFAULT 0,realized_event_count INTEGER DEFAULT 0,
           cumulative_realized_cost_basis_usd REAL DEFAULT 0,
           total_acquired_shares REAL,our_shares REAL);
         CREATE TABLE paper_trade_realized_allocation(
-          event_id TEXT PRIMARY KEY,paper_trade_id TEXT,event_timestamp INTEGER,event_type TEXT,
+          event_id TEXT PRIMARY KEY,paper_trade_id TEXT,event_timestamp INTEGER,event_sequence INTEGER,
+          event_type TEXT,
           strategy TEXT,pnl_usd REAL,allocation_status TEXT,allocation_source TEXT,
           termination_cause TEXT,termination_classifier_version TEXT,cost_basis_usd REAL,
           shares_closed REAL,shares_remaining REAL);
@@ -64,8 +68,8 @@ class TestProtocolV2Preconditions(unittest.TestCase):
         })
         for event_id, timestamp in (("t1", 9136), ("t2", 10000)):
             self.conn.execute(
-                "INSERT INTO bot_event_log VALUES(?,?, 'ttp_sweep_observation',?)",
-                (event_id, timestamp, payload),
+                "INSERT INTO bot_event_log VALUES(?,?,?,'ttp_sweep_observation',?)",
+                (event_id, 1 if event_id == "t1" else 2, timestamp, payload),
             )
         self.conn.execute(
             "INSERT INTO paper_trade(id,status,closed_at,market_slug,outcome,cost_basis_usd,"
@@ -75,15 +79,15 @@ class TestProtocolV2Preconditions(unittest.TestCase):
         )
         self.conn.execute("INSERT INTO pnl_snapshot VALUES(10000,'portfolio',0,0)")
         self.conn.execute(
-            "INSERT INTO bot_event_log VALUES('live',9500,'paper_sell',?)",
+            "INSERT INTO bot_event_log VALUES('live',3,9500,'paper_sell',?)",
             (json.dumps({"pnl_usd": 1, "cost_basis_usd": 1, "our_shares_closed": 1,
                          "our_shares_remaining": 0}),),
         )
         self.conn.execute(
-            "INSERT INTO paper_trade_realized_allocation(event_id,paper_trade_id,event_timestamp,"
+            "INSERT INTO paper_trade_realized_allocation(event_id,paper_trade_id,event_timestamp,event_sequence,"
             "event_type,strategy,pnl_usd,allocation_status,allocation_source,termination_cause,"
             "termination_classifier_version,cost_basis_usd,shares_closed,shares_remaining) VALUES("
-            "'live','lot',9500,'paper_sell','bot_filtered',1,'matched','live',"
+            "'live','lot',9500,3,'paper_sell','bot_filtered',1,'matched','live',"
             "'SOURCE_EXIT',?,1,1,0)",
             (db._TERMINATION_CLASSIFIER_VERSION,),
         )
@@ -94,19 +98,22 @@ class TestProtocolV2Preconditions(unittest.TestCase):
 
     def test_historical_unknown_is_excluded_from_live_final_lot_rate(self):
         self.conn.execute(
-            "INSERT INTO bot_event_log VALUES('historical',9400,'paper_sell',?)",
+            "INSERT INTO bot_event_log VALUES('historical',4,9400,'paper_sell',?)",
             (json.dumps({"pnl_usd": 0, "cost_basis_usd": 0, "our_shares_closed": 0,
                          "our_shares_remaining": 1}),),
         )
         self.conn.execute(
-            "INSERT INTO paper_trade_realized_allocation(event_id,paper_trade_id,event_timestamp,"
+            "INSERT INTO paper_trade_realized_allocation(event_id,paper_trade_id,event_timestamp,event_sequence,"
             "event_type,strategy,pnl_usd,allocation_status,allocation_source,termination_cause,"
             "termination_classifier_version,cost_basis_usd,shares_closed,shares_remaining) VALUES("
-            "'historical','lot',9400,'paper_sell','bot_filtered',0,'matched',"
+            "'historical','lot',9400,4,'paper_sell','bot_filtered',0,'matched',"
             "'historical_backfill','UNKNOWN',?,0,0,1)",
             (db._TERMINATION_CLASSIFIER_VERSION,),
         )
         self.conn.execute("UPDATE paper_trade SET realized_event_count=2 WHERE id='lot'")
+        self.conn.execute(
+            "UPDATE bot_event_sequence_counter SET next_value=5 WHERE singleton=1"
+        )
         checks, reasons = evaluate_preconditions(self.conn, self.protocol, 10000)
         self.assertEqual(checks["termination_capture"]["total"], 1)
         self.assertEqual(checks["termination_capture"]["unknown"], 0)

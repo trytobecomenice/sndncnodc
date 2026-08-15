@@ -4323,3 +4323,26 @@ cycle's bounded residual catch-up did include 2 dust sells (`$0.0133` combined c
 `$0.00` rounded PnL; they remain visible as restart-contaminated audit evidence rather than being
 manually removed. After final documentation sync, both temporary pause/lock files were removed
 and normal watchdog/autodeploy operation resumed.
+
+## 70. Ledger-v4 quarantine and reset ordering (2026-08-16)
+
+The stopped AWS forensic pass classified the apparent 35,490-event backfill population before any
+write: 14,614 events tie exactly to the earlier bot-filtered v1 cohort, 20,838 are same-window
+`shadow_rehab` events omitted by v1, and only 38 were genuinely later than the v1 snapshot. The
+large negative legacy equity was caused by the pre-readiness fallback summing shadow strategy PnL
+into the bot portfolio, not by a verified bot drawdown.
+
+Reconciliation-v4 records durable event sequence, source cutoff/evidence digests and explicit
+cohort/quantity coverage. Historical events without share fields are retained as
+`historical_unreconstructable`, never silently matched. Decision/research readers exclude them;
+risk equity retains their negative PnL and assigns zero to their positive PnL. Backfill fills only
+historical `NULL total_acquired_shares`; a runtime acquisition authority is never overwritten.
+
+Reset order is enforced in code: ledger audit first, then a fresh executable equity review, then
+evaluation against the existing HWM/floor, and only then an explicit reset if neither condition
+still holds. Entry interlock recovery remains hysteretic and automatic from healthy runtime
+samples; the persisted 2026-08-10 reason was ledger integrity, not a latency observation.
+
+The first 24 hours after restart qualify process stability, recorder coverage, sizing provenance
+and risk-gate behavior only. They do not establish strategy alpha; that needs weeks of delayed,
+executable, net-PnL evidence.

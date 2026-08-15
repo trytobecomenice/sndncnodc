@@ -44,9 +44,15 @@ does not authorize Live, a wallet change, an HWM reset, or larger sizing.
    true and seal count zero. Use a canonical `seal-000000000000-genesis.json`
    filename inside `LEDGER_SEAL_MANIFEST_DIR`. Later deployments must verify,
    never re-bootstrap.
-5. Generate a fresh reconciliation-v3 report *after the stop*. It must include
+5. Generate a fresh reconciliation-v4 report *after the stop*. It must include
    `bot_filtered`, `shadow_rehab`, and `shadow_challenger`, with strategy in the
-   allocation key. Require zero unmatched and zero ambiguous events.
+   allocation key. Require zero unmatched and zero ambiguous events. The report
+   must use persisted `bot_event_log.event_sequence`, never implicit `rowid`,
+   and emit source cutoffs/evidence hashes plus event-count breakdowns by
+   strategy, factual status, lot status, termination cause and event type.
+   Historical lots missing immutable share-conservation fields must be labelled
+   `historical_unreconstructable`; they may be retained but never promoted as
+   matched decision evidence.
 6. Record the exact report SHA-256. Run the backfill without `--apply`, then
    apply that same byte-for-byte report with its exact expected SHA.
 7. The apply transaction must upsert allocations, rebuild both cumulative lot
@@ -58,7 +64,9 @@ does not authorize Live, a wallet change, an HWM reset, or larger sizing.
    `paper_trade.cost_basis_usd` field.
 8. Before restart, independently verify:
    - readiness allocator/report versions and SHA;
-   - zero unresolved/missing allocation events;
+   - zero unresolved/missing allocation events (explicit
+     `historical_unreconstructable` quarantine is resolved coverage, not a
+     matched allocation);
    - cumulative totals by strategy and phantom status;
    - no mutation of immutable event PnL, legacy final-row PnL, or phantom flags;
    - all decision-reader queries select the paired
@@ -105,6 +113,16 @@ does not authorize Live, a wallet change, an HWM reset, or larger sizing.
   stopped state.
 - Restore the verified backup only for actual SQLite/schema corruption, not an
   ordinary validation failure. Record exactly which writes would be lost.
+- Apply `docs/research/LEDGER_V2_FORENSIC_STOP_RULE_2026-08-11.md` after the
+  single final sequence migration/reconciliation. It permits explicit unknown
+  historical evidence, never waives current/system integrity and never promotes
+  a reader that silently falls back to contaminated history.
+- `total_acquired_shares` is acquisition authority once populated. Backfill may
+  reconstruct only historical `NULL` values from complete share trails; it must
+  never overwrite a runtime value to make conservation pass.
+- Portfolio-risk equity includes matched clean `bot_filtered` PnL plus downside
+  from clean `historical_unreconstructable` events. Unknown positive PnL is zero.
+  Wallet/research readers use matched allocations only.
 
 ## Qualification boundary
 

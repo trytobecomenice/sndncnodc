@@ -19,7 +19,7 @@ import uuid
 
 
 SEAL_TABLE = "paper_trade_event_seal"
-SEALER_VERSION = "paper-ledger-sealer-v1"
+SEALER_VERSION = "paper-ledger-sealer-v2"
 MICRO = Decimal("1000000")
 GENESIS_CHAIN_SHA256 = "0" * 64
 
@@ -28,6 +28,17 @@ def _micros(value):
     if value is None:
         return 0
     return int((Decimal(str(value)) * MICRO).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _sum_micros(values):
+    """Quantize once after summing, preserving conservation across partial fills.
+
+    Quantizing every fill first is not additive at a half-micro boundary: two
+    individually rounded reductions can differ by one micro-share from the
+    rounded acquired quantity even when the source decimals conserve exactly.
+    """
+    total = sum((Decimal(str(value or 0)) for value in values), Decimal("0"))
+    return int((total * MICRO).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def _has_table(conn, name):
@@ -45,6 +56,7 @@ def _allocation_columns(conn):
 def _canonical_allocation(row):
     values = [
         row["event_id"], row["paper_trade_id"] or "", str(int(row["event_timestamp"])),
+        str(int(row["event_sequence"])),
         row["event_type"], row["strategy"], str(_micros(row["pnl_usd"])),
         str(_micros(row["cost_basis_usd"])), row["allocation_status"],
         str(_micros(row["shares_closed"])), str(_micros(row["shares_remaining"])),
@@ -76,13 +88,17 @@ def _allocation_rows(conn, where="1=1", params=()):
     columns = _allocation_columns(conn)
     shares_closed = "a.shares_closed" if "shares_closed" in columns else "NULL"
     shares_remaining = "a.shares_remaining" if "shares_remaining" in columns else "NULL"
+    if "event_sequence" not in columns:
+        raise RuntimeError("allocation ledger lacks durable event_sequence")
+    event_sequence = "a.event_sequence"
     return conn.execute(
-        "SELECT a.event_id,a.paper_trade_id,a.event_timestamp,a.event_type,a.strategy,"
+        "SELECT a.event_id,a.paper_trade_id,a.event_timestamp,"
+        f"{event_sequence} event_sequence,a.event_type,a.strategy,"
         "a.pnl_usd,a.cost_basis_usd,a.allocation_status,"
         f"{shares_closed} shares_closed,{shares_remaining} shares_remaining,"
         "a.termination_cause,a.termination_classifier_version "
         f"FROM paper_trade_realized_allocation a WHERE {where} "
-        "ORDER BY a.event_timestamp,a.event_id", params,
+        "ORDER BY a.event_timestamp,event_sequence,a.event_id", params,
     ).fetchall()
 
 
@@ -140,7 +156,9 @@ def seal_realized_events_before(conn, cutoff, realized_event_types):
         raise RuntimeError(f"cannot seal incomplete realized evidence; missing={missing[:5]}")
     for event in events:
         allocation = by_id[event["id"]]
-        if allocation["allocation_status"] != "matched" or not allocation["paper_trade_id"]:
+        if (allocation["allocation_status"] not in
+                {"matched", "historical_unreconstructable"}
+                or not allocation["paper_trade_id"]):
             raise RuntimeError(f"cannot seal unresolved allocation {event['id']}")
         payload = json.loads(event["payload_json"])
         if _micros(payload.get("pnl_usd")) != _micros(allocation["pnl_usd"]):
@@ -195,6 +213,33 @@ def audit_ledger(conn, realized_event_types):
     if not _has_table(conn, "paper_trade_realized_allocation"):
         return {"status": "UNKNOWN", "failures": [],
                 "warnings": ["allocation_table_missing"]}
+    event_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(bot_event_log)").fetchall()
+    }
+    source_sequence_invalid = 0
+    if ("event_sequence" not in event_columns
+            or not _has_table(conn, "bot_event_sequence_counter")):
+        source_sequence_invalid = 1
+    else:
+        invalid_rows = conn.execute(
+            "SELECT COUNT(*) FROM bot_event_log WHERE event_sequence IS NULL OR event_sequence<=0"
+        ).fetchone()[0]
+        duplicate_rows = conn.execute(
+            "SELECT COALESCE(SUM(n-1),0) FROM (SELECT COUNT(*) n FROM bot_event_log "
+            "GROUP BY event_sequence HAVING COUNT(*)>1)"
+        ).fetchone()[0]
+        counter = conn.execute(
+            "SELECT next_value FROM bot_event_sequence_counter WHERE singleton=1"
+        ).fetchone()
+        max_sequence = conn.execute(
+            "SELECT COALESCE(MAX(event_sequence),0) FROM bot_event_log"
+        ).fetchone()[0]
+        source_sequence_invalid = int(invalid_rows or 0) + int(duplicate_rows or 0)
+        if not counter or int(counter["next_value"]) <= int(max_sequence):
+            source_sequence_invalid += 1
+    result["source_event_sequence_invalid"] = source_sequence_invalid
+    if source_sequence_invalid:
+        result["failures"].append("source_event_sequence_invalid")
     placeholders = ",".join("?" for _ in realized_event_types)
 
     missing_a = conn.execute(
@@ -211,11 +256,16 @@ def audit_ledger(conn, realized_event_types):
            if _has_table(conn, SEAL_TABLE) else ""),
     ).fetchone()[0]
     economic_mismatch = 0
+    has_event_sequence = "event_sequence" in _allocation_columns(conn)
     retained = conn.execute(
-        "SELECT a.event_id,a.pnl_usd,a.cost_basis_usd,a.shares_closed,e.payload_json "
+        "SELECT a.event_id,a.pnl_usd,a.cost_basis_usd,a.shares_closed,"
+        + ("a.event_sequence," if has_event_sequence else "NULL event_sequence,")
+        + "e.event_sequence evidence_sequence,e.payload_json "
         "FROM paper_trade_realized_allocation a JOIN bot_event_log e ON e.id=a.event_id"
         if "shares_closed" in _allocation_columns(conn) else
-        "SELECT a.event_id,a.pnl_usd,a.cost_basis_usd,NULL shares_closed,e.payload_json "
+        "SELECT a.event_id,a.pnl_usd,a.cost_basis_usd,NULL shares_closed,"
+        + ("a.event_sequence," if has_event_sequence else "NULL event_sequence,")
+        + "e.event_sequence evidence_sequence,e.payload_json "
         "FROM paper_trade_realized_allocation a JOIN bot_event_log e ON e.id=a.event_id"
     ).fetchall()
     for row in retained:
@@ -231,14 +281,23 @@ def audit_ledger(conn, realized_event_types):
         if (row["shares_closed"] is not None
                 and _micros(payload.get("our_shares_closed")) != _micros(row["shares_closed"])):
             economic_mismatch += 1
+        if (row["event_sequence"] is not None
+                and int(row["event_sequence"]) != int(row["evidence_sequence"])):
+            economic_mismatch += 1
     unresolved = conn.execute(
         "SELECT COUNT(*) FROM paper_trade_realized_allocation "
-        "WHERE allocation_status!='matched' OR paper_trade_id IS NULL"
+        "WHERE allocation_status NOT IN ('matched','historical_unreconstructable') "
+        "OR paper_trade_id IS NULL"
+    ).fetchone()[0]
+    historical_unreconstructable = conn.execute(
+        "SELECT COUNT(*) FROM paper_trade_realized_allocation "
+        "WHERE allocation_status='historical_unreconstructable'"
     ).fetchone()[0]
     result.update({"retained_event_missing_allocation": missing_a,
                    "unsealed_allocation_missing_event": missing_e,
                    "retained_event_economic_mismatch": economic_mismatch,
-                   "unresolved_allocations": unresolved})
+                   "unresolved_allocations": unresolved,
+                   "historical_unreconstructable_allocations": historical_unreconstructable})
     if missing_a:
         result["failures"].append("retained_event_missing_allocation")
     if missing_e:
@@ -335,10 +394,14 @@ def audit_ledger(conn, realized_event_types):
                    for row in lot_rows):
                 quantity_unknown += 1
                 continue
-            sold = sum(_micros(row["shares_closed"]) for row in lot_rows)
+            sold = _sum_micros(row["shares_closed"] for row in lot_rows)
             remaining = _micros(lot_rows[-1]["shares_remaining"])
+            accounted = _sum_micros(
+                [*(row["shares_closed"] for row in lot_rows),
+                 lot_rows[-1]["shares_remaining"]]
+            )
             bad = (sold < 0 or remaining < 0
-                   or _micros(lot["total_acquired_shares"]) != sold + remaining)
+                   or _micros(lot["total_acquired_shares"]) != accounted)
             if lot["status"] == "closed" and remaining != 0:
                 bad = True
             if lot["status"] == "open" and _micros(lot["our_shares"]) != remaining:
