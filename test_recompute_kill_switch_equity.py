@@ -73,6 +73,48 @@ class RecomputeKillSwitchEquityTest(unittest.TestCase):
         self.assertAlmostEqual(result["strict_liquidation_equity_usd"], 1115.0)
         self.assertAlmostEqual(result["stale_quote_equity_usd"], 1123.0)
 
+    def test_resolved_payout_is_redeemable_liquidation_value(self):
+        state = {
+            "positions": {
+                "wallet|resolved-market|Yes": {
+                    "shares": 20.0,
+                    "cost_basis_usd": 10.0,
+                    "avg_entry_price": 0.5,
+                }
+            }
+        }
+        metadata = {
+            "closed": True,
+            "umaResolutionStatus": "resolved",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["1", "0"]',
+        }
+        with (
+            patch.object(review.db, "load_state", return_value=state),
+            patch.object(
+                review.bot,
+                "get_market_prices",
+                return_value=(None, None, "no orderbook exists"),
+            ),
+            patch.object(
+                review.polymarket_simulator,
+                "fetch_market_metadata",
+                return_value=metadata,
+            ),
+            patch.object(review.db, "realized_pnl_total", return_value=0.0),
+            patch.object(review.db, "get_risk_value", return_value=1125.0),
+            patch.object(
+                review.db,
+                "get_realized_ledger_integrity_status",
+                return_value={"status": "PASS", "failures": [], "warnings": []},
+            ),
+        ):
+            result = review.review_equity(max_workers=1)
+
+        self.assertEqual(result["quote_status_counts"], {"resolved_redeemable": 1})
+        self.assertEqual(result["resolved_redeemable_count"], 1)
+        self.assertAlmostEqual(result["strict_liquidation_equity_usd"], 1135.0)
+
 
 if __name__ == "__main__":
     unittest.main()

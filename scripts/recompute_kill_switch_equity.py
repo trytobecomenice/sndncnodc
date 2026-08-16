@@ -37,11 +37,30 @@ def review_equity(max_workers=10):
                 "quote_status": "price_error",
                 "book_age_seconds": None,
                 "stale_best_bid": None,
+                "resolution_price": None,
             }
         best_bid, indicative, error = bot.get_market_prices(parts[1], parts[2])
         quote_status = "live_executable" if best_bid is not None else "price_error"
         book_age_seconds = None
         stale_best_bid = None
+        resolution_price = None
+        if best_bid is None and error is not None:
+            # A resolved market correctly has no live order book, but its
+            # final 0/1 payout is redeemable value rather than a zero-value
+            # unpriceable position. Require Gamma's full factual resolution
+            # tuple; a metadata miss or merely-closed market remains zero.
+            try:
+                final_prices = bot._parse_market_resolution(
+                    polymarket_simulator.fetch_market_metadata(parts[1])
+                )
+                if final_prices is not None:
+                    resolution_price = bot._finite_price(
+                        final_prices.get(parts[2].lower()), allow_zero=True
+                    )
+                if resolution_price is not None:
+                    quote_status = "resolved_redeemable"
+            except Exception:
+                pass
         if best_bid is None and error is None:
             # get_market_prices deliberately hides a stale book behind an
             # indicative-only result so TTP can update its peak without ever
@@ -78,6 +97,7 @@ def review_equity(max_workers=10):
             "quote_status": quote_status,
             "book_age_seconds": book_age_seconds,
             "stale_best_bid": stale_best_bid,
+            "resolution_price": resolution_price,
         }
 
     observations = []
@@ -97,6 +117,7 @@ def review_equity(max_workers=10):
                 "quote_status": result["quote_status"],
                 "book_age_seconds": result["book_age_seconds"],
                 "stale_best_bid": result["stale_best_bid"],
+                "resolution_price": result["resolution_price"],
             })
     observations.sort(key=lambda row: row["position_key"])
 
@@ -115,8 +136,13 @@ def review_equity(max_workers=10):
     # cost carry or a guessed midpoint. This is intentionally more conservative
     # than the bot's configured risk mark and is reported side by side.
     liquidation_unrealized = sum(
-        (float(row["best_bid"]) * row["shares"] if row["best_bid"] is not None else 0.0)
-        - row["cost_basis_usd"]
+        (
+            float(row["best_bid"]) * row["shares"]
+            if row["best_bid"] is not None
+            else float(row["resolution_price"]) * row["shares"]
+            if row["resolution_price"] is not None
+            else 0.0
+        ) - row["cost_basis_usd"]
         for row in observations
     )
     liquidation_equity = config.PAPER_BANKROLL_USD + realized + liquidation_unrealized
@@ -124,6 +150,8 @@ def review_equity(max_workers=10):
         (
             float(row["best_bid"]) * row["shares"]
             if row["best_bid"] is not None
+            else float(row["resolution_price"]) * row["shares"]
+            if row["resolution_price"] is not None
             else float(row["stale_best_bid"]) * row["shares"]
             if row["stale_best_bid"] is not None
             else 0.0
@@ -144,6 +172,9 @@ def review_equity(max_workers=10):
         "position_count": len(observations),
         "indicative_price_count": len(risk_prices),
         "executable_bid_count": sum(row["best_bid"] is not None for row in observations),
+        "resolved_redeemable_count": sum(
+            row["resolution_price"] is not None for row in observations
+        ),
         "quote_status_counts": {
             status: sum(row["quote_status"] == status for row in observations)
             for status in sorted({row["quote_status"] for row in observations})

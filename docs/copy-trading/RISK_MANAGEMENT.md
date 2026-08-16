@@ -4582,6 +4582,7 @@ floor/drawdown triggers. A reset never supplies evidence that the trigger was fa
 
 The reset review reports executable liquidation separately from ordinary risk marks. Every open
 position is classified as `live_executable`, `stale_book`, `fresh_no_bid`, `price_error`, or
-`diagnostic_error`. Only a fresh positive best bid contributes to strict liquidation equity. A
-stale best bid is recorded in a separate diagnostic equity total solely to attribute a shortfall;
-it cannot authorize a reset or masquerade as executable proceeds.
+`diagnostic_error`. A factual `closed + resolved + outcomePrices` result is classified separately
+as `resolved_redeemable`. Only a fresh positive best bid or that final redeemable payout contributes
+to strict liquidation equity. A stale best bid is recorded in a separate diagnostic equity total
+solely to attribute a shortfall; it cannot authorize a reset or masquerade as executable proceeds.

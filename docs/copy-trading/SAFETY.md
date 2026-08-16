@@ -4347,6 +4347,8 @@ The equity review preserves the distinction between price visibility and exitabi
 book may contribute an indicative mark, but its bid is never counted in strict liquidation equity.
 Non-executable quotes are classified (`stale_book`, `fresh_no_bid`, or an explicit error), and a
 stale-quote total is emitted for diagnosis only. It is not a reset credential.
+An absent order book is checked against official resolution metadata: only a complete factual
+resolution is `resolved_redeemable` and contributes its final 0/1 payout to strict liquidation.
 
 The first 24 hours after restart qualify process stability, recorder coverage, sizing provenance
 and risk-gate behavior only. They do not establish strategy alpha; that needs weeks of delayed,
