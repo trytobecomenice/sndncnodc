@@ -4350,6 +4350,13 @@ stale-quote total is emitted for diagnosis only. It is not a reset credential.
 An absent order book is checked against official resolution metadata: only a complete factual
 resolution is `resolved_redeemable` and contributes its final 0/1 payout to strict liquidation.
 
+The 2026-08-16 production review exercised this distinction and refused to clear the latch. Ledger
+integrity was `PASS`; normal risk equity was `$995.89`, while strict executable/redeemable equity
+was `$818.69` versus the `$900` floor. Inventory consisted of 21 fresh-bid positions, 25 stale-book
+positions, one resolved/redeemable position, and four unpriceable/unresolvable stored slugs. The
+bot, watchdog and autodeploy therefore remain stopped/paused/locked. The 24-hour stability epoch
+has not started and no alpha inference is permitted from this stopped interval.
+
 The first 24 hours after restart qualify process stability, recorder coverage, sizing provenance
 and risk-gate behavior only. They do not establish strategy alpha; that needs weeks of delayed,
 executable, net-PnL evidence.

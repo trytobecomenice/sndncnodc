@@ -4586,3 +4586,11 @@ position is classified as `live_executable`, `stale_book`, `fresh_no_bid`, `pric
 as `resolved_redeemable`. Only a fresh positive best bid or that final redeemable payout contributes
 to strict liquidation equity. A stale best bid is recorded in a separate diagnostic equity total
 solely to attribute a shortfall; it cannot authorize a reset or masquerade as executable proceeds.
+
+**Production reset review (2026-08-16 11:43 UTC): reset refused.** Ledger integrity passed and the
+normal indicative risk mark was `$995.89` with no current trigger, but strict executable/redeemable
+equity was only `$818.69`, below the `$900` floor. Of 51 open positions, 21 had a fresh executable
+bid, 25 had a stale CLOB book, one was factually resolved/redeemable, and four had neither usable
+price nor official metadata under their stored slug. Stale-bid attribution was `$951.60`, but that
+diagnostic total is non-executable and therefore did not clear the latch. This is an inventory
+liquidity/market-lifecycle incident, not permission to reinterpret the ledger repair as a reset.
