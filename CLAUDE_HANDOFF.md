@@ -1,8 +1,13 @@
 # Claude Handoff — Polymarket Copybot
 
-**Purpose:** this is the short, current handoff for Claude (or any next agent). It does not replace
-the rule ledgers. Read this file first, then use `docs/copy-trading/RISK_MANAGEMENT.md` and
-`docs/copy-trading/SAFETY.md` for the full rationale and implementation history.
+> **SUPERSEDED AS CURRENT STATE:** read `CURRENT_HANDOFF.md` first. This large file is historical
+> context and may contain old sections labelled "current". No old snapshot here may override the
+> dated AWS-verified state or stop rules in `CURRENT_HANDOFF.md`.
+
+**Purpose:** this is retained historical handoff context for Claude (or any next agent). It does
+not replace `CURRENT_HANDOFF.md` or the rule ledgers. Use
+`docs/copy-trading/RISK_MANAGEMENT.md` and `docs/copy-trading/SAFETY.md` for the full rationale and
+implementation history.
 
 ## Project maturity — honest benchmark
 

@@ -1,5 +1,10 @@
 # Current State — Copy Bot Only
 
+> **SUPERSEDED AS CURRENT STATE:** the canonical, dated operational snapshot is
+> `../CURRENT_HANDOFF.md`. This document retains historical incident detail; do not act on its old
+> process IDs, commit IDs, PnL, HWM, locks, or deployment claims without a fresh AWS read-only
+> verification.
+
 > **Economic-integrity alert — 2026-08-07:** historical Paper PnL is quarantined after an external
 > review identified post-event/replayed-trade phantom profits and Codex independently reproduced
 > the core finding against the authoritative AWS database read-only. Read
